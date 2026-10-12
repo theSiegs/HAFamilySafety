@@ -780,6 +780,44 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._set_screentime_allowance(child_id, day_of_week, hours, minutes)
         await self.async_request_refresh()
 
+    async def async_set_xbox_screentime_limit(
+        self, child_id: str, day_of_week: int, hours: int, minutes: int
+    ) -> None:
+        """Set one day's Xbox allowance (the schedule the console enforces).
+
+        The day's current allowed ranges are read back first and sent
+        unchanged, because Microsoft takes allowance and ranges in one call.
+        """
+        if not 0 <= day_of_week <= 6:
+            raise ValueError("day_of_week must be between 0 and 6")
+        if hours < 0 or minutes < 0 or minutes > 59 or hours * 60 + minutes > 1440:
+            raise ValueError("screen-time allowance must be between 0 and 24 hours")
+        if self.web_api is None or not self._native_web_auth:
+            raise HomeAssistantError(
+                "Xbox screen time needs the native Microsoft sign-in (web session)"
+            )
+        day_key = DAY_KEYS[day_of_week]
+        # A fresh read when one is due, else the last one the poll kept: the
+        # policy read is rate limited and backed off per child.
+        payload = await self.web_api.get_xbox_screentime_policy(child_id)
+        if payload is None:
+            account = ((self.data or {}).get("accounts") or {}).get(child_id) or {}
+            payload = account.get("xbox_policy")
+        policy = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(policy, dict):
+            raise HomeAssistantError("Could not read the current Xbox screen-time schedule")
+        day = next(
+            (d for d in policy.get("dailyRestrictions") or [] if d.get("dayOfWeek") == day_key),
+            None,
+        )
+        ranges = (day or {}).get("allowedScreenTimeRanges") or [
+            {"begin": "00:00:00", "end": "1.00:00:00"}
+        ]
+        await self.web_api.set_xbox_screentime_allowance(
+            child_id, day_key, hours, minutes, ranges
+        )
+        await self.async_request_refresh()
+
     async def async_set_screentime_intervals(
         self,
         child_id: str,
