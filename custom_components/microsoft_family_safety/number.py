@@ -37,11 +37,24 @@ def _parse_allowance_to_minutes(allowance: str | int | float | None) -> int:
                 return 0
             return int(match.group(1) or 0) * 60 + int(match.group(2) or 0)
         parts = text.split(":")
-        hours = int(parts[0])
+        # .NET TimeSpan: a whole day comes as "1.00:00:00"
+        days = 0
+        if "." in parts[0]:
+            day_text, parts[0] = parts[0].split(".", 1)
+            days = int(day_text)
+        hours = days * 24 + int(parts[0])
         minutes = int(parts[1]) if len(parts) > 1 else 0
         return hours * 60 + minutes
     except (TypeError, ValueError, IndexError):
         return 0
+
+
+def _xbox_schedule(account_data: dict | None) -> dict | None:
+    """The Xbox schedule ("data" of the Xbox policy the coordinator keeps)."""
+    payload = (account_data or {}).get("xbox_policy")
+    data = payload.get("data") if isinstance(payload, dict) else None
+    return data if isinstance(data, dict) else None
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -52,22 +65,32 @@ async def async_setup_entry(
     coordinator: FamilySafetyDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
 
     known_accounts: set[str] = set()
+    known_xbox_accounts: set[str] = set()
 
     def _add_new_entities() -> None:
         """Add number entities for accounts that appeared since last update."""
         entities: list[NumberEntity] = []
         data = coordinator.data or {}
 
-        for account_id in data.get("accounts", {}):
-            if account_id in known_accounts:
-                continue
-            known_accounts.add(account_id)
-            for day_index, day_key, day_label in DAYS:
-                entities.append(
-                    FamilySafetyDailyLimitNumber(
-                        coordinator, entry, account_id, day_index, day_key, day_label,
+        for account_id, account_data in data.get("accounts", {}).items():
+            if account_id not in known_accounts:
+                known_accounts.add(account_id)
+                for day_index, day_key, day_label in DAYS:
+                    entities.append(
+                        FamilySafetyDailyLimitNumber(
+                            coordinator, entry, account_id, day_index, day_key, day_label,
+                        )
                     )
-                )
+            # Xbox limits only for children whose Xbox schedule could be read
+            # (a child without an Xbox gets 403 and no entities).
+            if account_id not in known_xbox_accounts and _xbox_schedule(account_data):
+                known_xbox_accounts.add(account_id)
+                for day_index, day_key, day_label in DAYS:
+                    entities.append(
+                        FamilySafetyXboxDailyLimitNumber(
+                            coordinator, entry, account_id, day_index, day_key, day_label,
+                        )
+                    )
 
         if entities:
             async_add_entities(entities)
@@ -180,4 +203,69 @@ class FamilySafetyDailyLimitNumber(CoordinatorEntity, NumberEntity):
             )
             raise HomeAssistantError(
                 f"Failed to set screen time limit: {err}"
+            ) from err
+
+
+class FamilySafetyXboxDailyLimitNumber(FamilySafetyDailyLimitNumber):
+    """Daily Xbox allowance for one day.
+
+    When the child's time-allowance policy is ``perDeviceType`` the console
+    enforces its own schedule (/family/api/xbox/screen-time-xbox), and the
+    Windows limit above does not reach it.
+    """
+
+    _attr_icon = "mdi:microsoft-xbox"
+
+    def __init__(
+        self,
+        coordinator: FamilySafetyDataUpdateCoordinator,
+        entry: ConfigEntry,
+        account_id: str,
+        day_index: int,
+        day_key: str,
+        day_label: str,
+    ) -> None:
+        """Initialize the Xbox number entity."""
+        super().__init__(coordinator, entry, account_id, day_index, day_key, day_label)
+        self._attr_unique_id = f"{entry.entry_id}_{account_id}_xbox_limit_{day_key}"
+        self._attr_name = f"{self._account_name} Xbox {day_label} Limit"
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the current Xbox allowance in minutes."""
+        if self._optimistic_value is not None:
+            return self._optimistic_value
+        account_data = self._get_account_data()
+        policy = _xbox_schedule(account_data)
+        if policy is None:
+            return None
+        for day in policy.get("dailyRestrictions") or []:
+            if isinstance(day, dict) and day.get("dayOfWeek") == self._day_key:
+                return _parse_allowance_to_minutes(day.get("allowedTotalScreenTime"))
+        return None
+
+    async def async_set_native_value(self, value: float) -> None:
+        """Set the Xbox allowance for this day (optimistic update)."""
+        total_minutes = int(value)
+        hours, minutes = divmod(total_minutes, 60)
+        _LOGGER.info(
+            "Setting Xbox %s screen time limit for %s to %dh%02dm",
+            self._day_key, self._account_name, hours, minutes,
+        )
+        self._optimistic_value = float(total_minutes)
+        self.async_write_ha_state()
+        try:
+            await self.coordinator.async_set_xbox_screentime_limit(
+                self._account_id, self._day_index, hours, minutes
+            )
+            self._optimistic_value = None
+        except Exception as err:
+            self._optimistic_value = None
+            self.async_write_ha_state()
+            _LOGGER.error(
+                "Failed to set Xbox %s limit for %s: %s",
+                self._day_key, self._account_name, err,
+            )
+            raise HomeAssistantError(
+                f"Failed to set Xbox screen time limit: {err}"
             ) from err

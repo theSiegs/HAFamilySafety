@@ -1835,6 +1835,44 @@ class FamilySafetyWebAPI:
             f"{seconds // 3600} h" if seconds >= 3600 else f"{seconds // 60} min",
         )
 
+    async def set_xbox_screentime_allowance(
+        self,
+        child_id: str,
+        day_key: str,
+        hours: int,
+        minutes: int,
+        allowed_ranges: list[dict[str, str]],
+    ) -> bool:
+        """Set one day's Xbox allowance, keeping its allowed time ranges.
+
+        POST /family/api/xbox/screen-time-xbox/set-custom-device-policy, the
+        call behind UpdateXboxScreenTimeAllowedIntervals in the Family web app.
+        Microsoft takes allowance and ranges together, so the caller passes the
+        day's current ``allowedScreenTimeRanges`` back unchanged.
+        """
+        result = await self._web_request(
+            "POST",
+            f"{self.WEB_API_BASE}/family/api/xbox/screen-time-xbox/set-custom-device-policy",
+            json_data={
+                "childId": str(child_id),
+                "screenTimeUpdateParams": {
+                    # .NET TimeSpan, which has no "24:00:00": a whole day is "1.00:00:00"
+                    "allowance": (
+                        "1.00:00:00"
+                        if int(hours) * 60 + int(minutes) >= 1440
+                        else f"{int(hours):02d}:{int(minutes):02d}:00"
+                    ),
+                    "daysOfWeek": [day_key],
+                    "allowedIntervals": [
+                        {"begin": r["begin"], "end": r["end"]} for r in allowed_ranges
+                    ],
+                },
+            },
+        )
+        if result is None:
+            raise FamilySafetyWebAPIError("Xbox screen-time allowance update failed")
+        return True
+
     @staticmethod
     def _extract_daily_usage_minutes(payload: object, target_date: str) -> int | None:
         """Pull the target day's total from a recent-activity report payload."""

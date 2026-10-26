@@ -16,6 +16,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from .const import (
     ATTR_ACCOUNT_BALANCE,
@@ -35,6 +36,7 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import FamilySafetyDataUpdateCoordinator
+from .number import _parse_allowance_to_minutes, _xbox_schedule
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -104,6 +106,7 @@ async def async_setup_entry(
     async_add_entities([FamilySafetyConnectionSensor(coordinator, entry)])
 
     known_accounts: set[str] = set()
+    known_xbox_accounts: set[str] = set()
     known_devices: set[str] = set()
 
     def _add_new_entities() -> None:
@@ -117,6 +120,16 @@ async def async_setup_entry(
                 entities.extend(
                     _create_account_sensors(coordinator, entry, account_id, account_data)
                 )
+            # Xbox sensors only for children Microsoft has Xbox data for
+            if account_id not in known_xbox_accounts and (
+                (account_data or {}).get("xbox_today_usage") is not None
+                or _xbox_schedule(account_data)
+            ):
+                known_xbox_accounts.add(account_id)
+                entities.extend([
+                    FamilySafetyXboxScreenTimeSensor(coordinator, entry, account_id),
+                    FamilySafetyXboxTimeRemainingSensor(coordinator, entry, account_id),
+                ])
 
         for device_id in data.get("devices", {}):
             if device_id not in known_devices:
@@ -266,6 +279,97 @@ class FamilySafetyScreenTimeSensor(FamilySafetyAccountSensor):
                 else None
             ),
             **_format_duration_attributes(total_seconds),
+        }
+
+
+class FamilySafetyXboxScreenTimeSensor(FamilySafetyAccountSensor):
+    """Xbox play today, from the Xbox activity report.
+
+    The account Screen Time sensor covers every platform; this one is the
+    Xbox alone. Unknown until the report has been read today.
+    """
+
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_icon = "mdi:microsoft-xbox"
+
+    def __init__(
+        self,
+        coordinator: FamilySafetyDataUpdateCoordinator,
+        entry: ConfigEntry,
+        account_id: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, entry, account_id)
+        self._attr_unique_id = f"{entry.entry_id}_{account_id}_xbox_screentime"
+        self._attr_name = f"{self._get_account_name()} Xbox Screen Time"
+
+    @property
+    def native_value(self) -> int | None:
+        """Return today's Xbox play in minutes."""
+        account_data = self._get_account_data()
+        value = (account_data or {}).get("xbox_today_usage")
+        return value if isinstance(value, int) else None
+
+
+class FamilySafetyXboxTimeRemainingSensor(FamilySafetyAccountSensor):
+    """Xbox time left today: today's Xbox allowance minus today's Xbox play.
+
+    Unknown while either is unknown. A day without an Xbox limit has a
+    24 h allowance.
+    """
+
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
+    _attr_icon = "mdi:timer-sand"
+
+    def __init__(
+        self,
+        coordinator: FamilySafetyDataUpdateCoordinator,
+        entry: ConfigEntry,
+        account_id: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, entry, account_id)
+        self._attr_unique_id = f"{entry.entry_id}_{account_id}_xbox_time_remaining"
+        self._attr_name = f"{self._get_account_name()} Xbox Time Remaining"
+
+    def _today(self) -> dict[str, Any] | None:
+        schedule = _xbox_schedule(self._get_account_data())
+        if schedule is None:
+            return None
+        day_key = dt_util.now().strftime("%A").lower()
+        return next(
+            (
+                day
+                for day in schedule.get("dailyRestrictions") or []
+                if isinstance(day, dict) and day.get("dayOfWeek") == day_key
+            ),
+            None,
+        )
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the Xbox minutes left today."""
+        today = self._today()
+        used = (self._get_account_data() or {}).get("xbox_today_usage")
+        if today is None or not isinstance(used, int):
+            return None
+        allowance = _parse_allowance_to_minutes(today.get("allowedTotalScreenTime"))
+        return max(allowance - used, 0)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return today's allowance and allowed ranges."""
+        today = self._today()
+        if today is None:
+            return {}
+        return {
+            "allowance_minutes": _parse_allowance_to_minutes(
+                today.get("allowedTotalScreenTime")
+            ),
+            "allowed_ranges": today.get("allowedScreenTimeRanges") or [],
         }
 
 
