@@ -1856,7 +1856,12 @@ class FamilySafetyWebAPI:
             json_data={
                 "childId": str(child_id),
                 "screenTimeUpdateParams": {
-                    "allowance": f"{int(hours):02d}:{int(minutes):02d}:00",
+                    # .NET TimeSpan, which has no "24:00:00": a whole day is "1.00:00:00"
+                    "allowance": (
+                        "1.00:00:00"
+                        if int(hours) * 60 + int(minutes) >= 1440
+                        else f"{int(hours):02d}:{int(minutes):02d}:00"
+                    ),
                     "daysOfWeek": [day_key],
                     "allowedIntervals": [
                         {"begin": r["begin"], "end": r["end"]} for r in allowed_ranges
