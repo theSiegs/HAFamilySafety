@@ -427,8 +427,19 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._request_reauth("web_credentials_missing")
 
     def get_account(self, account_id: str) -> Account | None:
-        """Get the raw pyfamilysafety Account object."""
-        return self._accounts.get(account_id)
+        """Get the raw pyfamilysafety Account object.
+
+        The roster keys accounts by an int user id, while service calls pass
+        it as a str, so match on the normalized key.
+        """
+        account = self._accounts.get(account_id)
+        if account is not None:
+            return account
+        key = self._policy_key(account_id)
+        return next(
+            (acc for acc_id, acc in self._accounts.items() if self._policy_key(acc_id) == key),
+            None,
+        )
 
     def get_device(self, device_id: str) -> Device | None:
         """Get the raw pyfamilysafety Device object."""
@@ -436,7 +447,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def get_application(self, account_id: str, app_id: str) -> Application | None:
         """Get a raw pyfamilysafety Application object."""
-        account = self._accounts.get(account_id)
+        account = self.get_account(account_id)
         if account is None:
             return None
         try:
@@ -478,7 +489,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_lock_platform(
         self, account_id: str, platform: str, valid_until: datetime | None = None
     ) -> None:
-        account = self._accounts.get(account_id)
+        account = self.get_account(account_id)
         if account is None:
             raise ValueError(f"Account {account_id} not found")
         until = valid_until or (datetime.now() + timedelta(hours=24))
@@ -517,7 +528,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self.async_request_refresh()
 
     async def async_unlock_platform(self, account_id: str, platform: str) -> None:
-        account = self._accounts.get(account_id)
+        account = self.get_account(account_id)
         if account is None:
             raise ValueError(f"Account {account_id} not found")
 
