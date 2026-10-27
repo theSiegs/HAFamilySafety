@@ -1,6 +1,7 @@
 """Data coordinator for Microsoft Family Safety."""
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 import hashlib
 import json
@@ -179,6 +180,10 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: was read, or a web lock/unlock from here succeeded. Until then the
         #: Xbox lock switch reports unknown rather than "unlocked".
         self._xbox_lock_known: set[str] = set()
+        #: Xbox schedule writes go one at a time: several sent at once (one
+        #: per day, e.g. setting a whole week) mostly fail with dropped
+        #: connections.
+        self._xbox_write_lock = asyncio.Lock()
 
     def _entry_auth_anchor(self) -> str:
         """Fingerprint the base browser/mobile login stored in the config entry.
@@ -842,25 +847,32 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "Xbox screen time needs the native Microsoft sign-in (web session)"
             )
         day_key = DAY_KEYS[day_of_week]
-        # A fresh read when one is due, else the last one the poll kept: the
-        # policy read is rate limited and backed off per child.
-        payload = await self.web_api.get_xbox_screentime_policy(child_id)
-        if payload is None:
-            account = ((self.data or {}).get("accounts") or {}).get(child_id) or {}
-            payload = account.get("xbox_policy")
-        policy = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(policy, dict):
-            raise HomeAssistantError("Could not read the current Xbox screen-time schedule")
-        day = next(
-            (d for d in policy.get("dailyRestrictions") or [] if d.get("dayOfWeek") == day_key),
-            None,
-        )
-        ranges = (day or {}).get("allowedScreenTimeRanges") or [
-            {"begin": "00:00:00", "end": "1.00:00:00"}
-        ]
-        await self.web_api.set_xbox_screentime_allowance(
-            child_id, day_key, hours, minutes, ranges
-        )
+        async with self._xbox_write_lock:
+            # A fresh read when one is due, else the last one the poll kept:
+            # the policy read is rate limited and backed off per child.
+            payload = await self.web_api.get_xbox_screentime_policy(child_id)
+            if payload is None:
+                account = ((self.data or {}).get("accounts") or {}).get(child_id) or {}
+                payload = account.get("xbox_policy")
+            policy = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(policy, dict):
+                raise HomeAssistantError(
+                    "Could not read the current Xbox screen-time schedule"
+                )
+            day = next(
+                (
+                    d
+                    for d in policy.get("dailyRestrictions") or []
+                    if d.get("dayOfWeek") == day_key
+                ),
+                None,
+            )
+            ranges = (day or {}).get("allowedScreenTimeRanges") or [
+                {"begin": "00:00:00", "end": "1.00:00:00"}
+            ]
+            await self.web_api.set_xbox_screentime_allowance(
+                child_id, day_key, hours, minutes, ranges
+            )
         await self.async_request_refresh()
 
     async def async_set_screentime_intervals(
