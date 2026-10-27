@@ -316,8 +316,9 @@ class FamilySafetyXboxScreenTimeSensor(FamilySafetyAccountSensor):
 class FamilySafetyXboxTimeRemainingSensor(FamilySafetyAccountSensor):
     """Xbox time left today: today's Xbox allowance minus today's Xbox play.
 
-    Unknown while either is unknown. A day without an Xbox limit has a
-    24 h allowance.
+    Unknown while either is unknown. With Xbox limits turned off the
+    allowance is 24 h, as the Xbox Family app shows it: Microsoft keeps the
+    last stored allowance in the schedule, but it is not enforced then.
     """
 
     _attr_device_class = SensorDeviceClass.DURATION
@@ -349,6 +350,15 @@ class FamilySafetyXboxTimeRemainingSensor(FamilySafetyAccountSensor):
             None,
         )
 
+    def _limits_enabled(self) -> bool:
+        schedule = _xbox_schedule(self._get_account_data()) or {}
+        return schedule.get("isEnabled") is not False
+
+    def _allowance(self, today: dict[str, Any]) -> int:
+        if not self._limits_enabled():
+            return 24 * 60
+        return _parse_allowance_to_minutes(today.get("allowedTotalScreenTime"))
+
     @property
     def native_value(self) -> int | None:
         """Return the Xbox minutes left today."""
@@ -356,8 +366,7 @@ class FamilySafetyXboxTimeRemainingSensor(FamilySafetyAccountSensor):
         used = (self._get_account_data() or {}).get("xbox_today_usage")
         if today is None or not isinstance(used, int):
             return None
-        allowance = _parse_allowance_to_minutes(today.get("allowedTotalScreenTime"))
-        return max(allowance - used, 0)
+        return max(self._allowance(today) - used, 0)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -366,9 +375,8 @@ class FamilySafetyXboxTimeRemainingSensor(FamilySafetyAccountSensor):
         if today is None:
             return {}
         return {
-            "allowance_minutes": _parse_allowance_to_minutes(
-                today.get("allowedTotalScreenTime")
-            ),
+            "limits_enabled": self._limits_enabled(),
+            "allowance_minutes": self._allowance(today),
             "allowed_ranges": today.get("allowedScreenTimeRanges") or [],
         }
 
