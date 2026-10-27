@@ -7,7 +7,7 @@ import logging
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
     ConfigEntryNotReady,
@@ -288,6 +288,43 @@ def _register_services(hass: HomeAssistant) -> None:
         hass.services.async_register(
             DOMAIN, name, make_handler(method, extract), schema=schema
         )
+
+    async def probe_mobile_schedules(call: ServiceCall) -> ServiceResponse:
+        """Read-only probe: the raw mobile /v4 schedules answer for one child.
+
+        Runs on the long-lived mobile token, so it shows whether the Xbox
+        schedule is reachable without the Family web session (#52, #64).
+        """
+        coordinator = _get_coordinator(hass)
+        if coordinator is None or coordinator.web_api is None:
+            raise HomeAssistantError("No Microsoft Family Safety coordinator available")
+        child_id = str(call.data["account_id"])
+        answers = {}
+        for plat in call.data.get("plat_info", ["Windows", "Xbox"]):
+            try:
+                answers[plat] = await coordinator.web_api._request(
+                    "GET",
+                    f"/v4/devicelimits/schedules/{child_id}",
+                    params={
+                        "culture": "en-us",
+                        "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+                    },
+                    extra_headers={"Plat-Info": plat},
+                )
+            except Exception as err:  # noqa: BLE001 - report it in the answer
+                answers[plat] = {"error": repr(err)}
+        return {"answers": answers}
+
+    hass.services.async_register(
+        DOMAIN,
+        "probe_mobile_schedules",
+        probe_mobile_schedules,
+        schema=vol.Schema({
+            vol.Required("account_id"): cv.string,
+            vol.Optional("plat_info"): vol.All(cv.ensure_list, [cv.string]),
+        }),
+        supports_response=SupportsResponse.ONLY,
+    )
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
