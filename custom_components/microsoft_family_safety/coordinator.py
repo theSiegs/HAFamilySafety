@@ -579,10 +579,11 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     else:
                         self._platform_override_until.pop(key, None)
                     self._xbox_lock_known.add(key[0])
-            elif override_type == "cancel" or (
+            elif override_type in ("cancel", "allowuntil") or (
                 override is None and "dailyRestrictions" in data
             ):
-                # Microsoft answered and is not blocking: a stale local entry goes.
+                # Microsoft answered and is not blocking (allowUntil is extra
+                # time granted, the opposite of a lock): a stale local entry goes.
                 self._platform_override_until.pop(key, None)
                 self._xbox_lock_known.add(key[0])
             elif override_type is not None:
@@ -1594,6 +1595,20 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         )
                     except Exception as err:
                         _LOGGER.debug("Could not fetch Xbox screen-time policy: %r", err)
+                if _LOGGER.isEnabledFor(logging.DEBUG) and isinstance(xbox_policy, dict):
+                    policy_data = xbox_policy.get("data")
+                    if isinstance(policy_data, dict):
+                        _LOGGER.debug(
+                            "Xbox policy for %s: %s; override %s; days %s",
+                            account_id,
+                            {k: v for k, v in policy_data.items() if not isinstance(v, (list, dict))},
+                            policy_data.get("screenTimeOverride"),
+                            [
+                                (d.get("dayOfWeek"), d.get("allowedTotalScreenTime"))
+                                for d in policy_data.get("dailyRestrictions") or []
+                                if isinstance(d, dict)
+                            ],
+                        )
                 # The lock state comes from a fresh read only. The full payload
                 # is kept on the account data (last good one on a miss) for
                 # anything else that needs the Xbox schedule.

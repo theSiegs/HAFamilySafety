@@ -1880,15 +1880,25 @@ class FamilySafetyWebAPI:
             return None
         data = payload.get("data")
         if not isinstance(data, dict):
+            _LOGGER.debug("Xbox activity report has no data; keys %s", sorted(payload))
             return None
         events = data.get("dailyScreenTimeEvents")
         if not isinstance(events, list):
+            _LOGGER.debug("Xbox activity report has no daily events; keys %s", sorted(data))
             return None
+        dates = []
         for event in events:
             if not isinstance(event, dict):
                 continue
-            if str(event.get("date") or "")[:10] == target_date:
+            date = str(event.get("date") or "")[:10]
+            if date == target_date:
                 return FamilySafetyWebAPI._duration_to_minutes(event.get("timeUsed"))
+            dates.append(date)
+        _LOGGER.debug("Xbox activity report has no row for %s; rows %s", target_date, dates)
+        # A day without play has no row: read that as 0, but only when the rows
+        # there are use YYYY-MM-DD dates, so a format change can't pass as 0.
+        if all(len(d) == 10 and d[4] == "-" and d[7] == "-" for d in dates):
+            return 0
         return None
 
     @staticmethod
