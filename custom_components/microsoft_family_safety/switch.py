@@ -25,6 +25,7 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import FamilySafetyDataUpdateCoordinator
+from .permissions import async_check_entity_action
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -67,6 +68,10 @@ async def async_setup_entry(
 
             # Create per-platform lock switches only for selected platforms
             enabled_platforms = entry.options.get(CONF_PLATFORMS, DEFAULT_PLATFORMS)
+            if not coordinator.xbox_features:
+                enabled_platforms = [
+                    p for p in enabled_platforms if str(p).lower() != "xbox"
+                ]
             for platform in enabled_platforms:
                 entities.append(
                     FamilySafetyPlatformLockSwitch(
@@ -84,6 +89,22 @@ async def async_setup_entry(
             # Create screen time limits on/off switch (issue #24)
             entities.append(
                 FamilySafetyScreenTimePolicySwitch(
+                    coordinator, entry, account_id, account_name,
+                )
+            )
+
+            # Xbox schedule on/off (the console's own limits, PerDeviceType).
+            if coordinator.xbox_features:
+                entities.append(
+                    FamilySafetyXboxScheduleSwitch(
+                        coordinator, entry, account_id, account_name,
+                    )
+                )
+
+            # Per-child "App, feature, and game limits" switch: per-app limits
+            # are only enforced while it is on.
+            entities.append(
+                FamilySafetyAppLimitsSwitch(
                     coordinator, entry, account_id, account_name,
                 )
             )
@@ -174,11 +195,13 @@ class FamilySafetyAppBlockSwitch(CoordinatorEntity, SwitchEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Block the application."""
+        await async_check_entity_action(self)
         _LOGGER.info("Blocking app %s for account %s", self._app_name, self._account_name)
         await self.coordinator.async_block_app(self._account_id, self._app_id)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Unblock the application."""
+        await async_check_entity_action(self)
         _LOGGER.info("Unblocking app %s for account %s", self._app_name, self._account_name)
         await self.coordinator.async_unblock_app(self._account_id, self._app_id)
 
@@ -253,11 +276,13 @@ class FamilySafetyPlatformLockSwitch(CoordinatorEntity, SwitchEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Lock the platform (web override for Windows/Xbox, else mobile API)."""
+        await async_check_entity_action(self)
         _LOGGER.debug("Locking platform %s for %s", self._platform, self._account_name)
         await self.coordinator.async_lock_platform(self._account_id, self._platform)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Unlock the platform (web override for Windows/Xbox, else mobile API)."""
+        await async_check_entity_action(self)
         _LOGGER.debug("Unlocking platform %s for %s", self._platform, self._account_name)
         await self.coordinator.async_unlock_platform(self._account_id, self._platform)
 
@@ -322,6 +347,7 @@ class FamilySafetyAccountLockSwitch(CoordinatorEntity, SwitchEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Lock the account (optimistic update)."""
+        await async_check_entity_action(self)
         _LOGGER.info("Locking account %s", self._account_name)
         self._optimistic_state = True
         self.async_write_ha_state()
@@ -335,6 +361,7 @@ class FamilySafetyAccountLockSwitch(CoordinatorEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Unlock the account (optimistic update)."""
+        await async_check_entity_action(self)
         _LOGGER.info("Unlocking account %s", self._account_name)
         self._optimistic_state = False
         self.async_write_ha_state()
@@ -410,6 +437,7 @@ class FamilySafetyScreenTimePolicySwitch(CoordinatorEntity, SwitchEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Enable screen time limits (restore the saved schedule)."""
+        await async_check_entity_action(self)
         _LOGGER.info("Enabling screen time limits for %s", self._account_name)
         self._optimistic_state = True
         self.async_write_ha_state()
@@ -423,6 +451,7 @@ class FamilySafetyScreenTimePolicySwitch(CoordinatorEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Disable screen time limits (grant unlimited time)."""
+        await async_check_entity_action(self)
         _LOGGER.info("Disabling screen time limits for %s", self._account_name)
         self._optimistic_state = False
         self.async_write_ha_state()
@@ -433,3 +462,125 @@ class FamilySafetyScreenTimePolicySwitch(CoordinatorEntity, SwitchEntity):
             self._optimistic_state = None
             self.async_write_ha_state()
             raise
+
+
+class FamilySafetyAppLimitsSwitch(CoordinatorEntity, SwitchEntity):
+    """Per-child "App, feature, and game limits" switch.
+
+    Mirrors the toggle above the app list on family.microsoft.com: while it
+    is off, the limits set on individual apps are kept but not enforced.
+    """
+
+    def __init__(
+        self,
+        coordinator: FamilySafetyDataUpdateCoordinator,
+        entry: ConfigEntry,
+        account_id: str,
+        account_name: str,
+    ) -> None:
+        super().__init__(coordinator)
+        self._account_id = account_id
+        self._account_name = account_name
+        self._attr_unique_id = f"{entry.entry_id}_{account_id}_app_limits"
+        self._attr_name = f"{account_name} App Limits"
+        self._optimistic_state: bool | None = None
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._account_id)},
+            name=f"{self._account_name} (Family Safety)",
+            manufacturer="Microsoft",
+            model="Family Safety Account",
+        )
+
+    @property
+    def is_on(self) -> bool | None:
+        if self._optimistic_state is not None:
+            return self._optimistic_state
+        account = (self.coordinator.data or {}).get("accounts", {}).get(self._account_id) or {}
+        value = account.get("app_limits_enabled")
+        return value if isinstance(value, bool) else None
+
+    @property
+    def icon(self) -> str:
+        return "mdi:apps-box" if self.is_on else "mdi:apps"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {ATTR_USER_ID: self._account_id}
+
+    async def _async_set(self, enabled: bool) -> None:
+        self._optimistic_state = enabled
+        self.async_write_ha_state()
+        try:
+            await self.coordinator.async_set_app_limits_enabled(self._account_id, enabled)
+        finally:
+            self._optimistic_state = None
+            self.async_write_ha_state()
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await async_check_entity_action(self)
+        _LOGGER.info("Enabling app limits for %s", self._account_name)
+        await self._async_set(True)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await async_check_entity_action(self)
+        _LOGGER.info("Disabling app limits for %s", self._account_name)
+        await self._async_set(False)
+
+
+class FamilySafetyXboxScheduleSwitch(CoordinatorEntity, SwitchEntity):
+    """Turn the child's Xbox schedule on or off (the days are kept).
+
+    Mirrors the Xbox screen time toggle of the Family Safety app. While it is
+    on, the console enforces the "Xbox <day> Limit" values.
+    """
+
+    def __init__(
+        self,
+        coordinator: FamilySafetyDataUpdateCoordinator,
+        entry: ConfigEntry,
+        account_id: str,
+        account_name: str,
+    ) -> None:
+        super().__init__(coordinator)
+        self._account_id = account_id
+        self._account_name = account_name
+        self._attr_unique_id = f"{entry.entry_id}_{account_id}_xbox_schedule"
+        self._attr_name = f"{account_name} Xbox Screen Time Limits"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._account_id)},
+            name=f"{self._account_name} (Family Safety)",
+            manufacturer="Microsoft",
+            model="Family Safety Account",
+        )
+
+    @property
+    def is_on(self) -> bool | None:
+        account = (self.coordinator.data or {}).get("accounts", {}).get(self._account_id) or {}
+        policy = account.get("xbox_screentime_policy")
+        if not isinstance(policy, dict) or not isinstance(policy.get("isEnabled"), bool):
+            return None
+        return policy["isEnabled"]
+
+    @property
+    def icon(self) -> str:
+        return "mdi:microsoft-xbox" if self.is_on else "mdi:microsoft-xbox-controller-off"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {ATTR_USER_ID: self._account_id}
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await async_check_entity_action(self)
+        _LOGGER.info("Enabling Xbox screen time limits for %s", self._account_name)
+        await self.coordinator.async_set_xbox_schedule_enabled(self._account_id, True)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await async_check_entity_action(self)
+        _LOGGER.info("Disabling Xbox screen time limits for %s", self._account_name)
+        await self.coordinator.async_set_xbox_schedule_enabled(self._account_id, False)

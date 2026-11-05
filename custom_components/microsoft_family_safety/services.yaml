@@ -195,12 +195,12 @@ set_screentime_intervals:
           step: 30
     end_hour:
       name: End Hour
-      description: End of allowed window (0-23).
+      description: End of allowed window (0-24, 24 = midnight).
       required: true
       selector:
         number:
           min: 0
-          max: 23
+          max: 24
           step: 1
     end_minute:
       name: End Minute
@@ -323,6 +323,23 @@ block_website:
     website:
       name: Website
       description: The domain to block (e.g., "example.com").
+      required: true
+      selector:
+        text:
+
+allow_website:
+  name: Allow Website
+  description: Add a website to the allowed list of a child account.
+  fields:
+    account_id:
+      name: Account ID
+      description: The user ID of the child account.
+      required: true
+      selector:
+        text:
+    website:
+      name: Website
+      description: The domain to allow (e.g., "example.com").
       required: true
       selector:
         text:

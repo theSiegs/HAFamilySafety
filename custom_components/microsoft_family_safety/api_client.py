@@ -21,6 +21,8 @@ from typing import Any
 import aiohttp
 from yarl import URL
 
+from homeassistant.util import dt as dt_util
+
 from ._pyfamilysafety_compat import authenticator_access_token_expired
 from .const import DAY_KEYS
 
@@ -176,6 +178,13 @@ class FamilySafetyWebAPI:
         #: "terms_of_use" when updated Terms of Use must be accepted. Such a
         #: step is a user decision and is never submitted automatically.
         self.account_interrupt: str | None = None
+        #: Set once the mobile /v4 schedule API answered; schedules then no
+        #: longer depend on the Family web context.
+        self.mobile_schedule_ok = False
+        #: Browser-like Accept-Language; the coordinator sets it from HA's language.
+        self.accept_language = "en-US,en;q=0.9"
+        #: child id -> (time.monotonic(), payload) of the last schedules GET.
+        self._mobile_schedule_cache: dict[str, tuple[float, dict]] = {}
         # Keep authentication health separate from endpoint-specific failures.
         # A private endpoint may return 401/403 while the account.microsoft.com
         # Family browser session itself is still authenticated.
@@ -277,24 +286,30 @@ class FamilySafetyWebAPI:
         """
         if self._web_session is None or self._web_session.closed:
             return strip_bot_manager_cookies(self._web_cookies)
-        exported: list[dict[str, Any]] = []
+        # Microsoft sets the same cookie for "host" and ".host"; aiohttp keeps
+        # both and the store grew by a pair per poll. One per (name, host,
+        # path), the ".host" form preferred since it also covers subdomains.
+        exported: dict[tuple[str, str, str], dict[str, Any]] = {}
         for morsel in self._web_session.cookie_jar:
             domain = str(morsel["domain"] or "")
             if not domain or morsel.key in _BOT_MANAGER_COOKIE_NAMES:
+                continue
+            path = str(morsel["path"] or "/")
+            key = (morsel.key, domain.lstrip("."), path)
+            if key in exported and not domain.startswith("."):
                 continue
             item: dict[str, Any] = {
                 "name": morsel.key,
                 "value": morsel.value,
                 "domain": domain,
-                "path": str(morsel["path"] or "/"),
+                "path": path,
                 "secure": bool(morsel["secure"]),
                 "httpOnly": bool(morsel["httponly"]),
             }
             if morsel["expires"]:
                 item["expires"] = str(morsel["expires"])
-            exported.append(item)
-        exported.sort(key=lambda item: (item["domain"], item["path"], item["name"]))
-        return exported
+            exported[key] = item
+        return sorted(exported.values(), key=lambda item: (item["domain"], item["path"], item["name"]))
 
     def export_family_context(self) -> tuple[str | None, str | None]:
         """Return captured Family antiforgery context for persistence."""
@@ -534,7 +549,7 @@ class FamilySafetyWebAPI:
             return None
         headers = {
             "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "de,de-DE;q=0.9,en;q=0.8,en-US;q=0.6",
+            "Accept-Language": self.accept_language,
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
             "User-Agent": _BROWSER_USER_AGENT,
@@ -681,7 +696,7 @@ class FamilySafetyWebAPI:
         """
         headers = {
             "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "de,de-DE;q=0.9,en;q=0.8,en-US;q=0.6",
+            "Accept-Language": self.accept_language,
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
             "User-Agent": _BROWSER_USER_AGENT,
@@ -777,7 +792,7 @@ class FamilySafetyWebAPI:
         self._web_csrf = None
         headers = {
             "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "de,de-DE;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+            "Accept-Language": self.accept_language,
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
             "User-Agent": _BROWSER_USER_AGENT,
@@ -1083,7 +1098,7 @@ class FamilySafetyWebAPI:
                 referer = f"{self.WEB_API_BASE}/family/settings/windows/{child}/devices"
         headers = {
             "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "de,de-DE;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+            "Accept-Language": self.accept_language,
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
             "X-Requested-With": "XMLHttpRequest",
@@ -1835,44 +1850,6 @@ class FamilySafetyWebAPI:
             f"{seconds // 3600} h" if seconds >= 3600 else f"{seconds // 60} min",
         )
 
-    async def set_xbox_screentime_allowance(
-        self,
-        child_id: str,
-        day_key: str,
-        hours: int,
-        minutes: int,
-        allowed_ranges: list[dict[str, str]],
-    ) -> bool:
-        """Set one day's Xbox allowance, keeping its allowed time ranges.
-
-        POST /family/api/xbox/screen-time-xbox/set-custom-device-policy, the
-        call behind UpdateXboxScreenTimeAllowedIntervals in the Family web app.
-        Microsoft takes allowance and ranges together, so the caller passes the
-        day's current ``allowedScreenTimeRanges`` back unchanged.
-        """
-        result = await self._web_request(
-            "POST",
-            f"{self.WEB_API_BASE}/family/api/xbox/screen-time-xbox/set-custom-device-policy",
-            json_data={
-                "childId": str(child_id),
-                "screenTimeUpdateParams": {
-                    # .NET TimeSpan, which has no "24:00:00": a whole day is "1.00:00:00"
-                    "allowance": (
-                        "1.00:00:00"
-                        if int(hours) * 60 + int(minutes) >= 1440
-                        else f"{int(hours):02d}:{int(minutes):02d}:00"
-                    ),
-                    "daysOfWeek": [day_key],
-                    "allowedIntervals": [
-                        {"begin": r["begin"], "end": r["end"]} for r in allowed_ranges
-                    ],
-                },
-            },
-        )
-        if result is None:
-            raise FamilySafetyWebAPIError("Xbox screen-time allowance update failed")
-        return True
-
     @staticmethod
     def _extract_daily_usage_minutes(payload: object, target_date: str) -> int | None:
         """Pull the target day's total from a recent-activity report payload."""
@@ -1915,6 +1892,226 @@ class FamilySafetyWebAPI:
             return None
         return hours * 60 + minutes + (1 if seconds >= 30 else 0)
 
+    # ------------------------------------------------------------------
+    # Mobile schedule API (/v4/devicelimits/schedules), as used by the
+    # Family Safety iOS app 2.1.0. It runs on the long-lived mobile refresh
+    # token, so it keeps working when the Family web context demands its
+    # daily interactive sign-in (prompt=login, #52). GET needs ``culture``
+    # and ``time`` (local ISO time with offset); both calls need Plat-Info.
+    # Allowances are milliseconds, intervals are {begin, end} "HH:MM:SS".
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mobile_now() -> str:
+        # Home Assistant's time zone, not the container's (which may be UTC).
+        return dt_util.now().isoformat(timespec="seconds")
+
+    async def _get_mobile_schedules(self, child_id: str, *, max_age: float = 0.0) -> dict:
+        """GET the child's schedules (Windows and Xbox in one payload).
+
+        ``max_age`` lets a read reuse a payload fetched moments ago in the same
+        poll (the Xbox read right after the Windows one). Writes always pass 0:
+        they rebuild the day from what Microsoft holds right now.
+        """
+        key = str(child_id)
+        cached = self._mobile_schedule_cache.get(key)
+        if max_age > 0 and cached and time.monotonic() - cached[0] <= max_age:
+            return cached[1]
+        result = await self._request(
+            "GET",
+            f"/v4/devicelimits/schedules/{child_id}",
+            params={"culture": "en-us", "time": self._mobile_now()},
+            extra_headers={"Plat-Info": "Windows"},
+        )
+        if not isinstance(result, dict):
+            raise FamilySafetyWebAPIError("Mobile schedule response was empty")
+        self._mobile_schedule_cache[key] = (time.monotonic(), result)
+        return result
+
+    @staticmethod
+    def _mobile_platform_schedule(payload: dict, platform: str) -> dict | None:
+        for schedule in payload.get("schedules") or []:
+            if isinstance(schedule, dict) and str(schedule.get("appliesTo")).lower() == platform.lower():
+                return schedule
+        return None
+
+    @staticmethod
+    def _time_to_slot(value: str, *, ceil: bool) -> int:
+        # .NET TimeSpan: midnight at the end of the day is "1.00:00:00".
+        text = str(value).strip()
+        days = 0
+        if "." in text.split(":")[0]:
+            day_part, text = text.split(".", 1)
+            days = int(day_part or 0)
+        parts = [int(float(p)) for p in text.split(":")[:3]] + [0, 0]
+        minutes = days * 1440 + parts[0] * 60 + parts[1] + (1 if parts[2] else 0)
+        slot = minutes // 30 + (1 if ceil and minutes % 30 else 0)
+        return max(0, min(48, slot))
+
+    @classmethod
+    def _intervals_to_slots(cls, intervals: list) -> list[bool]:
+        slots = [False] * 48
+        for item in intervals or []:
+            if not isinstance(item, dict):
+                continue
+            start = cls._time_to_slot(item.get("begin", "00:00:00"), ceil=False)
+            end = cls._time_to_slot(item.get("end", "00:00:00"), ceil=True)
+            if end <= start:
+                end = 48
+            for index in range(start, end):
+                slots[index] = True
+        return slots
+
+    @staticmethod
+    def _slots_to_intervals(slots: list[bool]) -> list[dict[str, str]]:
+        def fmt(slot: int) -> str:
+            if slot >= 48:
+                return "1.00:00:00"
+            return f"{slot // 2:02d}:{30 if slot % 2 else 0:02d}:00"
+
+        intervals: list[dict[str, str]] = []
+        start: int | None = None
+        for index, allowed in enumerate(list(slots) + [False]):
+            if allowed and start is None:
+                start = index
+            elif not allowed and start is not None:
+                intervals.append({"begin": fmt(start), "end": fmt(index)})
+                start = None
+        return intervals
+
+    async def get_mobile_screentime_policy(self, child_id: str, platform: str = "Windows") -> dict | None:
+        """Return the child's schedule in the shape the entities read (allowance "HH:MM:SS").
+
+        ``mobile_schedule_ok`` silences the daily web reauth, so it turns true
+        only once a policy was actually produced and false on any failure.
+        """
+        try:
+            schedule = self._mobile_platform_schedule(
+                await self._get_mobile_schedules(child_id), platform
+            )
+            result = self._convert_mobile_schedule(schedule) if schedule else None
+        except Exception:
+            self.mobile_schedule_ok = False
+            raise
+        self.mobile_schedule_ok = result is not None
+        return result
+
+    @classmethod
+    def _convert_mobile_schedule(cls, schedule: dict) -> dict | None:
+        daily: dict[str, dict[str, Any]] = {}
+        for day, data in (schedule.get("dailyRestrictions") or {}).items():
+            if not isinstance(data, dict):
+                continue
+            seconds = int(data.get("allowance") or 0) // 1000
+            intervals = data.get("allottedIntervals") or []
+            slots = cls._intervals_to_slots(intervals)
+            daily[day] = {
+                "allowance": f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}",
+                "allottedIntervals": intervals,
+                "allowedIntervals": slots,
+                # The lock/unlock restore reads 48 booleans only from "timeline".
+                "timeline": slots,
+            }
+        if not daily:
+            return None
+        return {"isEnabled": schedule.get("enabled"), "appliesTo": schedule.get("appliesTo"),
+                "dailyRestrictions": daily}
+
+    async def get_mobile_xbox_screentime_policy(self, child_id: str) -> dict | None:
+        """The child's Xbox schedule, from the same mobile payload as Windows.
+
+        Accounts in "PerDeviceType" mode have a separate Xbox schedule, which
+        is what the console enforces. It comes back in the Windows GET, so a
+        payload fetched moments ago in the same poll is reused. Never touches
+        ``mobile_schedule_ok``: that flag is about the Windows schedule.
+        """
+        payload = await self._get_mobile_schedules(child_id, max_age=30.0)
+        schedule = self._mobile_platform_schedule(payload, "Xbox")
+        if schedule is None:
+            return None
+        return self._convert_mobile_schedule(schedule)
+
+    async def set_mobile_xbox_screentime_allowance(
+        self, child_id: str, day_of_week: int, hours: int, minutes: int
+    ) -> bool:
+        await self._patch_mobile_day(
+            child_id,
+            day_of_week,
+            allowance_ms=(int(hours) * 60 + int(minutes)) * 60_000,
+            platform="Xbox",
+        )
+        return True
+
+    async def _patch_mobile_day(
+        self,
+        child_id: str,
+        day_of_week: int,
+        *,
+        allowance_ms: int | None = None,
+        intervals: list[dict[str, str]] | None = None,
+        platform: str = "Windows",
+    ) -> None:
+        payload = await self._get_mobile_schedules(child_id)
+        schedule = self._mobile_platform_schedule(payload, platform)
+        if schedule is None:
+            raise FamilySafetyWebAPIError(f"No {platform} schedule in the mobile response")
+        day = DAY_KEYS[day_of_week]
+        current = (schedule.get("dailyRestrictions") or {}).get(day) or {}
+        body = {
+            "dailyRestrictions": {
+                day: {
+                    "allowance": int(current.get("allowance") or 0) if allowance_ms is None else allowance_ms,
+                    "allottedIntervals": (
+                        (current.get("allottedIntervals") or []) if intervals is None else intervals
+                    ),
+                }
+            },
+            "appliesTo": schedule.get("appliesTo") or platform,
+            "culture": "en-us",
+            "mode": payload.get("mode") or "PerDeviceType",
+            "time": self._mobile_now(),
+        }
+        await self._request(
+            "PATCH", f"/v4/devicelimits/schedules/{child_id}",
+            json_data=body, extra_headers={"Plat-Info": "Windows"},
+        )
+
+    async def set_mobile_schedule_enabled(
+        self, child_id: str, enabled: bool, platform: str = "Windows"
+    ) -> bool:
+        """Turn the platform's weekly schedule on or off, keeping its days intact."""
+        payload = await self._get_mobile_schedules(child_id)
+        await self._request(
+            "PATCH", f"/v4/devicelimits/schedules/{child_id}",
+            json_data={
+                "enabled": bool(enabled),
+                "appliesTo": platform,
+                "culture": "en-us",
+                "mode": payload.get("mode") or "PerDeviceType",
+                "time": self._mobile_now(),
+            },
+            extra_headers={"Plat-Info": "Windows"},
+        )
+        return True
+
+    async def set_mobile_screentime_allowance(
+        self, child_id: str, day_of_week: int, hours: int, minutes: int
+    ) -> bool:
+        await self._patch_mobile_day(
+            child_id, day_of_week, allowance_ms=(int(hours) * 60 + int(minutes)) * 60_000
+        )
+        return True
+
+    async def set_mobile_screentime_intervals(
+        self, child_id: str, day_of_week: int, allowed_intervals: list[bool]
+    ) -> bool:
+        if len(allowed_intervals) != 48:
+            raise ValueError("allowed_intervals must contain exactly 48 values")
+        await self._patch_mobile_day(
+            child_id, day_of_week, intervals=self._slots_to_intervals(allowed_intervals)
+        )
+        return True
+
     async def set_screentime_daily_allowance(
         self,
         child_id: str,
@@ -1932,6 +2129,65 @@ class FamilySafetyWebAPI:
         )
         return result if isinstance(result, dict) else None
 
+    # App time limits (mobile aggregator, v3/AppLimits/policies), as the
+    # Family Safety app sends them since 2026-10 (capture shared on #64):
+    # days at the top level, allowance in milliseconds, intervals as
+    # {"start", "end"} in 12-hour .NET format ("07:00:00 AM"), whole day =
+    # "12:00:00 AM" to "12:00:00 AM" with intervalsEnabled false. Removing a
+    # limit is the same PATCH without the day keys.
+    _APP_LIMIT_PLATFORMS = {"windows": "Windows", "xbox": "Xbox", "mobile": "Mobile"}
+
+    @staticmethod
+    def _to_12h(value: str) -> str:
+        parts = [int(p) for p in str(value).strip().split(":")[:3]] + [0, 0]
+        hours = parts[0] % 24
+        suffix = "AM" if hours < 12 else "PM"
+        hours12 = hours % 12 or 12
+        return f"{hours12:02d}:{parts[1]:02d}:{parts[2]:02d} {suffix}"
+
+    @staticmethod
+    def _duration_to_ms(value: str) -> int:
+        parts = [int(p) for p in str(value).strip().split(":")[:3]] + [0, 0]
+        return ((parts[0] * 60 + parts[1]) * 60 + parts[2]) * 1000
+
+    def _app_limit_base(self, app_id: str, display_name: str) -> dict[str, Any]:
+        return {
+            "appId": app_id,
+            "displayName": display_name or app_id,
+            "enabled": True,
+            "blockState": "NotBlocked",
+            "appTimeEnforcementPolicy": "Custom",
+            "alternateAppIds": [],
+        }
+
+    async def get_app_limits_enabled(self, child_id: str, platform: str = "Windows") -> bool | None:
+        """Read the per-child "App, feature, and game limits" switch.
+
+        While it is off, no per-app limit is enforced even though the limits
+        stay stored. GET v2/AppLimits/settings/{child} with Plat-Info answers
+        {"enabled": bool, "lastModified": ...}.
+        """
+        result = await self._request(
+            "GET",
+            f"/v2/AppLimits/settings/{child_id}",
+            extra_headers={"Plat-Info": platform},
+        )
+        if isinstance(result, dict) and isinstance(result.get("enabled"), bool):
+            return result["enabled"]
+        return None
+
+    async def set_app_limits_enabled(
+        self, child_id: str, enabled: bool, platform: str = "Windows"
+    ) -> bool:
+        """Turn the per-child app limits switch on or off (204 on success)."""
+        await self._request(
+            "PATCH",
+            f"/v2/AppLimits/settings/{child_id}",
+            json_data={"enabled": bool(enabled)},
+            extra_headers={"Plat-Info": platform},
+        )
+        return True
+
     async def set_app_time_limit(
         self,
         child_id: str,
@@ -1942,103 +2198,122 @@ class FamilySafetyWebAPI:
         start_time: str = "07:00:00",
         end_time: str = "22:00:00",
     ) -> dict | None:
-        day_schedule = {
-            "allowance": allowance,
-            "allottedIntervalsEnabled": True,
-            "allottedIntervals": [{"start": start_time, "end": end_time}],
+        """Set the same daily limit (and allowed window) on every day."""
+        start = self._to_12h(start_time)
+        end = self._to_12h(end_time)
+        whole_day = start == end
+        day = {
+            "allowance": self._duration_to_ms(allowance),
+            "intervalsEnabled": not whole_day,
+            "intervals": [{"start": start, "end": end}],
         }
-        policy = {
-            # These identity/state fields are present in pyfamilysafety 1.1.2's
-            # working set_app_policy payload for the same mobile endpoint.
-            "appId": app_id,
-            "displayName": display_name or app_id,
-            "enabled": True,
-            "blocked": False,
-            "blockState": "NotBlocked",
-            "appTimeEnforcementPolicy": "custom",
-            **{day: day_schedule for day in DAY_KEYS},
-        }
-        platform_header = {
-            "windows": "WINDOWS",
-            "xbox": "XBOX",
-            "mobile": "MOBILE",
-        }.get(str(platform).lower(), str(platform).upper())
+        body = {**self._app_limit_base(app_id, display_name), **{d: day for d in DAY_KEYS}}
         result = await self._request(
             "PATCH",
-            f"/v3/appLimits/policies/{child_id}/{app_id}",
-            json_data=policy,
-            extra_headers={"Plat-Info": platform_header},
+            f"/v3/AppLimits/policies/{child_id}/{app_id}",
+            json_data=body,
+            extra_headers={
+                "Plat-Info": self._APP_LIMIT_PLATFORMS.get(str(platform).lower(), "Windows")
+            },
         )
-        return result if isinstance(result, dict) else None
+        return result if isinstance(result, dict) else {}
 
     async def remove_app_time_limit(
         self, child_id: str, app_id: str, display_name: str, platform: str
     ) -> dict | None:
-        platform_header = {
-            "windows": "WINDOWS",
-            "xbox": "XBOX",
-            "mobile": "MOBILE",
-        }.get(str(platform).lower(), str(platform).upper())
+        """Remove the app's time limit: the same PATCH without the day keys."""
         result = await self._request(
             "PATCH",
-            f"/v3/appLimits/policies/{child_id}/{app_id}",
-            json_data={
-                "appId": app_id,
-                "displayName": display_name or app_id,
-                "enabled": False,
-                "blocked": False,
-                "blockState": "NotBlocked",
-                "appTimeEnforcementPolicy": "custom",
+            f"/v3/AppLimits/policies/{child_id}/{app_id}",
+            json_data=self._app_limit_base(app_id, display_name),
+            extra_headers={
+                "Plat-Info": self._APP_LIMIT_PLATFORMS.get(str(platform).lower(), "Windows")
             },
-            extra_headers={"Plat-Info": platform_header},
         )
-        return result if isinstance(result, dict) else None
+        return result if isinstance(result, dict) else {}
+
+    @staticmethod
+    def _website_url(website: str) -> str:
+        """Microsoft wants an absolute URL in the exception list (#54).
+
+        A bare host such as ``example.org`` answers
+        ``Settings.WebRestrictions.BadUrlFormat``; ``https://example.org`` is
+        accepted and the app shows it as ``example.org``.
+        """
+        site = str(website).strip()
+        if not site.lower().startswith(("http://", "https://")):
+            site = f"https://{site}"
+        return site
 
     async def block_website(self, child_id: str, website: str) -> dict | None:
-        """Block a website without discarding the existing lists.
+        """Add a website to the blocked list.
 
-        Microsoft treats the list fields as policy values, so preserve the
-        current blocked/allowed entries instead of sending only the new host.
-        Reading is performed through the current web endpoint when available;
-        the actual write remains on the mobile API, as in the upstream client.
+        Since 2026-10 the mobile aggregator takes one operation per site:
+        ``{"op": "Add", "path": "/exceptions", "value": {"website": url,
+        "allowed": false}}``; ``allowed: true`` puts it on the allowed list
+        instead. The write answers 204 and the Family Safety app shows the
+        site right away, but the mobile ``GET /v1/WebRestrictions`` still
+        returns ``exceptions: []`` for it, so do not read back through it.
+        Confirmed on a real account on 2026-10-27.
         """
-        current = await self.get_web_browsing_settings(child_id)
-        if not isinstance(current, dict):
-            raise FamilySafetyWebAPIError(
-                "Cannot safely add a blocked website because the current web policy could not be read"
-            )
-        blocked = list(current.get("blockedSites") or current.get("BlockedSites") or [])
-        allowed = list(current.get("allowedSites") or current.get("AllowedSites") or [])
-        if website not in blocked:
-            blocked.append(website)
-        allowed = [site for site in allowed if site != website]
         result = await self._request(
             "PATCH",
             f"/v1/WebRestrictions/{child_id}",
-            json_data={"blockedSites": blocked, "allowedSites": allowed},
+            json_data={"operations": [{
+                "op": "Add",
+                "path": "/exceptions",
+                "value": {"website": self._website_url(website), "allowed": False},
+            }]},
         )
-        return result if isinstance(result, dict) else None
+        return result if isinstance(result, dict) else {}
+
+    async def allow_website(self, child_id: str, website: str) -> dict | None:
+        """Add a website to the allowed list (see block_website)."""
+        result = await self._request(
+            "PATCH",
+            f"/v1/WebRestrictions/{child_id}",
+            json_data={"operations": [{
+                "op": "Add",
+                "path": "/exceptions",
+                "value": {"website": self._website_url(website), "allowed": True},
+            }]},
+        )
+        return result if isinstance(result, dict) else {}
 
     async def remove_website(self, child_id: str, website: str) -> dict | None:
-        current = await self.get_web_browsing_settings(child_id)
-        if not isinstance(current, dict):
-            raise FamilySafetyWebAPIError(
-                "Cannot safely remove a website because the current web policy could not be read"
-            )
-        blocked_source = current.get("blockedSites") or current.get("BlockedSites") or []
-        allowed_source = current.get("allowedSites") or current.get("AllowedSites") or []
-        blocked = [s for s in blocked_source if s != website]
-        allowed = [s for s in allowed_source if s != website]
+        """Remove a website from the blocked or allowed list.
+
+        The removal takes the URL as a plain string value: an object there
+        makes the aggregator answer 500 ``JsonReaderException``.
+        """
         result = await self._request(
             "PATCH",
             f"/v1/WebRestrictions/{child_id}",
-            json_data={"blockedSites": blocked, "allowedSites": allowed},
+            json_data={"operations": [{
+                "op": "Remove",
+                "path": "/exceptions",
+                "value": self._website_url(website),
+            }]},
         )
-        return result if isinstance(result, dict) else None
+        return result if isinstance(result, dict) else {}
+
+    @staticmethod
+    def _patch_operations(path: str, value: Any) -> dict[str, Any]:
+        """Body of a mobile-aggregator PATCH since 2026-10 (issue #54).
+
+        WebRestrictions and ContentRestrictions now take a JSON-Patch-like
+        document, ``{"operations": [{"op": "Replace", "path": "/field",
+        "value": ...}]}``. The op is spelled with a capital letter: ``replace``
+        is rejected with a generic "Invalid Payload". Confirmed on 2026-10-27
+        with a real change of ``maxAgeRating`` read back from Microsoft.
+        """
+        return {"operations": [{"op": "Replace", "path": path, "value": value}]}
 
     async def toggle_web_filter(self, child_id: str, enabled: bool) -> dict | None:
         result = await self._request(
-            "PATCH", f"/v1/WebRestrictions/{child_id}", json_data={"isEnabled": enabled}
+            "PATCH",
+            f"/v1/WebRestrictions/{child_id}",
+            json_data=self._patch_operations("/enabled", bool(enabled)),
         )
         return result if isinstance(result, dict) else None
 
@@ -2046,17 +2321,23 @@ class FamilySafetyWebAPI:
         if not 3 <= age <= 21:
             raise ValueError("age must be between 3 and 21")
         result = await self._request(
-            "PATCH", f"/v1/ContentRestrictions/{child_id}", json_data={"maxAgeRating": age}
+            "PATCH",
+            f"/v1/ContentRestrictions/{child_id}",
+            json_data=self._patch_operations("/maxAgeRating", int(age)),
         )
         return result if isinstance(result, dict) else None
 
     async def set_acquisition_policy(
         self, child_id: str, require_approval: bool
     ) -> dict | None:
+        # Same document shape as set_age_rating; the field itself has not
+        # been exercised against a real account yet.
         result = await self._request(
             "PATCH",
             f"/v1/ContentRestrictions/{child_id}",
-            json_data={"acquisitionPolicy": "freeOnly" if require_approval else "unrestricted"},
+            json_data=self._patch_operations(
+                "/acquisitionPolicy", "freeOnly" if require_approval else "unrestricted"
+            ),
         )
         return result if isinstance(result, dict) else None
 

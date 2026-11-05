@@ -16,6 +16,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import ATTR_FIRST_NAME, ATTR_SURNAME, DAYS, DOMAIN
 from .coordinator import FamilySafetyDataUpdateCoordinator
+from .permissions import async_check_entity_action
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -37,24 +38,11 @@ def _parse_allowance_to_minutes(allowance: str | int | float | None) -> int:
                 return 0
             return int(match.group(1) or 0) * 60 + int(match.group(2) or 0)
         parts = text.split(":")
-        # .NET TimeSpan: a whole day comes as "1.00:00:00"
-        days = 0
-        if "." in parts[0]:
-            day_text, parts[0] = parts[0].split(".", 1)
-            days = int(day_text)
-        hours = days * 24 + int(parts[0])
+        hours = int(parts[0])
         minutes = int(parts[1]) if len(parts) > 1 else 0
         return hours * 60 + minutes
     except (TypeError, ValueError, IndexError):
         return 0
-
-
-def _xbox_schedule(account_data: dict | None) -> dict | None:
-    """The Xbox schedule ("data" of the Xbox policy the coordinator keeps)."""
-    payload = (account_data or {}).get("xbox_policy")
-    data = payload.get("data") if isinstance(payload, dict) else None
-    return data if isinstance(data, dict) else None
-
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -81,9 +69,15 @@ async def async_setup_entry(
                             coordinator, entry, account_id, day_index, day_key, day_label,
                         )
                     )
-            # Xbox limits only for children whose Xbox schedule could be read
-            # (a child without an Xbox gets 403 and no entities).
-            if account_id not in known_xbox_accounts and _xbox_schedule(account_data):
+            # Xbox limits once the child's Xbox schedule is turned on (the
+            # "Xbox Screen Time Limits" switch, or the Family Safety app).
+            xbox = (account_data or {}).get("xbox_screentime_policy")
+            if (
+                coordinator.xbox_features
+                and account_id not in known_xbox_accounts
+                and isinstance(xbox, dict)
+                and xbox.get("isEnabled")
+            ):
                 known_xbox_accounts.add(account_id)
                 for day_index, day_key, day_label in DAYS:
                     entities.append(
@@ -175,6 +169,7 @@ class FamilySafetyDailyLimitNumber(CoordinatorEntity, NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         """Set the daily screen time limit (optimistic update)."""
+        await async_check_entity_action(self)
         total_minutes = int(value)
         hours = total_minutes // 60
         minutes = total_minutes % 60
@@ -209,9 +204,10 @@ class FamilySafetyDailyLimitNumber(CoordinatorEntity, NumberEntity):
 class FamilySafetyXboxDailyLimitNumber(FamilySafetyDailyLimitNumber):
     """Daily Xbox allowance for one day.
 
-    When the child's time-allowance policy is ``perDeviceType`` the console
-    enforces its own schedule (/family/api/xbox/screen-time-xbox), and the
-    Windows limit above does not reach it.
+    On accounts where the Xbox has its own schedule ("PerDeviceType"), the
+    console enforces that schedule and the Windows limits above do not reach
+    it. Read and written through the mobile API. Idea and entity design from
+    PR #61 by JohnMcLear.
     """
 
     _attr_icon = "mdi:microsoft-xbox"
@@ -225,27 +221,29 @@ class FamilySafetyXboxDailyLimitNumber(FamilySafetyDailyLimitNumber):
         day_key: str,
         day_label: str,
     ) -> None:
-        """Initialize the Xbox number entity."""
         super().__init__(coordinator, entry, account_id, day_index, day_key, day_label)
         self._attr_unique_id = f"{entry.entry_id}_{account_id}_xbox_limit_{day_key}"
         self._attr_name = f"{self._account_name} Xbox {day_label} Limit"
 
     @property
     def native_value(self) -> float | None:
-        """Return the current Xbox allowance in minutes."""
         if self._optimistic_value is not None:
             return self._optimistic_value
-        account_data = self._get_account_data()
-        policy = _xbox_schedule(account_data)
-        if policy is None:
+        policy = (self._get_account_data() or {}).get("xbox_screentime_policy")
+        if not isinstance(policy, dict):
             return None
-        for day in policy.get("dailyRestrictions") or []:
-            if isinstance(day, dict) and day.get("dayOfWeek") == self._day_key:
-                return _parse_allowance_to_minutes(day.get("allowedTotalScreenTime"))
-        return None
+        day_data = (policy.get("dailyRestrictions") or {}).get(self._day_key)
+        if not isinstance(day_data, dict):
+            return None
+        return _parse_allowance_to_minutes(day_data.get("allowance"))
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        policy = (self._get_account_data() or {}).get("xbox_screentime_policy")
+        return {"xbox_schedule_enabled": bool(isinstance(policy, dict) and policy.get("isEnabled"))}
 
     async def async_set_native_value(self, value: float) -> None:
-        """Set the Xbox allowance for this day (optimistic update)."""
+        await async_check_entity_action(self)
         total_minutes = int(value)
         hours, minutes = divmod(total_minutes, 60)
         _LOGGER.info(
@@ -258,14 +256,8 @@ class FamilySafetyXboxDailyLimitNumber(FamilySafetyDailyLimitNumber):
             await self.coordinator.async_set_xbox_screentime_limit(
                 self._account_id, self._day_index, hours, minutes
             )
-            self._optimistic_value = None
         except Exception as err:
+            raise HomeAssistantError(f"Failed to set Xbox screen time limit: {err}") from err
+        finally:
             self._optimistic_value = None
             self.async_write_ha_state()
-            _LOGGER.error(
-                "Failed to set Xbox %s limit for %s: %s",
-                self._day_key, self._account_name, err,
-            )
-            raise HomeAssistantError(
-                f"Failed to set Xbox screen time limit: {err}"
-            ) from err

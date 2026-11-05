@@ -1,19 +1,20 @@
 """The Microsoft Family Safety integration."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 import logging
 
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
+from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
     ConfigEntryNotReady,
     HomeAssistantError,
 )
 from homeassistant.helpers import config_validation as cv
+from homeassistant.util import dt as dt_util
 
 from .const import (
     ALL_SERVICES,
@@ -26,6 +27,7 @@ from .const import (
     SERVICE_LOCK_PLATFORM,
     SERVICE_REMOVE_APP_TIME_LIMIT,
     SERVICE_REMOVE_WEBSITE,
+    SERVICE_ALLOW_WEBSITE,
     SERVICE_SET_ACQUISITION_POLICY,
     SERVICE_SET_AGE_RATING,
     SERVICE_SET_APP_TIME_LIMIT,
@@ -37,8 +39,10 @@ from .const import (
     SERVICE_LOCK_ACCOUNT,
     SERVICE_UNLOCK_ACCOUNT,
     SERVICE_REQUEST_REAUTH,
+    CONF_ALLOWED_USERS,
 )
 from .coordinator import FamilySafetyDataUpdateCoordinator
+from .permissions import guard_service
 from ._httpx_web_adapter import apply_httpx_web_transport_patch
 from ._httpx_web_tuning import apply_httpx_web_tuning_patch
 
@@ -91,7 +95,8 @@ SERVICE_SET_SCREENTIME_INTERVALS_SCHEMA = vol.Schema({
     vol.Required("day_of_week"): vol.All(vol.Coerce(int), vol.Range(min=0, max=6)),
     vol.Required("start_hour"): vol.All(vol.Coerce(int), vol.Range(min=0, max=23)),
     vol.Optional("start_minute", default=0): vol.In([0, 30]),
-    vol.Required("end_hour"): vol.All(vol.Coerce(int), vol.Range(min=0, max=23)),
+    # 24 = midnight at the end of the day (with end_minute 0).
+    vol.Required("end_hour"): vol.All(vol.Coerce(int), vol.Range(min=0, max=24)),
     vol.Optional("end_minute", default=0): vol.In([0, 30]),
 })
 
@@ -149,14 +154,24 @@ SERVICE_UNLOCK_ACCOUNT_SCHEMA = vol.Schema({
 SERVICE_REQUEST_REAUTH_SCHEMA = vol.Schema({})
 
 
-def _get_coordinator(hass: HomeAssistant) -> FamilySafetyDataUpdateCoordinator | None:
-    """Get the first available coordinator."""
-    if DOMAIN not in hass.data:
-        return None
-    for coordinator in hass.data[DOMAIN].values():
-        if isinstance(coordinator, FamilySafetyDataUpdateCoordinator):
+def _get_coordinator(
+    hass: HomeAssistant, account_id: str | None = None
+) -> FamilySafetyDataUpdateCoordinator | None:
+    """The coordinator whose roster holds ``account_id``, else the first one.
+
+    With two Microsoft accounts configured, each entry has its own token: a
+    call sent to the wrong one is refused by Microsoft.
+    """
+    coordinators = [
+        c for c in hass.data.get(DOMAIN, {}).values()
+        if isinstance(c, FamilySafetyDataUpdateCoordinator)
+    ]
+    for coordinator in coordinators:
+        if account_id is not None and str(account_id) in (
+            str(k) for k in ((coordinator.data or {}).get("accounts") or {})
+        ):
             return coordinator
-    return None
+    return coordinators[0] if coordinators else None
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -187,13 +202,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _register_services(hass)
 
     # Reload on options change (e.g. update interval)
+    _LOADED_OPTIONS[entry.entry_id] = _reload_relevant(entry.options)
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
 
     return True
 
 
+#: entry_id -> the options the entry was loaded with, minus those read live.
+_LOADED_OPTIONS: dict[str, dict] = {}
+
+
+def _reload_relevant(options) -> dict:
+    """Options whose change needs a reload. The allowed users are read at each action."""
+    return {k: v for k, v in dict(options).items() if k != CONF_ALLOWED_USERS}
+
+
 async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Handle options update — reload the integration."""
+    """Reload on an options change, unless only the allowed users changed."""
+    if _LOADED_OPTIONS.get(entry.entry_id) == _reload_relevant(entry.options):
+        return
     await hass.config_entries.async_reload(entry.entry_id)
 
 
@@ -216,7 +243,7 @@ def _register_services(hass: HomeAssistant) -> None:
         (SERVICE_LOCK_PLATFORM, SERVICE_LOCK_PLATFORM_SCHEMA, "async_lock_platform",
          lambda d: (
              d["account_id"], d["platform"],
-             datetime.now() + timedelta(hours=d.get("duration_hours", 24)),
+             dt_util.now() + timedelta(hours=d.get("duration_hours", 24)),
          )),
         (SERVICE_UNLOCK_PLATFORM, SERVICE_UNLOCK_PLATFORM_SCHEMA, "async_unlock_platform",
          lambda d: (d["account_id"], d["platform"])),
@@ -251,6 +278,8 @@ def _register_services(hass: HomeAssistant) -> None:
          lambda d: (d["account_id"], d["website"])),
         (SERVICE_REMOVE_WEBSITE, SERVICE_REMOVE_WEBSITE_SCHEMA, "async_remove_website",
          lambda d: (d["account_id"], d["website"])),
+        (SERVICE_ALLOW_WEBSITE, SERVICE_BLOCK_WEBSITE_SCHEMA, "async_allow_website",
+         lambda d: (d["account_id"], d["website"])),
         (SERVICE_TOGGLE_WEB_FILTER, SERVICE_TOGGLE_WEB_FILTER_SCHEMA,
          "async_toggle_web_filter",
          lambda d: (d["account_id"], d["enabled"])),
@@ -269,7 +298,7 @@ def _register_services(hass: HomeAssistant) -> None:
 
     def make_handler(method_name, extract_args):
         async def handler(call: ServiceCall) -> None:
-            coordinator = _get_coordinator(hass)
+            coordinator = _get_coordinator(hass, call.data.get("account_id"))
             if coordinator is None:
                 raise HomeAssistantError("No Microsoft Family Safety coordinator available")
             try:
@@ -286,45 +315,8 @@ def _register_services(hass: HomeAssistant) -> None:
 
     for name, schema, method, extract in services:
         hass.services.async_register(
-            DOMAIN, name, make_handler(method, extract), schema=schema
+            DOMAIN, name, guard_service(hass, make_handler(method, extract)), schema=schema
         )
-
-    async def probe_mobile_schedules(call: ServiceCall) -> ServiceResponse:
-        """Read-only probe: the raw mobile /v4 schedules answer for one child.
-
-        Runs on the long-lived mobile token, so it shows whether the Xbox
-        schedule is reachable without the Family web session (#52, #64).
-        """
-        coordinator = _get_coordinator(hass)
-        if coordinator is None or coordinator.web_api is None:
-            raise HomeAssistantError("No Microsoft Family Safety coordinator available")
-        child_id = str(call.data["account_id"])
-        answers = {}
-        for plat in call.data.get("plat_info", ["Windows", "Xbox"]):
-            try:
-                answers[plat] = await coordinator.web_api._request(
-                    "GET",
-                    f"/v4/devicelimits/schedules/{child_id}",
-                    params={
-                        "culture": "en-us",
-                        "time": datetime.now().astimezone().isoformat(timespec="seconds"),
-                    },
-                    extra_headers={"Plat-Info": plat},
-                )
-            except Exception as err:  # noqa: BLE001 - report it in the answer
-                answers[plat] = {"error": repr(err)}
-        return {"answers": answers}
-
-    hass.services.async_register(
-        DOMAIN,
-        "probe_mobile_schedules",
-        probe_mobile_schedules,
-        schema=vol.Schema({
-            vol.Required("account_id"): cv.string,
-            vol.Optional("plat_info"): vol.All(cv.ensure_list, [cv.string]),
-        }),
-        supports_response=SupportsResponse.ONLY,
-    )
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

@@ -13,6 +13,7 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory, UnitOfTime
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -33,10 +34,11 @@ from .const import (
     ATTR_SURNAME,
     ATTR_TODAY_TIME_USED,
     ATTR_USER_ID,
+    DAY_KEYS,
     DOMAIN,
 )
 from .coordinator import FamilySafetyDataUpdateCoordinator
-from .number import _parse_allowance_to_minutes, _xbox_schedule
+from .number import _parse_allowance_to_minutes
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -120,10 +122,16 @@ async def async_setup_entry(
                 entities.extend(
                     _create_account_sensors(coordinator, entry, account_id, account_data)
                 )
-            # Xbox sensors only for children Microsoft has Xbox data for
-            if account_id not in known_xbox_accounts and (
-                (account_data or {}).get("xbox_today_usage") is not None
-                or _xbox_schedule(account_data)
+            # Xbox sensors only for children Microsoft has Xbox data for. Xbox
+            # play comes from the web activity report, so they need the Xbox
+            # features (the Family web session).
+            if (
+                coordinator.xbox_features
+                and account_id not in known_xbox_accounts
+                and (
+                    (account_data or {}).get("xbox_today_usage") is not None
+                    or _xbox_schedule(account_data)
+                )
             ):
                 known_xbox_accounts.add(account_id)
                 entities.extend([
@@ -220,13 +228,23 @@ class FamilySafetyDeviceSensor(CoordinatorEntity, SensorEntity):
                 manufacturer="Microsoft",
             )
         account_id = device_data.get("account_id")
-        return DeviceInfo(
+        info = DeviceInfo(
             identifiers={(DOMAIN, self._device_id)},
             name=device_data.get(ATTR_DEVICE_NAME, "Unknown Device"),
             manufacturer=device_data.get("device_make", "Unknown"),
             model=device_data.get("device_model"),
-            via_device=(DOMAIN, account_id) if account_id else None,
         )
+        if account_id:
+            # `via_device` is deprecated (removed in HA 2027.8): the link now
+            # needs the registry id of the child's device. The account sensors
+            # fill in its name and model; creating it bare here only
+            # guarantees it exists whatever the order entities are added in.
+            parent = dr.async_get(self.hass).async_get_or_create(
+                config_entry_id=self.coordinator.entry.entry_id,
+                identifiers={(DOMAIN, account_id)},
+            )
+            info["via_device_id"] = parent.id
+        return info
 
 
 class FamilySafetyScreenTimeSensor(FamilySafetyAccountSensor):
@@ -280,6 +298,12 @@ class FamilySafetyScreenTimeSensor(FamilySafetyAccountSensor):
             ),
             **_format_duration_attributes(total_seconds),
         }
+
+
+def _xbox_schedule(account_data: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The child's Xbox schedule as the coordinator keeps it, if read."""
+    policy = (account_data or {}).get("xbox_screentime_policy")
+    return policy if isinstance(policy, dict) else None
 
 
 class FamilySafetyXboxScreenTimeSensor(FamilySafetyAccountSensor):
@@ -340,15 +364,9 @@ class FamilySafetyXboxTimeRemainingSensor(FamilySafetyAccountSensor):
         schedule = _xbox_schedule(self._get_account_data())
         if schedule is None:
             return None
-        day_key = dt_util.now().strftime("%A").lower()
-        return next(
-            (
-                day
-                for day in schedule.get("dailyRestrictions") or []
-                if isinstance(day, dict) and day.get("dayOfWeek") == day_key
-            ),
-            None,
-        )
+        day_key = DAY_KEYS[(dt_util.now().weekday() + 1) % 7]
+        day = (schedule.get("dailyRestrictions") or {}).get(day_key)
+        return day if isinstance(day, dict) else None
 
     def _limits_enabled(self) -> bool:
         schedule = _xbox_schedule(self._get_account_data()) or {}
@@ -357,7 +375,7 @@ class FamilySafetyXboxTimeRemainingSensor(FamilySafetyAccountSensor):
     def _allowance(self, today: dict[str, Any]) -> int:
         if not self._limits_enabled():
             return 24 * 60
-        return _parse_allowance_to_minutes(today.get("allowedTotalScreenTime"))
+        return _parse_allowance_to_minutes(today.get("allowance"))
 
     @property
     def native_value(self) -> int | None:
@@ -377,7 +395,7 @@ class FamilySafetyXboxTimeRemainingSensor(FamilySafetyAccountSensor):
         return {
             "limits_enabled": self._limits_enabled(),
             "allowance_minutes": self._allowance(today),
-            "allowed_ranges": today.get("allowedScreenTimeRanges") or [],
+            "allowed_ranges": today.get("allottedIntervals") or [],
         }
 
 
