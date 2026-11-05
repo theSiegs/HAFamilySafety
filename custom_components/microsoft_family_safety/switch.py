@@ -94,12 +94,12 @@ async def async_setup_entry(
             )
 
             # Xbox schedule on/off (the console's own limits, PerDeviceType).
-            if coordinator.xbox_features:
-                entities.append(
-                    FamilySafetyXboxScheduleSwitch(
-                        coordinator, entry, account_id, account_name,
-                    )
+            # Mobile API only, so it is there with or without Xbox features.
+            entities.append(
+                FamilySafetyXboxScheduleSwitch(
+                    coordinator, entry, account_id, account_name,
                 )
+            )
 
             # Per-child "App, feature, and game limits" switch: per-app limits
             # are only enforced while it is on.

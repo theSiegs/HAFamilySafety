@@ -1549,8 +1549,9 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "Microsoft account session is authenticated; keeping reauth disabled "
                 "and treating this as Family API context/authentication failure"
             )
-        if self._mobile_only:
-            return result
+        # The Xbox schedule comes from the mobile API (the same /v4 schedules
+        # payload as the Windows one), so it is read with or without the Xbox
+        # features: only the Xbox lock and Xbox play time need the web session.
         try:
             result["xbox_screentime_policy"] = (
                 await self.web_api.get_mobile_xbox_screentime_policy(account_id)

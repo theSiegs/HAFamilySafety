@@ -70,11 +70,11 @@ async def async_setup_entry(
                         )
                     )
             # Xbox limits once the child's Xbox schedule is turned on (the
-            # "Xbox Screen Time Limits" switch, or the Family Safety app).
+            # "Xbox Screen Time Limits" switch, or the Family Safety app). They
+            # run on the mobile API, so the Xbox features option is not needed.
             xbox = (account_data or {}).get("xbox_screentime_policy")
             if (
-                coordinator.xbox_features
-                and account_id not in known_xbox_accounts
+                account_id not in known_xbox_accounts
                 and isinstance(xbox, dict)
                 and xbox.get("isEnabled")
             ):
