@@ -245,6 +245,13 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._platform_holds: dict[str, dict[str, Any]] = {}
         self._platform_holds_loaded = False
         self._platform_hold_locks: dict[str, asyncio.Lock] = {}
+        #: Extra time this integration gave (add_time_bonus), kept apart from
+        #: the holds: "account|platform" -> {account_id, platform, until}.
+        self._bonus_store: Store = Store(
+            hass, STORAGE_VERSION, f"{DOMAIN}.platform_bonuses.{entry.entry_id}"
+        )
+        self._bonuses: dict[str, dict[str, Any]] = {}
+        self._bonuses_loaded = False
         #: account id -> list URL -> domains a sync_site_list added (site_sync.py).
         self._site_sync_store: Store = Store(
             hass, STORAGE_VERSION, f"{DOMAIN}.site_sync.{entry.entry_id}"
@@ -336,6 +343,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._policy_key(key): value for key, value in data.items()
             }
         await self._async_load_platform_holds()
+        await self._async_load_bonuses()
         await self.app_pauser.async_load()
         auth_state = await self._auth_store.async_load()
         if (
@@ -989,6 +997,166 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             and theirs is not None
             and abs(ours - theirs) <= self._OWN_LOCK_TOLERANCE
         )
+
+    # ------------------------------------------------------------------
+    # Extra time (add_time_bonus / cancel_time_bonus) -- EXPERIMENTAL
+    # ------------------------------------------------------------------
+    #
+    # No capture shows how extra time is written. The request is the
+    # captured blockUntil one with "allowUntil" (the type the reads report),
+    # and nothing is believed until Microsoft reads it back.
+
+    _BONUS_PLATFORMS = ("windows", "xbox")
+
+    async def _async_load_bonuses(self) -> None:
+        if self._bonuses_loaded:
+            return
+        data = await self._bonus_store.async_load()
+        if isinstance(data, dict):
+            self._bonuses = {str(k): v for k, v in data.items() if isinstance(v, dict)}
+        self._bonuses_loaded = True
+
+    def _bonus_in_force(self, account_id: Any, platform: str) -> dict[str, Any] | None:
+        bonus = self._bonuses.get(self._hold_key(account_id, platform))
+        if bonus is None or active_until({"type": ALLOW_UNTIL, "valid_until": bonus.get("until")}) is None:
+            return None
+        return bonus
+
+    def _web_error_code(self, platform: str) -> str | None:
+        if self.web_api is None:
+            return None
+        if platform.lower() == "windows":
+            return getattr(self.web_api, "last_web_error_code", None)
+        return getattr(self.web_api, "last_isolated_error_code", None)
+
+    async def _async_write_allow_until(
+        self, account: Account, account_id: str, platform: str, until: datetime
+    ) -> None:
+        """Send the experimental allowUntil once; an error is not retried."""
+        if self._web_override_available(platform):
+            try:
+                await self.web_api.set_platform_time_override(
+                    account_id, platform, "allowUntil", iso_utc(until)
+                )
+            except Exception as err:
+                raise HomeAssistantError(
+                    f"Microsoft refused the extra time (experimental request; "
+                    f"HTTP status {self._web_error_code(platform) or 'unknown'}): {err}"
+                ) from err
+            return
+        if platform.lower() in self._WEB_LOCK_STATE_PLATFORMS:
+            raise HomeAssistantError(
+                f"Cannot give {platform} extra time: it needs the Family web session, "
+                "which is not available. Re-authenticate the integration."
+            )
+        # Mobile aggregator, same body as pyfamilysafety's BlockUntil override.
+        body = {
+            "overrideType": "AllowUntil",
+            "target": platform,
+            "validUntil": dt_util.as_utc(until).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        try:
+            response = await account._api.send_request(
+                endpoint="override_device_restriction", body=body, USER_ID=account.user_id
+            )
+        except Exception as err:
+            raise HomeAssistantError(
+                f"Microsoft refused the extra time (experimental request): {err}"
+            ) from err
+        _LOGGER.debug("Experimental mobile AllowUntil: sent %s, answer %r", body, response)
+
+    async def async_add_time_bonus(
+        self, account_id: str, platform: str, until: datetime
+    ) -> dict[str, Any]:
+        """EXPERIMENTAL: give extra time on a platform until ``until``.
+
+        Microsoft keeps one override per platform, so extra time replaces a
+        lock of ours: the hold is let go (``released_hold``). Succeeds only
+        when Microsoft reads back an allowUntil ending within 2 minutes of
+        what was sent.
+        """
+        if platform.lower() not in self._BONUS_PLATFORMS:
+            raise ServiceValidationError("Extra time is for Windows or Xbox.")
+        account = self.get_account(account_id)
+        if account is None:
+            raise ValueError(f"Account {account_id} not found")
+        self._check_platform_lockable(platform)
+        until = dt_util.as_utc(until)
+        key = self._hold_key(account_id, platform)
+        async with self._hold_lock(key):
+            await self._async_load_platform_holds()
+            await self._async_load_bonuses()
+            await self._async_write_allow_until(account, account_id, platform, until)
+            current = await self._async_read_platform_override(account_id, platform)
+            sent = make_override(ALLOW_UNTIL, until)
+            if not (
+                isinstance(current, dict)
+                and current.get("type") == ALLOW_UNTIL
+                and parse_utc(current.get("valid_until")) is not None
+                and abs(parse_utc(current["valid_until"]) - until) <= self._OWN_LOCK_TOLERANCE
+            ):
+                _LOGGER.debug(
+                    "Experimental extra time on %s of %s not confirmed: sent %s, read back %s",
+                    platform, account_id, sent, current,
+                )
+                raise HomeAssistantError(
+                    "Microsoft did not apply the extra time (experimental request); "
+                    f"sent allowUntil {sent['valid_until']}, HTTP status "
+                    f"{self._web_error_code(platform) or 'unknown'}, read back "
+                    f"{current if current is not None else 'nothing (the read failed)'}."
+                )
+            released = self._platform_holds.pop(key, None) is not None
+            if released:
+                await self._async_save_platform_holds()
+            self._platform_override_until.pop((str(account_id), platform.lower()), None)
+            self._bonuses[key] = {
+                "account_id": str(account_id), "platform": platform, "until": iso_utc(until),
+            }
+            await self._bonus_store.async_save(self._bonuses)
+        await self.async_request_refresh()
+        return {
+            "platform": platform,
+            "applied_until": dt_util.as_local(until).isoformat(),
+            "read_back": self._override_details(current),
+            "released_hold": released,
+        }
+
+    async def async_cancel_time_bonus(self, account_id: str, platform: str) -> dict[str, Any]:
+        """Cancel extra time on a platform: only when an allowUntil is in force.
+
+        A lock (blockUntil), ours or a parent's, is never touched.
+        """
+        if platform.lower() not in self._BONUS_PLATFORMS:
+            raise ServiceValidationError("Extra time is for Windows or Xbox.")
+        account = self.get_account(account_id)
+        if account is None:
+            raise ValueError(f"Account {account_id} not found")
+        self._check_platform_lockable(platform)
+        key = self._hold_key(account_id, platform)
+        async with self._hold_lock(key):
+            await self._async_load_bonuses()
+            current = await self._async_read_platform_override(account_id, platform)
+            if current is None:
+                raise HomeAssistantError(
+                    f"Could not read what is in force on {platform}, so nothing was cancelled."
+                )
+            if current.get("type") != ALLOW_UNTIL:
+                if self._bonuses.pop(key, None) is not None:
+                    await self._bonus_store.async_save(self._bonuses)
+                return {
+                    "platform": platform,
+                    "cancelled": False,
+                    "reason": f"no extra time in force ({current.get('type')})",
+                    "read_back": self._override_details(current),
+                }
+            await self._async_write_platform_override(account, account_id, platform, NO_OVERRIDE)
+            if self._bonuses.pop(key, None) is not None:
+                await self._bonus_store.async_save(self._bonuses)
+        return {
+            "platform": platform,
+            "cancelled": True,
+            "read_back": self._override_details(current),
+        }
 
     async def async_release_platform(self, account_id: str, platform: str) -> None:
         """Cancel any lock on the platform and forget the hold: the lock switch's off.
@@ -1968,6 +2136,8 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         * ``parent``: an override is in force that is not ours (a lock or
           extra time from the Family Safety app), or we hold a lock but
           Microsoft shows it cancelled or ending at another time.
+        * ``bonus_ours``: extra time add_time_bonus gave is in force (for
+          Windows, where the poll cannot see extra time: our record of it).
         * ``none``: nothing in force and no hold of ours.
 
         The Xbox override comes from the Xbox policy read every poll. For
@@ -1994,7 +2164,19 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ):
             hold = None
         kind = (current or {}).get("type")
-        if hold is not None and kind == BLOCK_UNTIL and (
+        bonus = self._bonus_in_force(account_id, platform)
+        bonus_ours = bonus is not None and (
+            (
+                kind == ALLOW_UNTIL
+                and abs(parse_utc(current.get("valid_until")) - parse_utc(bonus["until"]))
+                <= self._OWN_LOCK_TOLERANCE
+            )
+            # Windows extra time is not visible in the poll: our record decides.
+            or (platform.lower() != "xbox" and kind == NO_OVERRIDE)
+        )
+        if bonus_ours:
+            who = "bonus_ours"
+        elif hold is not None and kind == BLOCK_UNTIL and (
             current.get("valid_until") is None or self._is_own_lock(hold, current)
         ):
             who = "ours"

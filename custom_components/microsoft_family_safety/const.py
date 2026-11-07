@@ -132,6 +132,8 @@ SERVICE_REQUEST_REAUTH: Final = "request_reauth"
 SERVICE_SYNC_SITE_LIST: Final = "sync_site_list"
 SERVICE_PAUSE_APP: Final = "pause_app"
 SERVICE_GET_SITES: Final = "get_sites"
+SERVICE_ADD_TIME_BONUS: Final = "add_time_bonus"
+SERVICE_CANCEL_TIME_BONUS: Final = "cancel_time_bonus"
 SERVICE_RESUME_APP: Final = "resume_app"
 
 ALL_SERVICES: Final = [
@@ -158,6 +160,8 @@ ALL_SERVICES: Final = [
     SERVICE_PAUSE_APP,
     SERVICE_RESUME_APP,
     SERVICE_GET_SITES,
+    SERVICE_ADD_TIME_BONUS,
+    SERVICE_CANCEL_TIME_BONUS,
 ]
 
 # Platforms

@@ -1624,9 +1624,15 @@ class FamilySafetyWebAPI:
 
         Identical in shape to the Windows body -- only platformType and the URL
         path differ.
+
+        ``allowUntil`` (extra time) is EXPERIMENTAL: never captured, sent in
+        the same shape as blockUntil because the read side reports
+        screenTimeOverrideType "allowUntil". Callers must read the override
+        back to know whether Microsoft took it; the body and the answer are
+        logged at debug level for comparison with a real capture.
         """
-        if time_override not in {"blockUntil", "cancel"}:
-            raise ValueError("time_override must be 'blockUntil' or 'cancel'")
+        if time_override not in {"blockUntil", "cancel", "allowUntil"}:
+            raise ValueError("time_override must be 'blockUntil', 'allowUntil' or 'cancel'")
         key = platform.lower()
         path = self._PLATFORM_OVERRIDE_PATHS.get(key)
         if path is None:
@@ -1634,15 +1640,16 @@ class FamilySafetyWebAPI:
                 f"No screen-time override endpoint is known for platform {platform!r}. "
                 f"Known: {sorted(self._PLATFORM_OVERRIDE_PATHS)}"
             )
+        body = {
+            "childId": str(child_id),
+            "platformType": key,
+            "timeOverride": time_override,
+            "dateTime": date_time,
+        }
         result = await self._web_request(
             "POST",
             f"{self.WEB_API_BASE}{path}",
-            json_data={
-                "childId": str(child_id),
-                "platformType": key,
-                "timeOverride": time_override,
-                "dateTime": date_time,
-            },
+            json_data=body,
             relationship_child_id=(
                 str(child_id)
                 if key in self._PLATFORM_OVERRIDE_NEEDS_RELATIONSHIP_TOKEN
@@ -1660,12 +1667,17 @@ class FamilySafetyWebAPI:
             # existing behaviour.
             isolated=key != "windows",
         )
-        if result is None:
-            detail = (
-                f" ({self.last_isolated_error_code})"
-                if key != "windows" and self.last_isolated_error_code
-                else ""
+        if time_override == "allowUntil":
+            _LOGGER.debug(
+                "Experimental %s allowUntil: sent %s, answer %r (error code %s)",
+                platform, body, result,
+                self.last_isolated_error_code if key != "windows" else self.last_web_error_code,
             )
+        if result is None:
+            code = (
+                self.last_isolated_error_code if key != "windows" else self.last_web_error_code
+            )
+            detail = f" ({code})" if code else ""
             raise FamilySafetyWebAPIError(
                 f"{platform} screen-time override web request failed{detail}"
             )

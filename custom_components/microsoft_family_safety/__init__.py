@@ -44,6 +44,8 @@ from .const import (
     SERVICE_PAUSE_APP,
     SERVICE_RESUME_APP,
     SERVICE_GET_SITES,
+    SERVICE_ADD_TIME_BONUS,
+    SERVICE_CANCEL_TIME_BONUS,
     CONF_ALLOWED_USERS,
 )
 from .coordinator import FamilySafetyDataUpdateCoordinator
@@ -157,6 +159,16 @@ SERVICE_REQUEST_REAUTH_SCHEMA = vol.Schema({})
 
 SERVICE_GET_SITES_SCHEMA = child_schema({})
 
+SERVICE_ADD_TIME_BONUS_SCHEMA = child_schema({
+    vol.Required("platform"): vol.In(["Windows", "Xbox"]),
+    vol.Optional("minutes"): vol.All(vol.Coerce(int), vol.Range(min=1, max=1440)),
+    vol.Optional("until"): cv.datetime,
+})
+
+SERVICE_CANCEL_TIME_BONUS_SCHEMA = child_schema({
+    vol.Required("platform"): vol.In(["Windows", "Xbox"]),
+})
+
 SERVICE_SYNC_SITE_LIST_SCHEMA = child_schema({
     vol.Required("url"): https_url,
     vol.Optional("max_domains", default=MAX_SYNC_DOMAINS): vol.All(
@@ -170,6 +182,7 @@ SERVICE_SYNC_SITE_LIST_SCHEMA = child_schema({
 _RESPONSE_SERVICES = frozenset({
     SERVICE_LOCK_PLATFORM, SERVICE_UNLOCK_PLATFORM, SERVICE_SYNC_SITE_LIST,
     SERVICE_PAUSE_APP, SERVICE_RESUME_APP, SERVICE_GET_SITES,
+    SERVICE_ADD_TIME_BONUS, SERVICE_CANCEL_TIME_BONUS,
 })
 #: Services for administrators only, whatever the allowed-users option says:
 #: sync_site_list downloads a URL from inside Home Assistant.
@@ -188,6 +201,22 @@ def _lock_until(data: dict) -> datetime:
         until = until.replace(tzinfo=dt_util.get_default_time_zone())
     if until <= dt_util.now():
         raise ServiceValidationError(f"until ({until.isoformat()}) is not in the future.")
+    return until
+
+
+def _bonus_until(data: dict) -> datetime:
+    """When add_time_bonus's extra time ends: ``until``, or ``minutes`` from now."""
+    if (data.get("until") is None) == (data.get("minutes") is None):
+        raise ServiceValidationError("Give either minutes or until.")
+    if data.get("minutes") is not None:
+        return dt_util.now() + timedelta(minutes=data["minutes"])
+    until = data["until"]
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=dt_util.get_default_time_zone())
+    if until <= dt_util.now():
+        raise ServiceValidationError(f"until ({until.isoformat()}) is not in the future.")
+    if until > dt_util.now() + timedelta(minutes=1440):
+        raise ServiceValidationError("Extra time can be given for 24 hours at most.")
     return until
 
 
@@ -329,6 +358,10 @@ def _register_services(hass: HomeAssistant) -> None:
          lambda d: (d["account_id"],)),
         (SERVICE_REQUEST_REAUTH, SERVICE_REQUEST_REAUTH_SCHEMA, "async_request_reauth",
          lambda d: ()),
+        (SERVICE_ADD_TIME_BONUS, SERVICE_ADD_TIME_BONUS_SCHEMA, "async_add_time_bonus",
+         lambda d: (d["account_id"], d["platform"], _bonus_until(d))),
+        (SERVICE_CANCEL_TIME_BONUS, SERVICE_CANCEL_TIME_BONUS_SCHEMA,
+         "async_cancel_time_bonus", lambda d: (d["account_id"], d["platform"])),
         (SERVICE_GET_SITES, SERVICE_GET_SITES_SCHEMA, "async_get_sites",
          lambda d: (d["account_id"],)),
         (SERVICE_PAUSE_APP, PAUSE_SCHEMA, "async_pause_app",

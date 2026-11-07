@@ -376,6 +376,18 @@ data:
 
 Both actions can answer with what they did (`response_variable`): `{prior, applied}`. `applied` is `"left_parent_override"` when a parent changed the lock in the Family Safety app since; the answer then has `current: {type, valid_until, override_until, allow_until}`. Strict mode must stay off when another integration manages these locks (see [Strict mode](#strict-mode)).
 
+#### Extra time (experimental)
+
+`add_time_bonus` and `cancel_time_bonus` are **experimental: based on an uncaptured request; verified by reading back.** No capture shows how the Family Safety app writes extra time, so `add_time_bonus` sends the captured lock request with `allowUntil` instead of `blockUntil`, then reads the override back and succeeds only when Microsoft reports extra time ending within 2 minutes of what was asked. Otherwise it fails with what was read back (the request and answer are logged at debug level). Extra time replaces a `lock_platform` lock (Microsoft keeps one override per platform), so the lock's hold is released. `cancel_time_bonus` only ever cancels extra time, never a lock. The `hold` attribute reads `bonus_ours` while extra time given here is in force.
+
+```yaml
+service: microsoft_family_safety.add_time_bonus
+data:
+  account_id: "1234567890123456"
+  platform: "Xbox"
+  minutes: 30
+```
+
 ```yaml
 # Unlock a single platform
 service: microsoft_family_safety.unlock_platform

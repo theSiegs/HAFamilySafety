@@ -682,3 +682,70 @@ get_sites:
       selector:
         entity:
           integration: microsoft_family_safety
+
+add_time_bonus:
+  name: Add Time Bonus (experimental)
+  description: "EXPERIMENTAL: based on an uncaptured request; verified by reading back. Give a child extra time on Windows or the Xbox, for some minutes or until a time. Microsoft keeps one override per platform, so this replaces a lock placed by lock_platform (released_hold in the answer). Succeeds only when Microsoft reads back extra time ending when asked; otherwise it fails and says what was read back. Answers with platform, applied_until, read_back and released_hold."
+  fields:
+    account_id:
+      name: Account ID
+      description: The user ID of the child account. Give this or an entity of the child.
+      required: false
+      selector:
+        text:
+    entity_id:
+      name: Child entity
+      description: Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID.
+      required: false
+      selector:
+        entity:
+          integration: microsoft_family_safety
+    platform:
+      name: Platform
+      description: Windows or Xbox.
+      required: true
+      selector:
+        select:
+          options:
+            - "Windows"
+            - "Xbox"
+    minutes:
+      name: Minutes
+      description: Extra time from now, 1 to 1440 minutes. Give this or until.
+      selector:
+        number:
+          min: 1
+          max: 1440
+          unit_of_measurement: min
+    until:
+      name: Until
+      description: When the extra time ends, instead of minutes (local time without an offset).
+      selector:
+        datetime:
+
+cancel_time_bonus:
+  name: Cancel Time Bonus (experimental)
+  description: "EXPERIMENTAL: based on an uncaptured request; verified by reading back. Cancel extra time on Windows or the Xbox. Only extra time is cancelled: when a lock (ours or a parent's) or nothing is in force, nothing is sent and the answer says so."
+  fields:
+    account_id:
+      name: Account ID
+      description: The user ID of the child account. Give this or an entity of the child.
+      required: false
+      selector:
+        text:
+    entity_id:
+      name: Child entity
+      description: Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID.
+      required: false
+      selector:
+        entity:
+          integration: microsoft_family_safety
+    platform:
+      name: Platform
+      description: Windows or Xbox.
+      required: true
+      selector:
+        select:
+          options:
+            - "Windows"
+            - "Xbox"
