@@ -54,6 +54,7 @@ from .const import (
     CONF_XBOX_FEATURES,
     DEFAULT_STRICT_MODE,
     EVENT_LOCK_REASSERTED,
+    EVENT_REQUEST,
     DEFAULT_XBOX_FEATURES,
     CONF_API_KEY,
     CONF_AUTH_URL,
@@ -248,6 +249,9 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             entry.options.get(CONF_APP_USAGE_SENSORS, DEFAULT_APP_USAGE_SENSORS) or 0
         )
         self._app_usage_tracker = AppUsageGrowthTracker()
+        #: Ids of the pending requests seen on the last poll; None before the
+        #: first, which only sets the baseline (a restart is not news).
+        self._seen_request_ids: set[str] | None = None
         #: hold key -> when strict mode last placed that lock again.
         self._last_reassert: dict[str, datetime] = {}
         if not self._mobile_only:
@@ -1095,6 +1099,42 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "until": iso_utc(until),
             },
         )
+
+    def _fire_request_events(
+        self, pending: list[Any], accounts_data: dict[str, Any]
+    ) -> None:
+        """Fire microsoft_family_safety_request for each request new since the last poll.
+
+        The fields are Microsoft's as pyfamilysafety returns them (puid, id,
+        type, platform, requestedTime, appId / displayName when present);
+        requested_time is passed on as Microsoft gives it, since its unit is
+        not documented.
+        """
+        requests = [r for r in pending if isinstance(r, dict) and r.get("id") is not None]
+        ids = {str(r["id"]) for r in requests}
+        seen, self._seen_request_ids = self._seen_request_ids, ids
+        if seen is None:
+            return
+        for request in requests:
+            if str(request["id"]) in seen:
+                continue
+            puid = request.get("puid")
+            account_id = str(puid) if puid is not None else None
+            account = accounts_data.get(account_id) or accounts_data.get(puid) or {}
+            self.hass.bus.async_fire(
+                EVENT_REQUEST,
+                {
+                    "entry_id": self.entry.entry_id,
+                    "account_id": account_id,
+                    "first_name": account.get("first_name"),
+                    "request_id": str(request["id"]),
+                    "type": request.get("type"),
+                    "platform": request.get("platform"),
+                    "app_id": request.get("appId"),
+                    "app_name": request.get("displayName") or request.get("appName"),
+                    "requested_time": request.get("requestedTime"),
+                },
+            )
 
     def _fire_app_usage_events(self, accounts_data: dict[str, Any]) -> None:
         """Fire microsoft_family_safety_app_usage for each app that grew since the last poll."""
@@ -2484,6 +2524,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.debug("Strict mode check failed: %r", err)
             self._devices = new_devices
             pending = getattr(self.api, "pending_requests", None) or []
+            self._fire_request_events(pending, accounts_data)
             self._is_retrying_auth = False
             return {"accounts": accounts_data, "devices": devices_data, "pending_requests": pending}
         except HttpException as err:

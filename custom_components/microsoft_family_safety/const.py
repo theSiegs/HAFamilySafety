@@ -40,6 +40,8 @@ DEFAULT_XBOX_FEATURES: Final = True
 CONF_STRICT_MODE: Final = "strict_mode"
 DEFAULT_STRICT_MODE: Final = False
 EVENT_LOCK_REASSERTED: Final = f"{DOMAIN}_lock_reasserted"
+#: Fired once for each pending request (more time, an app) that appears.
+EVENT_REQUEST: Final = f"{DOMAIN}_request"
 # Per-app usage sensors (app_usage.py): how many of each child's most used
 # apps get one. 0 = off, which also turns the app usage event off.
 CONF_APP_USAGE_SENSORS: Final = "app_usage_sensors"
