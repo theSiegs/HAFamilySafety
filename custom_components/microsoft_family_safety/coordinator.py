@@ -1675,6 +1675,43 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "ignored": site_sync.sample(ignored),
         }
 
+    async def async_get_sites(self, account_id: str) -> dict[str, Any]:
+        """The child's website lists as Microsoft stores them, and which a sync added.
+
+        Shaped like Family Link's get_sites: ``from_list`` holds the domains a
+        sync_site_list added and still sees blocked, ``from_list_by_url`` the
+        same per list, so a caller can tell them from sites blocked by hand.
+        """
+        account_id = str(account_id)
+        if not self.web_api:
+            raise HomeAssistantError("Web API not initialized")
+        try:
+            web = await self.web_api.get_web_browsing_settings(account_id)
+        except Exception as err:  # noqa: BLE001 - reported below
+            _LOGGER.debug("Could not read the website lists of %s: %r", account_id, err)
+            web = None
+        stored = site_sync.stored_site_lists(web)
+        hosts = site_sync.site_lists(web)
+        if stored is None or hosts is None:
+            raise HomeAssistantError(
+                "Could not read the child's blocked and allowed websites from Microsoft."
+            )
+        blocked_hosts = set(hosts[0])
+        async with self._site_sync_lock:
+            synced = ((await self._site_sync_store.async_load()) or {}).get(account_id) or {}
+        by_url = {
+            url: sorted(set(domains) & blocked_hosts) for url, domains in synced.items()
+        }
+        enabled = web.get("enabled", web.get("isEnabled", web.get("IsEnabled")))
+        return {
+            "account_id": account_id,
+            "blocked": stored[0],
+            "allowed": stored[1],
+            "filter_enabled": enabled if isinstance(enabled, bool) else None,
+            "from_list": sorted({d for domains in by_url.values() for d in domains}),
+            "from_list_by_url": by_url,
+        }
+
     async def _async_stop_site_sync(self, account_id: str, url: str) -> dict[str, Any]:
         """Remove everything the list added for the child, then forget the list."""
         blocked, _ = await self._async_read_site_lists(account_id)

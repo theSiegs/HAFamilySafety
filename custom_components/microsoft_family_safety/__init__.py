@@ -43,6 +43,7 @@ from .const import (
     SERVICE_SYNC_SITE_LIST,
     SERVICE_PAUSE_APP,
     SERVICE_RESUME_APP,
+    SERVICE_GET_SITES,
     CONF_ALLOWED_USERS,
 )
 from .coordinator import FamilySafetyDataUpdateCoordinator
@@ -154,6 +155,8 @@ SERVICE_UNLOCK_ACCOUNT_SCHEMA = child_schema({
 
 SERVICE_REQUEST_REAUTH_SCHEMA = vol.Schema({})
 
+SERVICE_GET_SITES_SCHEMA = child_schema({})
+
 SERVICE_SYNC_SITE_LIST_SCHEMA = child_schema({
     vol.Required("url"): https_url,
     vol.Optional("max_domains", default=MAX_SYNC_DOMAINS): vol.All(
@@ -166,11 +169,11 @@ SERVICE_SYNC_SITE_LIST_SCHEMA = child_schema({
 #: Services that answer with what they did (``{"prior", "applied"}``).
 _RESPONSE_SERVICES = frozenset({
     SERVICE_LOCK_PLATFORM, SERVICE_UNLOCK_PLATFORM, SERVICE_SYNC_SITE_LIST,
-    SERVICE_PAUSE_APP, SERVICE_RESUME_APP,
+    SERVICE_PAUSE_APP, SERVICE_RESUME_APP, SERVICE_GET_SITES,
 })
 #: Services for administrators only, whatever the allowed-users option says:
 #: sync_site_list downloads a URL from inside Home Assistant.
-_ADMIN_SERVICES = frozenset({SERVICE_SYNC_SITE_LIST})
+_ADMIN_SERVICES = frozenset({SERVICE_SYNC_SITE_LIST, SERVICE_GET_SITES})
 
 
 def _lock_until(data: dict) -> datetime:
@@ -326,6 +329,8 @@ def _register_services(hass: HomeAssistant) -> None:
          lambda d: (d["account_id"],)),
         (SERVICE_REQUEST_REAUTH, SERVICE_REQUEST_REAUTH_SCHEMA, "async_request_reauth",
          lambda d: ()),
+        (SERVICE_GET_SITES, SERVICE_GET_SITES_SCHEMA, "async_get_sites",
+         lambda d: (d["account_id"],)),
         (SERVICE_PAUSE_APP, PAUSE_SCHEMA, "async_pause_app",
          lambda d: (d["account_id"], d["apps"])),
         (SERVICE_RESUME_APP, RESUME_SCHEMA, "async_resume_app",

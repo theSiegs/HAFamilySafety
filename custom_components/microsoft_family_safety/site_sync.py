@@ -118,6 +118,29 @@ def site_lists(web_data: dict[str, Any] | None) -> tuple[list[str], list[str]] |
     return sorted(dict.fromkeys(blocked)), sorted(dict.fromkeys(allowed))
 
 
+def stored_site_lists(web_data: dict[str, Any] | None) -> tuple[list[str], list[str]] | None:
+    """(blocked, allowed) exactly as Microsoft stores them (absolute URLs); None if unreadable."""
+    if not isinstance(web_data, dict):
+        return None
+    exceptions = web_data.get("exceptions", web_data.get("Exceptions"))
+    if isinstance(exceptions, list) and exceptions:
+        blocked: list[str] = []
+        allowed: list[str] = []
+        for item in exceptions:
+            if not isinstance(item, dict):
+                continue
+            site = item.get("website") or item.get("Website")
+            if isinstance(site, str) and site:
+                (allowed if item.get("allowed", item.get("Allowed")) else blocked).append(site)
+        return blocked, allowed
+    if isinstance(exceptions, list) or "blockedSites" in web_data or "allowedSites" in web_data:
+        return (
+            [s for s in web_data.get("blockedSites") or [] if isinstance(s, str)],
+            [s for s in web_data.get("allowedSites") or [] if isinstance(s, str)],
+        )
+    return None
+
+
 def _within(host: str, domain: str) -> bool:
     return host == domain or host.endswith("." + domain)
 

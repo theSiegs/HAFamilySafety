@@ -243,3 +243,44 @@ async def test_a_read_that_lost_every_site_changes_nothing(hass, rig, aioclient_
         await _sync(hass)
     assert rig.web_api.writes == []
     rig.web_api.get_web_browsing_settings = real
+
+
+# --- get_sites -----------------------------------------------------------------
+
+
+async def _get_sites(hass, user=None):
+    return await hass.services.async_call(
+        DOMAIN, "get_sites", {"account_id": CHILD}, blocking=True, return_response=True,
+        context=Context(user_id=user.id) if user else None,
+    )
+
+
+async def test_get_sites_returns_what_microsoft_stores_and_what_the_list_added(
+    hass, rig, aioclient_mock
+):
+    rig.web_api.sites = {"manual.example": False, "www.school.example": True}
+    _serve(aioclient_mock, "a.example\nb.example\n")
+    await _sync(hass)
+
+    result = await _get_sites(hass)
+
+    assert sorted(result["blocked"]) == [
+        "https://a.example", "https://b.example", "https://manual.example"
+    ]
+    assert result["allowed"] == ["https://www.school.example"]
+    assert result["filter_enabled"] is True
+    assert result["from_list"] == ["a.example", "b.example"]
+    assert result["from_list_by_url"] == {URL: ["a.example", "b.example"]}
+
+
+async def test_get_sites_is_for_administrators(hass, rig):
+    user = MockUser(is_owner=False).add_to_hass(hass)
+    user.mock_policy({"entities": True})
+    with pytest.raises(Unauthorized):
+        await _get_sites(hass, user=user)
+
+
+async def test_get_sites_refuses_an_unreadable_answer(hass, rig):
+    rig.web_api.read_fails = True
+    with pytest.raises(HomeAssistantError):
+        await _get_sites(hass)
