@@ -47,6 +47,44 @@ def top_apps(applications: list[dict[str, Any]] | None, count: int) -> list[dict
     return ranked[: max(count, 0)]
 
 
+#: App id prefix -> platform (pyfamilysafety's get_platform, plus win32: from
+#: _pyfamilysafety_compat). Microsoft gives each platform its own id for an
+#: app: a game is x:<id> on the Xbox and appx:/win32: on Windows.
+_PLATFORM_PREFIXES = (("x:", "Xbox"), ("appx:", "Windows"), ("win32:", "Windows"), ("a:", "Mobile"))
+
+
+def app_platform(app_id: str) -> str | None:
+    """The platform an app id belongs to, from its prefix."""
+    for prefix, platform in _PLATFORM_PREFIXES:
+        if str(app_id).startswith(prefix):
+            return platform
+    return None
+
+
+def apps_attribute(
+    applications: list[dict[str, Any]] | None, *, used_only: bool = False
+) -> list[dict[str, Any]]:
+    """Every app in Family Link's ``apps`` shape: ``{package, name, minutes}``, most used first.
+
+    ``package`` is Microsoft's app id, which carries the platform, so an app
+    on two platforms is two entries; ``platform`` says which. No icons: the
+    list must stay small, and the attribute is not recorded anyway.
+    """
+    apps = [
+        {
+            "package": app["app_id"],
+            "name": app.get("app_name") or app["app_id"],
+            "minutes": round(float(app.get("usage_minutes") or 0), 1),
+            "platform": app_platform(app["app_id"]),
+        }
+        for app in applications or []
+        if isinstance(app, dict) and app.get("app_id")
+    ]
+    if used_only:
+        apps = [app for app in apps if app["minutes"] > 0]
+    return sorted(apps, key=lambda app: (-app["minutes"], app["name"].lower()))
+
+
 def usage_summary(applications: list[dict[str, Any]] | None) -> dict[str, Any]:
     """A short summary of a child's apps, small enough for the recorder."""
     apps = [app for app in applications or [] if isinstance(app, dict)]

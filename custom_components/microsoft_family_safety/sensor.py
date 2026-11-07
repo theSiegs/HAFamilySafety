@@ -38,7 +38,13 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import FamilySafetyDataUpdateCoordinator
-from .app_usage import app_usage_unique_id, safe_app_id, top_apps, usage_summary
+from .app_usage import (
+    app_usage_unique_id,
+    apps_attribute,
+    safe_app_id,
+    top_apps,
+    usage_summary,
+)
 from .binary_sensor import MinuteUpdateMixin
 from .site_sync import site_lists
 
@@ -292,6 +298,8 @@ class FamilySafetyScreenTimeSensor(FamilySafetyAccountSensor):
     _attr_native_unit_of_measurement = UnitOfTime.MINUTES
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
     _attr_icon = "mdi:clock-outline"
+    # The per-app breakdown changes on every poll: kept out of the recorder.
+    _unrecorded_attributes = frozenset({"apps"})
 
     def __init__(
         self,
@@ -328,6 +336,8 @@ class FamilySafetyScreenTimeSensor(FamilySafetyAccountSensor):
             "raw_microsoft_minutes": account_data.get("raw_today_screentime_usage"),
             "raw_microsoft_ms": account_data.get("raw_today_screentime_ms"),
             "last_api_poll": account_data.get("screen_time_polled_at"),
+            # Family Link's shape, as Hearth reads it: the apps used today.
+            "apps": apps_attribute(account_data.get("applications"), used_only=True),
             "update_interval_seconds": (
                 int(self.coordinator.update_interval.total_seconds())
                 if self.coordinator.update_interval
@@ -408,6 +418,7 @@ class FamilySafetyTimeRemainingSensor(MinuteUpdateMixin, FamilySafetyAccountSens
     _attr_native_unit_of_measurement = UnitOfTime.MINUTES
     _attr_icon = "mdi:timer-sand"
     _platform = "Windows"
+    _unrecorded_attributes = frozenset({"used_minutes", "allowed_ranges"})
 
     def __init__(
         self,
@@ -435,6 +446,7 @@ class FamilySafetyTimeRemainingSensor(MinuteUpdateMixin, FamilySafetyAccountSens
         """Return why, today's allowance and allowed ranges."""
         status = self._status()
         attrs: dict[str, Any] = {
+            ATTR_USER_ID: self._account_id,
             "allowed_now": status["allowed"],
             "reason": status["reason"],
             "allowance_minutes": status["allowance_minutes"],
@@ -524,6 +536,7 @@ class FamilySafetyApplicationCountSensor(FamilySafetyAccountSensor):
 
     _attr_icon = "mdi:apps"
     _attr_state_class = SensorStateClass.MEASUREMENT
+    _unrecorded_attributes = frozenset({"apps"})
 
     def __init__(
         self,
@@ -551,7 +564,11 @@ class FamilySafetyApplicationCountSensor(FamilySafetyAccountSensor):
 
         # A summary only: the full list (dozens of apps with icon URLs) went
         # over the recorder's 16 KB attribute limit.
-        return usage_summary(account_data.get("applications", []))
+        return {
+            **usage_summary(account_data.get("applications", [])),
+            # Every app (Family Link's shape), used today or not.
+            "apps": apps_attribute(account_data.get("applications")),
+        }
 
 
 class FamilySafetyAppUsageSensor(FamilySafetyAccountSensor):

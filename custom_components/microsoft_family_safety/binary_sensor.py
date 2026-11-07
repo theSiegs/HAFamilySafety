@@ -56,18 +56,36 @@ class MinuteUpdateMixin:
             async_track_time_change(self.hass, self._async_minute_tick, second=0)
         )
 
+    _last_snapshot: Any = None
+
+    def _snapshot(self) -> Any:
+        """What the entity shows; the tick writes only when it changed."""
+        value = self.is_on if isinstance(self, BinarySensorEntity) else self.native_value
+        return value, tuple(sorted((self.extra_state_attributes or {}).items(), key=str))
+
     @callback
     def _async_minute_tick(self, _now: datetime) -> None:
-        self.async_write_ha_state()
+        snapshot = self._snapshot()
+        if snapshot != self._last_snapshot:
+            self.async_write_ha_state()
+
+    @callback
+    def async_write_ha_state(self) -> None:
+        self._last_snapshot = self._snapshot()
+        super().async_write_ha_state()
 
 
 class FamilySafetyAllowedNowSensor(MinuteUpdateMixin, CoordinatorEntity, BinarySensorEntity):
     """On while the child may use the platform right now.
 
+    The minutes left and used move every minute: they are not recorded.
+
     Off when a lock is in force, outside today's allowed hours, or once today's
     allowance is used up; on with limits turned off or extra time granted.
     Unknown while the schedule or today's usage is unknown.
     """
+
+    _unrecorded_attributes = frozenset({"remaining_minutes", "used_minutes"})
 
     def __init__(
         self,

@@ -134,3 +134,22 @@ async def test_applications_sensor_no_longer_carries_the_full_list(hass):
     assert "applications" not in attrs
     assert attrs["blocked_count"] == 1
     assert count.native_value == 3
+
+
+async def test_apps_attribute_in_family_link_shape(hass):
+    coord, entry = _coordinator(hass, 0)
+    coord.data["accounts"][CHILD]["applications"].append(
+        {"app_id": "x:1234", "app_name": "Racing", "blocked": False, "usage_minutes": 0}
+    )
+    screen = sensor.FamilySafetyScreenTimeSensor(coord, entry, CHILD)
+    count = sensor.FamilySafetyApplicationCountSensor(coord, entry, CHILD)
+
+    used = screen.extra_state_attributes["apps"]
+    assert used[0] == {"package": "appx:game", "name": "Game", "minutes": 50.0, "platform": "Windows"}
+    assert [a["package"] for a in used] == ["appx:game", "appx:browser", "appx:music"]
+    every = count.extra_state_attributes["apps"]
+    assert {"package": "x:1234", "name": "Racing", "minutes": 0.0, "platform": "Xbox"} in every
+    assert all("icon" not in a and "icon_url" not in a for a in every)
+    # Not recorded: it changes every poll.
+    assert "apps" in screen._unrecorded_attributes
+    assert "apps" in count._unrecorded_attributes

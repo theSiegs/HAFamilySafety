@@ -162,3 +162,36 @@ async def test_entities_for_both_platforms(hass, coordinator):
     assert xbox.extra_state_attributes["reason"] in {
         "within_limits", "outside_allowed_hours", "allowance_used"
     }
+
+
+async def test_minute_tick_writes_only_when_something_changed(hass, coordinator):
+    coord, entry = coordinator
+    entity = binary_sensor.FamilySafetyAllowedNowSensor(coord, entry, CHILD, "Windows")
+    writes: list = []
+    entity.hass = hass
+    entity.entity_id = "binary_sensor.alex_windows_allowed_now"
+    # Count writes that reach Home Assistant.
+    import homeassistant.helpers.entity as ha_entity
+
+    original = ha_entity.Entity.async_write_ha_state
+    ha_entity.Entity.async_write_ha_state = lambda self: writes.append(1)
+    try:
+        entity.async_write_ha_state()
+        entity._async_minute_tick(dt_util.now())
+        entity._async_minute_tick(dt_util.now())
+        assert len(writes) == 1
+        coord.data["accounts"][CHILD]["blocked_platforms"] = ["Windows"]
+        entity._async_minute_tick(dt_util.now())
+        assert len(writes) == 2
+    finally:
+        ha_entity.Entity.async_write_ha_state = original
+
+
+async def test_volatile_attributes_are_not_recorded_and_user_id_is_there(hass, coordinator):
+    coord, entry = coordinator
+    allowed = binary_sensor.FamilySafetyAllowedNowSensor(coord, entry, CHILD, "Xbox")
+    remaining = sensor.FamilySafetyXboxTimeRemainingSensor(coord, entry, CHILD)
+    assert {"remaining_minutes", "used_minutes"} <= allowed._unrecorded_attributes
+    assert "used_minutes" in remaining._unrecorded_attributes
+    assert allowed.extra_state_attributes["user_id"] == CHILD
+    assert remaining.extra_state_attributes["user_id"] == CHILD
