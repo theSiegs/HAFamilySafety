@@ -131,7 +131,7 @@
     },
     "lock_platform": {
       "name": "Lock Platform",
-      "description": "Lock a platform (Windows/Xbox/Mobile) for a child account.",
+      "description": "Lock a platform (Windows/Xbox/Mobile) for a child account until a time. The first lock saves the override Microsoft had in force (a parent's own lock, or none) so unlock_platform can put it back; a lock already in force that ends later is kept. Answers with the saved prior state and the lock applied.",
       "fields": {
         "account_id": {
           "name": "Account ID",
@@ -147,13 +147,17 @@
         },
         "duration_hours": {
           "name": "Duration (hours)",
-          "description": "Duration of the lock in hours."
+          "description": "Duration of the lock in hours (default 24). Give this or until, not both."
+        },
+        "until": {
+          "name": "Until",
+          "description": "When the lock ends, instead of duration_hours. A time without an offset is Home Assistant's local time."
         }
       }
     },
     "unlock_platform": {
       "name": "Unlock Platform",
-      "description": "Unlock a platform (Windows/Xbox/Mobile) for a child account.",
+      "description": "Unlock a platform (Windows/Xbox/Mobile) for a child account. Puts back the lock that was in force before lock_platform if it has not run out yet, otherwise cancels the lock. Answers with the prior state and what was applied.",
       "fields": {
         "account_id": {
           "name": "Account ID",
@@ -413,7 +417,7 @@
     },
     "lock_account": {
       "name": "Lock Account",
-      "description": "Lock a child account by setting all screen time to zero. Saves current policy for later restoration.",
+      "description": "Lock a child account by setting all screen time to zero. Saves current policy for later restoration. The lock never expires on its own: it stays until unlock_account (or the screen time limits switch) restores the saved policy.",
       "fields": {
         "account_id": {
           "name": "Account ID",
@@ -460,6 +464,12 @@
           "description": "The domain to allow."
         }
       }
+    }
+  },
+  "issues": {
+    "xbox_lock_needs_xbox_features": {
+      "title": "The Xbox lock needs the Xbox features",
+      "description": "Something asked {title} to lock or unlock an Xbox, but this entry runs on the mobile token only, and the Xbox lock goes through the Microsoft Family web session.\n\nTo turn the Xbox features on, open Settings > Devices & services > Microsoft Family Safety > Configure, tick **Xbox** under Monitored platforms and submit. Home Assistant then asks you to sign in to Microsoft again; answer **Yes** to \"Stay signed in?\". Some accounts must repeat that sign-in every 24 hours.\n\nIf you do not need the Xbox lock, remove the call that asked for it and ignore this issue."
     }
   }
 }

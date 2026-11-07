@@ -1,17 +1,18 @@
 """The Microsoft Family Safety integration."""
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 import logging
 
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
     ConfigEntryNotReady,
     HomeAssistantError,
+    ServiceValidationError,
 )
 from homeassistant.helpers import config_validation as cv
 from homeassistant.util import dt as dt_util
@@ -59,9 +60,12 @@ SERVICE_BLOCK_APP_SCHEMA = child_schema({
 
 SERVICE_LOCK_PLATFORM_SCHEMA = child_schema({
     vol.Required("platform"): vol.In(["Windows", "Xbox", "Mobile"]),
-    vol.Optional("duration_hours", default=24): vol.All(
+    # No default here: giving both is an error, so the 24 h default is
+    # applied in _lock_until once it is known that ``until`` is absent.
+    vol.Optional("duration_hours"): vol.All(
         vol.Coerce(int), vol.Range(min=1, max=168)
     ),
+    vol.Optional("until"): cv.datetime,
 })
 
 SERVICE_UNLOCK_PLATFORM_SCHEMA = child_schema({
@@ -141,6 +145,25 @@ SERVICE_UNLOCK_ACCOUNT_SCHEMA = child_schema({
 })
 
 SERVICE_REQUEST_REAUTH_SCHEMA = vol.Schema({})
+
+
+#: Services that answer with what they did (``{"prior", "applied"}``).
+_RESPONSE_SERVICES = frozenset({SERVICE_LOCK_PLATFORM, SERVICE_UNLOCK_PLATFORM})
+
+
+def _lock_until(data: dict) -> datetime:
+    """When a lock_platform lock ends: ``until``, or ``duration_hours`` from now."""
+    if data.get("until") is not None and data.get("duration_hours") is not None:
+        raise ServiceValidationError("Give either duration_hours or until, not both.")
+    until = data.get("until")
+    if until is None:
+        return dt_util.now() + timedelta(hours=data.get("duration_hours") or 24)
+    if until.tzinfo is None:
+        # A time without offset is Home Assistant's local time.
+        until = until.replace(tzinfo=dt_util.get_default_time_zone())
+    if until <= dt_util.now():
+        raise ServiceValidationError(f"until ({until.isoformat()}) is not in the future.")
+    return until
 
 
 def _get_coordinator(
@@ -230,10 +253,7 @@ def _register_services(hass: HomeAssistant) -> None:
         (SERVICE_UNBLOCK_APP, SERVICE_BLOCK_APP_SCHEMA, "async_unblock_app",
          lambda d: (d["account_id"], d["app_id"])),
         (SERVICE_LOCK_PLATFORM, SERVICE_LOCK_PLATFORM_SCHEMA, "async_lock_platform",
-         lambda d: (
-             d["account_id"], d["platform"],
-             dt_util.now() + timedelta(hours=d.get("duration_hours", 24)),
-         )),
+         lambda d: (d["account_id"], d["platform"], _lock_until(d))),
         (SERVICE_UNLOCK_PLATFORM, SERVICE_UNLOCK_PLATFORM_SCHEMA, "async_unlock_platform",
          lambda d: (d["account_id"], d["platform"])),
         (SERVICE_APPROVE_REQUEST, SERVICE_APPROVE_REQUEST_SCHEMA, "async_approve_request",
@@ -286,8 +306,8 @@ def _register_services(hass: HomeAssistant) -> None:
          lambda d: ()),
     ]
 
-    def make_handler(method_name, extract_args, per_child):
-        async def handler(call: ServiceCall) -> None:
+    def make_handler(method_name, extract_args, per_child, responds):
+        async def handler(call: ServiceCall) -> dict | None:
             data = dict(call.data)
             if per_child:
                 # account_id as before, or any entity of the child.
@@ -296,7 +316,7 @@ def _register_services(hass: HomeAssistant) -> None:
             if coordinator is None:
                 raise HomeAssistantError("No Microsoft Family Safety coordinator available")
             try:
-                await getattr(coordinator, method_name)(*extract_args(data))
+                result = await getattr(coordinator, method_name)(*extract_args(data))
             except HomeAssistantError:
                 raise
             except Exception as err:  # noqa: BLE001 - report as a service error
@@ -305,6 +325,9 @@ def _register_services(hass: HomeAssistant) -> None:
                 raise HomeAssistantError(
                     f"Microsoft Family Safety {call.service} failed: {err}"
                 ) from err
+            if responds:
+                return result if isinstance(result, dict) else {}
+            return None
         return handler
 
     for name, schema, method, extract in services:
@@ -313,9 +336,14 @@ def _register_services(hass: HomeAssistant) -> None:
             SERVICE_DENY_REQUEST_SCHEMA,
             SERVICE_REQUEST_REAUTH_SCHEMA,
         )
+        responds = name in _RESPONSE_SERVICES
         hass.services.async_register(
-            DOMAIN, name, guard_service(hass, make_handler(method, extract, per_child)),
+            DOMAIN, name,
+            guard_service(hass, make_handler(method, extract, per_child, responds)),
             schema=schema,
+            supports_response=(
+                SupportsResponse.OPTIONAL if responds else SupportsResponse.NONE
+            ),
         )
 
 

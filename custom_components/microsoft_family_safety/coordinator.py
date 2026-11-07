@@ -19,7 +19,12 @@ from yarl import URL
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    HomeAssistantError,
+    ServiceValidationError,
+)
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -28,6 +33,16 @@ from homeassistant.util import dt as dt_util
 from ._pyfamilysafety_compat import apply_patches, is_stale_roster_error
 from .api_client import FamilySafetyWebAPI
 from .auth.addon_client import AddonCookieClient
+from .screen_time import (
+    BLOCK_UNTIL,
+    NO_OVERRIDE,
+    UNKNOWN,
+    active_until,
+    iso_utc,
+    override as make_override,
+    parse_platform_override,
+    parse_utc,
+)
 from .const import (
     CONF_XBOX_FEATURES,
     DEFAULT_XBOX_FEATURES,
@@ -56,6 +71,10 @@ _FAMILY_TOKEN_REJECTED = "web_family_token_rejected"
 #: Polls in a row ending in family_context_state == "auth_required" before the
 #: coordinator treats the Family session as gone and starts reauthentication.
 _FAMILY_AUTH_REQUIRED_POLLS = 2
+#: Locks this integration holds on a platform, with the state before them.
+PLATFORM_HOLD_STORAGE_KEY = f"{DOMAIN}.platform_holds"
+#: Repair issue raised when an Xbox lock is asked of a mobile-only entry.
+XBOX_LOCK_ISSUE = "xbox_lock_needs_xbox_features"
 
 
 def _range_to_slots(start_hour: int, start_minute: int, end_hour: int, end_minute: int) -> list[bool]:
@@ -198,6 +217,16 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: was read, or a web lock/unlock from here succeeded. Until then the
         #: Xbox lock switch reports unknown rather than "unlocked".
         self._xbox_lock_known: set[str] = set()
+        #: "account|platform" -> the lock this integration holds there and
+        #: the override in force before it (see async_lock_platform).
+        self._hold_store: Store = Store(
+            hass, STORAGE_VERSION, f"{PLATFORM_HOLD_STORAGE_KEY}.{entry.entry_id}"
+        )
+        self._platform_holds: dict[str, dict[str, Any]] = {}
+        self._platform_holds_loaded = False
+        self._platform_hold_locks: dict[str, asyncio.Lock] = {}
+        if not self._mobile_only:
+            ir.async_delete_issue(hass, DOMAIN, f"{XBOX_LOCK_ISSUE}_{entry.entry_id}")
 
     @property
     def _native_web_auth(self) -> bool:
@@ -258,6 +287,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._saved_screentime = {
                 self._policy_key(key): value for key, value in data.items()
             }
+        await self._async_load_platform_holds()
         auth_state = await self._auth_store.async_load()
         if (
             isinstance(auth_state, dict)
@@ -653,65 +683,267 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         account_data["blocked_platforms"] = blocked
         account_data["xbox_lock_known"] = key[0] in self._xbox_lock_known
 
-    async def async_lock_platform(
-        self, account_id: str, platform: str, valid_until: datetime | None = None
-    ) -> None:
-        account = self.get_account(account_id)
-        if account is None:
-            raise ValueError(f"Account {account_id} not found")
-        until = valid_until or (dt_util.now() + timedelta(hours=24))
+    # ------------------------------------------------------------------
+    # Platform lock (lock_platform / unlock_platform) with save and restore
+    # ------------------------------------------------------------------
+    #
+    # The first lock of a child's platform reads the override Microsoft has
+    # in force (a parent's own lock, extra time, or nothing) and keeps it as
+    # the "prior" in a Store, together with the fact that this integration
+    # now holds a lock there. A later lock, also after a restart or after a
+    # failed call, finds that hold and never takes its own lock for the prior
+    # state. unlock_platform puts the prior back (a blockUntil still in the
+    # future) or cancels, then forgets the hold.
 
-        # Windows AND Xbox both have a working web override endpoint; they are
-        # separate paths, not one endpoint parameterised by platform (see
-        # FamilySafetyWebAPI.supports_platform_override).
-        #
-        # Xbox previously fell straight through to the pyfamilysafety mobile
-        # aggregator below.  That aggregator still ACCEPTS and STORES an Xbox
-        # override -- and reports it back via blocked_platforms -- but Microsoft
-        # stopped honouring it on the console, the same regression that forced
-        # Xbox *usage* onto the web report-v3 endpoint around 2026-08-20.  The
-        # result was a lock that read as applied and did nothing.
-        if (
+    @staticmethod
+    def _hold_key(account_id: Any, platform: str) -> str:
+        return f"{account_id}|{platform.lower()}"
+
+    def _hold_lock(self, key: str) -> asyncio.Lock:
+        return self._platform_hold_locks.setdefault(key, asyncio.Lock())
+
+    async def _async_load_platform_holds(self) -> None:
+        if self._platform_holds_loaded:
+            return
+        data = await self._hold_store.async_load()
+        if isinstance(data, dict):
+            self._platform_holds = {
+                str(k): v for k, v in data.items() if isinstance(v, dict)
+            }
+        self._platform_holds_loaded = True
+
+    async def _async_save_platform_holds(self) -> None:
+        await self._hold_store.async_save(self._platform_holds)
+
+    def platform_hold(self, account_id: Any, platform: str) -> dict[str, Any] | None:
+        """The lock this integration holds on a child's platform, if any."""
+        hold = self._platform_holds.get(self._hold_key(account_id, platform))
+        return dict(hold) if hold else None
+
+    def _check_platform_lockable(self, platform: str) -> None:
+        """Refuse an Xbox lock on an entry kept on the mobile token only."""
+        if platform.lower() != "xbox" or not self._mobile_only:
+            return
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            f"{XBOX_LOCK_ISSUE}_{self.entry.entry_id}",
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key=XBOX_LOCK_ISSUE,
+            translation_placeholders={"title": self.entry.title or DOMAIN},
+        )
+        raise ServiceValidationError(
+            "The Xbox lock needs the Xbox features, which are off for this "
+            "Microsoft Family Safety entry (it runs on the mobile token only). "
+            "Tick Xbox under Monitored platforms in the integration options, "
+            "then sign in again when asked."
+        )
+
+    async def _async_read_platform_override(
+        self, account_id: str, platform: str
+    ) -> dict[str, Any] | None:
+        """The override Microsoft has in force for this platform; None if unreadable."""
+        if self.web_api is None:
+            return None
+        try:
+            if platform.lower() == "xbox":
+                payload = await self.web_api.get_xbox_screentime_policy(account_id)
+            else:
+                payload = await self.web_api.get_device_overrides(account_id)
+        except Exception as err:  # noqa: BLE001 - a failed read is "unknown"
+            _LOGGER.debug("Could not read the %s override of %s: %r", platform, account_id, err)
+            return None
+        return parse_platform_override(payload, platform)
+
+    def _web_override_available(self, platform: str) -> bool:
+        return bool(
             FamilySafetyWebAPI.supports_platform_override(platform)
             and self._native_web_auth
             and self.web_api is not None
             and self.web_api.has_web_cookies
-        ):
-            until_utc = dt_util.as_utc(until)
-            date_time = until_utc.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        )
+
+    async def _async_write_platform_override(
+        self,
+        account: Account,
+        account_id: str,
+        platform: str,
+        kind: str,
+        until: datetime | None = None,
+    ) -> None:
+        """Send a blockUntil (until ``until``) or a cancel for one platform.
+
+        Windows and Xbox both have a working web override endpoint; they are
+        separate paths, not one endpoint parameterised by platform (see
+        FamilySafetyWebAPI.supports_platform_override).
+
+        Xbox previously fell straight through to the pyfamilysafety mobile
+        aggregator. That aggregator still ACCEPTS and STORES an Xbox override
+        -- and reports it back via blocked_platforms -- but Microsoft stopped
+        honouring it on the console, the same regression that forced Xbox
+        *usage* onto the web report-v3 endpoint around 2026-08-20. The result
+        was a lock that read as applied and did nothing.
+        """
+        key = (str(account_id), platform.lower())
+        is_xbox = platform.lower() in self._WEB_LOCK_STATE_PLATFORMS
+        block = kind == BLOCK_UNTIL
+        action = "lock" if block else "unlock"
+        if self._web_override_available(platform):
+            moment = (
+                until if block
+                else self._platform_override_until.get(key, dt_util.utcnow())
+            )
             try:
                 await self.web_api.set_platform_time_override(
-                    account_id, platform, "blockUntil", date_time
+                    account_id, platform, "blockUntil" if block else "cancel",
+                    iso_utc(moment),
                 )
             except Exception as err:
-                if platform.lower() in self._WEB_LOCK_STATE_PLATFORMS:
+                if is_xbox:
                     raise HomeAssistantError(
-                        f"Could not lock {platform}: the Family web request failed ({err})"
+                        f"Could not {action} {platform}: the Family web request failed ({err})"
                     ) from err
                 _LOGGER.debug(
                     "%s web override unavailable; falling back to mobile API: %s",
                     platform, err,
                 )
             else:
-                self._platform_override_until[(str(account_id), platform.lower())] = until_utc
-                if platform.lower() in self._WEB_LOCK_STATE_PLATFORMS:
+                if block:
+                    self._platform_override_until[key] = dt_util.as_utc(until)
+                else:
+                    self._platform_override_until.pop(key, None)
+                if is_xbox:
                     self._xbox_lock_known.add(str(account_id))
                 await self.async_request_refresh()
                 return
 
         # The mobile API still accepts an Xbox override but the console ignores
         # it, so reporting success here would tell automations the console is
-        # locked when it is not.
-        if platform.lower() in self._WEB_LOCK_STATE_PLATFORMS:
+        # locked (or unlocked) when it is not.
+        if is_xbox:
             raise HomeAssistantError(
-                f"Cannot lock {platform}: it can only be locked through the Family "
-                "web session, which is not available. Re-authenticate the integration."
+                f"Cannot {action} {platform}: it can only be {action}ed through the "
+                "Family web session, which is not available. Re-authenticate the "
+                "integration."
             )
-        # pyfamilysafety formats the value with a literal "Z": give it real UTC.
-        await self._override_platform_mobile(
-            account, account_id, platform, OverrideType.UNTIL,
-            dt_util.as_utc(until).replace(tzinfo=None),
-        )
+        if block:
+            # pyfamilysafety formats the value with a literal "Z": give it real UTC.
+            await self._override_platform_mobile(
+                account, account_id, platform, OverrideType.UNTIL,
+                dt_util.as_utc(until).replace(tzinfo=None),
+            )
+        else:
+            await self._override_platform_mobile(
+                account, account_id, platform, OverrideType.CANCEL
+            )
+            self._platform_override_until.pop(key, None)
+
+    @staticmethod
+    def _hold_in_force(hold: dict[str, Any], now: datetime) -> bool:
+        """A hold whose lock has not run out yet (or was never sent)."""
+        until = parse_utc(hold.get("until"))
+        return until is None or until > now
+
+    async def async_lock_platform(
+        self, account_id: str, platform: str, valid_until: datetime | None = None
+    ) -> dict[str, Any]:
+        """Lock a platform until ``valid_until`` (default 24 h).
+
+        Returns ``{"prior": ..., "applied": ...}``: the override saved on the
+        first lock (kept unchanged by later ones) and the one now sent. A
+        blockUntil already in force that ends later is kept, never shortened.
+        """
+        account = self.get_account(account_id)
+        if account is None:
+            raise ValueError(f"Account {account_id} not found")
+        self._check_platform_lockable(platform)
+        requested = dt_util.as_utc(valid_until or (dt_util.now() + timedelta(hours=24)))
+        key = self._hold_key(account_id, platform)
+        async with self._hold_lock(key):
+            await self._async_load_platform_holds()
+            now = dt_util.utcnow()
+            hold = self._platform_holds.get(key)
+            if hold is not None and not self._hold_in_force(hold, now):
+                # Our earlier lock has run out on its own: a new hold starts.
+                self._platform_holds.pop(key, None)
+                hold = None
+            current = await self._async_read_platform_override(account_id, platform)
+            if hold is None:
+                hold = {
+                    "account_id": str(account_id),
+                    "platform": platform,
+                    "prior": current if current is not None else make_override(UNKNOWN),
+                    "until": None,
+                    "confirmed": False,
+                    "created": iso_utc(now),
+                }
+                self._platform_holds[key] = hold
+                await self._async_save_platform_holds()
+            target = requested
+            current_block = (
+                active_until(current, now)
+                if (current or {}).get("type") == BLOCK_UNTIL
+                else None
+            )
+            for later in (current_block, parse_utc(hold.get("until"))):
+                if later is not None and later > target:
+                    target = later
+            # Recorded before the write: should Microsoft apply it and the
+            # call still fail, a retry knows the blockUntil it reads is ours.
+            hold["until"] = iso_utc(target)
+            await self._async_save_platform_holds()
+            await self._async_write_platform_override(
+                account, account_id, platform, BLOCK_UNTIL, target
+            )
+            hold["confirmed"] = True
+            await self._async_save_platform_holds()
+            return {"prior": dict(hold["prior"]), "applied": make_override(BLOCK_UNTIL, target)}
+
+    async def async_unlock_platform(self, account_id: str, platform: str) -> dict[str, Any]:
+        """Unlock a platform, putting back the override saved by the first lock.
+
+        A saved blockUntil still in the future is sent again; anything else
+        (nothing saved, nothing in force before, an override that has run out
+        since, or an allowUntil, whose write format is not known) ends in a
+        cancel. Returns ``{"prior": ..., "applied": ...}``.
+        """
+        account = self.get_account(account_id)
+        if account is None:
+            raise ValueError(f"Account {account_id} not found")
+        self._check_platform_lockable(platform)
+        key = self._hold_key(account_id, platform)
+        async with self._hold_lock(key):
+            await self._async_load_platform_holds()
+            hold = self._platform_holds.get(key)
+            prior = (
+                dict(hold["prior"])
+                if hold and isinstance(hold.get("prior"), dict)
+                else None
+            )
+            restore_until = active_until(prior)
+            if restore_until is not None and prior["type"] == BLOCK_UNTIL:
+                await self._async_write_platform_override(
+                    account, account_id, platform, BLOCK_UNTIL, restore_until
+                )
+                applied = make_override(BLOCK_UNTIL, restore_until)
+            else:
+                await self._async_write_platform_override(
+                    account, account_id, platform, NO_OVERRIDE
+                )
+                applied = make_override(NO_OVERRIDE)
+                if restore_until is not None:
+                    # Extra time cannot be written back: no capture shows how.
+                    _LOGGER.info(
+                        "%s of %s had extra time (allowUntil) before the lock; it "
+                        "cannot be granted again from here, the lock was cancelled",
+                        platform, account_id,
+                    )
+                    applied["not_restored"] = prior
+            if hold is not None:
+                self._platform_holds.pop(key, None)
+                await self._async_save_platform_holds()
+            return {"prior": prior, "applied": applied}
 
     async def _override_platform_mobile(
         self,
@@ -739,55 +971,6 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.info("Microsoft answered 500 but the %s override was applied", platform)
             return
         await self.async_request_refresh()
-
-    async def async_unlock_platform(self, account_id: str, platform: str) -> None:
-        account = self.get_account(account_id)
-        if account is None:
-            raise ValueError(f"Account {account_id} not found")
-
-        if (
-            FamilySafetyWebAPI.supports_platform_override(platform)
-            and self._native_web_auth
-            and self.web_api is not None
-            and self.web_api.has_web_cookies
-        ):
-            until = self._platform_override_until.get(
-                (str(account_id), platform.lower()), dt_util.utcnow()
-            )
-            date_time = dt_util.as_utc(until).isoformat(timespec="milliseconds").replace(
-                "+00:00", "Z"
-            )
-            try:
-                await self.web_api.set_platform_time_override(
-                    account_id, platform, "cancel", date_time
-                )
-            except Exception as err:
-                if platform.lower() in self._WEB_LOCK_STATE_PLATFORMS:
-                    raise HomeAssistantError(
-                        f"Could not unlock {platform}: the Family web request failed ({err})"
-                    ) from err
-                _LOGGER.debug(
-                    "%s web cancel unavailable; falling back to mobile API: %s",
-                    platform, err,
-                )
-            else:
-                self._platform_override_until.pop((str(account_id), platform.lower()), None)
-                if platform.lower() in self._WEB_LOCK_STATE_PLATFORMS:
-                    self._xbox_lock_known.add(str(account_id))
-                await self.async_request_refresh()
-                return
-
-        # As for the lock: a mobile-API Xbox cancel does nothing on the console,
-        # so fail and keep the lock state as it is rather than report "unlocked".
-        if platform.lower() in self._WEB_LOCK_STATE_PLATFORMS:
-            raise HomeAssistantError(
-                f"Cannot unlock {platform}: it can only be unlocked through the Family "
-                "web session, which is not available. Re-authenticate the integration."
-            )
-        await self._override_platform_mobile(
-            account, account_id, platform, OverrideType.CANCEL
-        )
-        self._platform_override_until.pop((str(account_id), platform.lower()), None)
 
     async def async_approve_request(
         self, request_id: str, extension_time: int = 3600
