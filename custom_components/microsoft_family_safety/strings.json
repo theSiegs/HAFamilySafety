@@ -99,7 +99,11 @@
       "fields": {
         "account_id": {
           "name": "Account ID",
-          "description": "The user ID of the child account."
+          "description": "The user ID of the child account. Give this or an entity of the child."
+        },
+        "entity_id": {
+          "name": "Child entity",
+          "description": "Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID."
         },
         "app_id": {
           "name": "Application ID",
@@ -113,7 +117,11 @@
       "fields": {
         "account_id": {
           "name": "Account ID",
-          "description": "The user ID of the child account."
+          "description": "The user ID of the child account. Give this or an entity of the child."
+        },
+        "entity_id": {
+          "name": "Child entity",
+          "description": "Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID."
         },
         "app_id": {
           "name": "Application ID",
@@ -127,7 +135,11 @@
       "fields": {
         "account_id": {
           "name": "Account ID",
-          "description": "The user ID of the child account."
+          "description": "The user ID of the child account. Give this or an entity of the child."
+        },
+        "entity_id": {
+          "name": "Child entity",
+          "description": "Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID."
         },
         "platform": {
           "name": "Platform",
@@ -145,7 +157,11 @@
       "fields": {
         "account_id": {
           "name": "Account ID",
-          "description": "The user ID of the child account."
+          "description": "The user ID of the child account. Give this or an entity of the child."
+        },
+        "entity_id": {
+          "name": "Child entity",
+          "description": "Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID."
         },
         "platform": {
           "name": "Platform",
@@ -183,7 +199,11 @@
       "fields": {
         "account_id": {
           "name": "Account ID",
-          "description": "The user ID of the child account."
+          "description": "The user ID of the child account. Give this or an entity of the child."
+        },
+        "entity_id": {
+          "name": "Child entity",
+          "description": "Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID."
         },
         "day_of_week": {
           "name": "Day of Week",
@@ -205,7 +225,11 @@
       "fields": {
         "account_id": {
           "name": "Account ID",
-          "description": "The user ID of the child account."
+          "description": "The user ID of the child account. Give this or an entity of the child."
+        },
+        "entity_id": {
+          "name": "Child entity",
+          "description": "Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID."
         },
         "day_of_week": {
           "name": "Day of Week",
@@ -235,7 +259,11 @@
       "fields": {
         "account_id": {
           "name": "Account ID",
-          "description": "The user ID of the child account."
+          "description": "The user ID of the child account. Give this or an entity of the child."
+        },
+        "entity_id": {
+          "name": "Child entity",
+          "description": "Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID."
         },
         "app_id": {
           "name": "Application ID",
@@ -273,7 +301,11 @@
       "fields": {
         "account_id": {
           "name": "Account ID",
-          "description": "The user ID of the child account."
+          "description": "The user ID of the child account. Give this or an entity of the child."
+        },
+        "entity_id": {
+          "name": "Child entity",
+          "description": "Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID."
         },
         "app_id": {
           "name": "Application ID",
@@ -295,7 +327,11 @@
       "fields": {
         "account_id": {
           "name": "Account ID",
-          "description": "The user ID of the child account."
+          "description": "The user ID of the child account. Give this or an entity of the child."
+        },
+        "entity_id": {
+          "name": "Child entity",
+          "description": "Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID."
         },
         "website": {
           "name": "Website",
@@ -309,7 +345,11 @@
       "fields": {
         "account_id": {
           "name": "Account ID",
-          "description": "The user ID of the child account."
+          "description": "The user ID of the child account. Give this or an entity of the child."
+        },
+        "entity_id": {
+          "name": "Child entity",
+          "description": "Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID."
         },
         "website": {
           "name": "Website",
@@ -323,7 +363,11 @@
       "fields": {
         "account_id": {
           "name": "Account ID",
-          "description": "The user ID of the child account."
+          "description": "The user ID of the child account. Give this or an entity of the child."
+        },
+        "entity_id": {
+          "name": "Child entity",
+          "description": "Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID."
         },
         "enabled": {
           "name": "Enabled",
@@ -337,7 +381,11 @@
       "fields": {
         "account_id": {
           "name": "Account ID",
-          "description": "The user ID of the child account."
+          "description": "The user ID of the child account. Give this or an entity of the child."
+        },
+        "entity_id": {
+          "name": "Child entity",
+          "description": "Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID."
         },
         "age": {
           "name": "Age Rating",
@@ -351,7 +399,11 @@
       "fields": {
         "account_id": {
           "name": "Account ID",
-          "description": "The user ID of the child account."
+          "description": "The user ID of the child account. Give this or an entity of the child."
+        },
+        "entity_id": {
+          "name": "Child entity",
+          "description": "Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID."
         },
         "require_approval": {
           "name": "Require Approval",
@@ -365,7 +417,11 @@
       "fields": {
         "account_id": {
           "name": "Account ID",
-          "description": "The user ID of the child account to lock."
+          "description": "The user ID of the child account to lock. Give this or an entity of the child."
+        },
+        "entity_id": {
+          "name": "Child entity",
+          "description": "Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID."
         }
       }
     },
@@ -375,7 +431,11 @@
       "fields": {
         "account_id": {
           "name": "Account ID",
-          "description": "The user ID of the child account to unlock."
+          "description": "The user ID of the child account to unlock. Give this or an entity of the child."
+        },
+        "entity_id": {
+          "name": "Child entity",
+          "description": "Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID."
         }
       }
     },
@@ -389,7 +449,11 @@
       "fields": {
         "account_id": {
           "name": "Account ID",
-          "description": "The user ID of the child account."
+          "description": "The user ID of the child account. Give this or an entity of the child."
+        },
+        "entity_id": {
+          "name": "Child entity",
+          "description": "Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID."
         },
         "website": {
           "name": "Website",
