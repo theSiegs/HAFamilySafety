@@ -40,10 +40,12 @@ from .const import (
     SERVICE_LOCK_ACCOUNT,
     SERVICE_UNLOCK_ACCOUNT,
     SERVICE_REQUEST_REAUTH,
+    SERVICE_SYNC_SITE_LIST,
     CONF_ALLOWED_USERS,
 )
 from .coordinator import FamilySafetyDataUpdateCoordinator
-from .permissions import guard_service
+from .permissions import async_require_admin, guard_service
+from .site_sync import MAX_SYNC_DOMAINS, https_url
 from .targeting import child_schema, resolve_account_id
 from ._httpx_web_adapter import apply_httpx_web_transport_patch
 from ._httpx_web_tuning import apply_httpx_web_tuning_patch
@@ -149,9 +151,22 @@ SERVICE_UNLOCK_ACCOUNT_SCHEMA = child_schema({
 
 SERVICE_REQUEST_REAUTH_SCHEMA = vol.Schema({})
 
+SERVICE_SYNC_SITE_LIST_SCHEMA = child_schema({
+    vol.Required("url"): https_url,
+    vol.Optional("max_domains", default=MAX_SYNC_DOMAINS): vol.All(
+        vol.Coerce(int), vol.Range(min=1, max=MAX_SYNC_DOMAINS)
+    ),
+    vol.Optional("stop", default=False): cv.boolean,
+})
+
 
 #: Services that answer with what they did (``{"prior", "applied"}``).
-_RESPONSE_SERVICES = frozenset({SERVICE_LOCK_PLATFORM, SERVICE_UNLOCK_PLATFORM})
+_RESPONSE_SERVICES = frozenset(
+    {SERVICE_LOCK_PLATFORM, SERVICE_UNLOCK_PLATFORM, SERVICE_SYNC_SITE_LIST}
+)
+#: Services for administrators only, whatever the allowed-users option says:
+#: sync_site_list downloads a URL from inside Home Assistant.
+_ADMIN_SERVICES = frozenset({SERVICE_SYNC_SITE_LIST})
 
 
 def _lock_until(data: dict) -> datetime:
@@ -307,10 +322,14 @@ def _register_services(hass: HomeAssistant) -> None:
          lambda d: (d["account_id"],)),
         (SERVICE_REQUEST_REAUTH, SERVICE_REQUEST_REAUTH_SCHEMA, "async_request_reauth",
          lambda d: ()),
+        (SERVICE_SYNC_SITE_LIST, SERVICE_SYNC_SITE_LIST_SCHEMA, "async_sync_site_list",
+         lambda d: (d["account_id"], d["url"], d["max_domains"], d["stop"])),
     ]
 
-    def make_handler(method_name, extract_args, per_child, responds):
+    def make_handler(method_name, extract_args, per_child, responds, admin_only):
         async def handler(call: ServiceCall) -> dict | None:
+            if admin_only:
+                await async_require_admin(hass, call)
             data = dict(call.data)
             if per_child:
                 # account_id as before, or any entity of the child.
@@ -342,7 +361,10 @@ def _register_services(hass: HomeAssistant) -> None:
         responds = name in _RESPONSE_SERVICES
         hass.services.async_register(
             DOMAIN, name,
-            guard_service(hass, make_handler(method, extract, per_child, responds)),
+            guard_service(
+                hass,
+                make_handler(method, extract, per_child, responds, name in _ADMIN_SERVICES),
+            ),
             schema=schema,
             supports_response=(
                 SupportsResponse.OPTIONAL if responds else SupportsResponse.NONE

@@ -40,6 +40,7 @@ from .const import (
 from .coordinator import FamilySafetyDataUpdateCoordinator
 from .app_usage import app_usage_unique_id, safe_app_id, top_apps, usage_summary
 from .binary_sensor import MinuteUpdateMixin
+from .site_sync import site_lists
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -336,37 +337,13 @@ class FamilySafetyScreenTimeSensor(FamilySafetyAccountSensor):
         }
 
 
-def _site_host(value: Any) -> str | None:
-    """"https://www.example.com/path" -> "www.example.com"."""
-    if not isinstance(value, str) or not value.strip():
-        return None
-    text = value.strip()
-    if "://" in text:
-        text = text.split("://", 1)[1]
-    return text.split("/", 1)[0].lower() or None
-
-
 def website_lists(web_data: dict[str, Any]) -> dict[str, Any]:
     """The blocked and allowed sites as plain host names, with counts.
 
     Built from Microsoft's ``exceptions`` (``{"website", "allowed"}``), else
     from the ``blockedSites`` / ``allowedSites`` lists the read derives.
     """
-    blocked: list[str] = []
-    allowed: list[str] = []
-    exceptions = web_data.get("exceptions", web_data.get("Exceptions"))
-    if isinstance(exceptions, list) and exceptions:
-        for item in exceptions:
-            if not isinstance(item, dict):
-                continue
-            host = _site_host(item.get("website") or item.get("Website"))
-            if host:
-                (allowed if item.get("allowed", item.get("Allowed")) else blocked).append(host)
-    else:
-        blocked = [h for h in map(_site_host, web_data.get("blockedSites") or []) if h]
-        allowed = [h for h in map(_site_host, web_data.get("allowedSites") or []) if h]
-    blocked = sorted(dict.fromkeys(blocked))
-    allowed = sorted(dict.fromkeys(allowed))
+    blocked, allowed = site_lists(web_data) or ([], [])
     result: dict[str, Any] = {
         "blocked_sites": blocked,
         "allowed_sites": allowed,
