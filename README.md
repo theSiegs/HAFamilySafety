@@ -176,7 +176,7 @@ Legacy and native mode are mutually exclusive per config entry; there is no auto
 | Monitored platforms | Windows / Xbox / Mobile | Windows | One lock switch per platform. Xbox also decides whether the web session is used, see [below](#xbox-and-the-web-session) |
 | Users allowed to control Microsoft Family Safety | list of Home Assistant users | *(empty: everybody)* | See [Who can control the integration](#who-can-control-the-integration) |
 | Strict mode | on / off | off | Places a `lock_platform` lock again when it is cancelled elsewhere; see [Strict mode](#strict-mode) |
-| Xbox lock without the web session | on / off | on | Locks the Xbox through today's Xbox schedule while the web session is down; see [below](#xbox-lock-without-the-web-session) |
+| Xbox lock without the web session | on / off | off | Locks the Xbox through today's Xbox schedule while the web session is down; see [below](#xbox-lock-without-the-web-session) |
 | Allow insecure local HTTP authentication (testing only) | on / off | off | See below |
 
 #### Strict mode
@@ -208,13 +208,13 @@ Unticking Xbox later takes effect at once; the web credentials already stored st
 
 #### Xbox lock without the web session
 
-With **Xbox lock without the web session: use today's Xbox schedule** on (the default), an Xbox lock keeps working while the web session waits for its sign-in. When the web route cannot be used (no Family context, a context that needs a sign-in, or the Xbox lock request answering 401), `lock_platform` on Xbox (and the Xbox lock switch):
+With **Xbox lock without the web session: use today's Xbox schedule** on (off by default: turn it on once you have checked that your console stops when today's Xbox daily limit is set to no time mid-day), an Xbox lock keeps working while the web session waits for its sign-in. When the web route cannot be used (no Family context, a context that needs a sign-in, or the Xbox lock request answering 401), `lock_platform` on Xbox (and the Xbox lock switch):
 
 1. reads **today's** Xbox schedule day exactly as Microsoft holds it (allowance and allowed hours, and whether the Xbox schedule is on) and saves it with the lock, on disk, before writing anything;
 2. sets today's Xbox allowance to **0** through the mobile token (the allowed hours stay as they are; a schedule that was off is turned on for the lock and off again afterwards);
 3. puts the saved day back at `unlock_platform` (or the switch turned off), at the end of the lock, and **at midnight in any case**: such a lock never lasts past midnight and is never carried to the next day. A restart that missed the moment puts it back on the first update.
 
-The day is only put back while it still shows the lock: when a parent changed it in the Family Safety app meanwhile, the parent's day is kept and `unlock_platform` answers `left_parent_override`. Whenever the web route works, the web lock is used as before. The answers of `lock_platform` and `unlock_platform` and the attributes of the lock switch and Allowed Now sensor carry `lock_path`: `web` or `mobile_schedule`.
+The day is only put back while it still shows the lock: when a parent changed it in the Family Safety app meanwhile, the parent's day is kept and `unlock_platform` answers `left_parent_override`. A new `lock_platform` on that child then answers `left_parent_override` too, without writing over the parent's day. If the saved day cannot be put back once the lock has ended, it is retried at every update and a Repairs issue ("An Xbox schedule was not put back") stays up until it succeeds. Whenever the web route works, the web lock is used as before. The answers of `lock_platform` and `unlock_platform` and the attributes of the lock switch and Allowed Now sensor carry `lock_path`: `web` or `mobile_schedule`.
 
 While such a lock holds, the switch reads locked, `hold` is `ours` with `override: blockUntil` until the lock's end, and `allowance_minutes` shows the saved allowance, not the 0 written; the Xbox daily limit number for today shows 0. It needs a separate Xbox schedule (Family Safety's "per device type" limits); otherwise the lock fails with a clear error and nothing is changed. Extra time on the Xbox (`add_time_bonus`, `cancel_time_bonus`) still needs the web session and fails with a clear error without it. Turn the option off to have the Xbox lock refuse instead, as before.
 

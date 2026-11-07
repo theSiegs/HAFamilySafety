@@ -19,6 +19,7 @@ from pytest_homeassistant_custom_component.common import (
 )
 
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.util import dt as dt_util
 
 from custom_components.microsoft_family_safety import binary_sensor, switch
@@ -151,7 +152,10 @@ def _poll(coord) -> None:
 
 @pytest.fixture
 def entry(hass):
-    entry = MockConfigEntry(domain=DOMAIN, data={"refresh_token": "x"})
+    entry = MockConfigEntry(
+        domain=DOMAIN, data={"refresh_token": "x"},
+        options={CONF_XBOX_LOCK_MOBILE_FALLBACK: True},
+    )
     entry.add_to_hass(hass)
     return entry
 
@@ -286,14 +290,29 @@ async def test_relock_keeps_the_saved_day_and_the_later_end(coord, web, noon):
     assert len(web.day_writes) == 1  # still ours: nothing written again
 
 
-async def test_relock_after_a_parent_change_saves_the_parents_day(coord, web, noon):
+async def test_relock_after_a_parent_change_leaves_the_parents_day(coord, web, noon):
     await coord.async_lock_platform(CHILD, "Xbox", _in(2))
     web.days[_today()] = {"allowance": 3600 * 1000, "allottedIntervals": EVENING}
+    writes = len(web.day_writes)
 
-    await coord.async_lock_platform(CHILD, "Xbox", _in(2))
-    assert coord.platform_hold(CHILD, "Xbox")["saved"]["allowance"] == 3600 * 1000
-    await coord.async_unlock_platform(CHILD, "Xbox")
+    result = await coord.async_lock_platform(CHILD, "Xbox", _in(2))
+    assert result["applied"] == "left_parent_override"
+    assert result["lock_path"] == "mobile_schedule"
+    assert result["current"]["allowance_minutes"] == 60
+    assert len(web.day_writes) == writes
     assert web.days[_today()]["allowance"] == 3600 * 1000
+    assert coord.platform_hold(CHILD, "Xbox") is None
+
+
+async def test_fallback_is_off_by_default(hass, web, noon):
+    entry = MockConfigEntry(domain=DOMAIN, data={"refresh_token": "x"})
+    entry.add_to_hass(hass)
+    coord = _make(hass, entry, web)
+    web.has_web_cookies = False
+
+    with pytest.raises(HomeAssistantError, match="web session"):
+        await coord.async_lock_platform(CHILD, "Xbox", _in(2))
+    assert web.day_writes == []
 
 
 # Unlock ----------------------------------------------------------------------
@@ -445,11 +464,15 @@ async def test_failed_restore_is_retried_on_the_next_poll(hass, coord, web, noon
     web.read_fail = True
     await coord._async_check_mobile_holds()
     assert coord.platform_hold(CHILD, "Xbox") is not None
+    issue_id = coord._not_restored_issue_id(coord._hold_key(CHILD, "Xbox"))
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, issue_id)
+    assert issue is not None and issue.severity == ir.IssueSeverity.ERROR
 
     web.read_fail = False
     await coord._async_check_mobile_holds()
     assert web.days[_today()]["allowance"] == TWO_HOURS
     assert coord.platform_hold(CHILD, "Xbox") is None
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
 
 
 async def test_unlock_after_the_end_reports_hold_expired_and_restores(coord, web, noon, freezer):
@@ -523,7 +546,8 @@ async def test_state_right_after_the_lock_before_a_poll(coord, web, noon):
 
 async def test_strict_mode_leaves_a_schedule_lock_alone(hass, web, noon):
     entry = MockConfigEntry(
-        domain=DOMAIN, data={"refresh_token": "x"}, options={"strict_mode": True},
+        domain=DOMAIN, data={"refresh_token": "x"},
+        options={"strict_mode": True, CONF_XBOX_LOCK_MOBILE_FALLBACK: True},
     )
     entry.add_to_hass(hass)
     coord = _make(hass, entry, web)

@@ -43,7 +43,8 @@ EVENT_LOCK_REASSERTED: Final = f"{DOMAIN}_lock_reasserted"
 # Xbox lock without the Family web session: today's Xbox schedule day is set
 # to no time (mobile API) and put back at unlock, at its end or at midnight.
 CONF_XBOX_LOCK_MOBILE_FALLBACK: Final = "xbox_lock_mobile_fallback"
-DEFAULT_XBOX_LOCK_MOBILE_FALLBACK: Final = True
+DEFAULT_XBOX_LOCK_MOBILE_FALLBACK: Final = False
+XBOX_SCHEDULE_NOT_RESTORED_ISSUE: Final = "xbox_schedule_not_restored"
 #: How an Xbox lock was placed (``lock_path`` attribute and service answers).
 LOCK_PATH_WEB: Final = "web"
 LOCK_PATH_MOBILE_SCHEDULE: Final = "mobile_schedule"

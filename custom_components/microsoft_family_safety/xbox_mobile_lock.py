@@ -33,6 +33,7 @@ from typing import Any, Callable
 
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.event import async_track_point_in_utc_time
 from homeassistant.util import dt as dt_util
 
@@ -41,7 +42,9 @@ from .const import (
     CONF_XBOX_LOCK_MOBILE_FALLBACK,
     DAY_KEYS,
     DEFAULT_XBOX_LOCK_MOBILE_FALLBACK,
+    DOMAIN,
     LOCK_PATH_MOBILE_SCHEDULE,
+    XBOX_SCHEDULE_NOT_RESTORED_ISSUE,
 )
 from .screen_time import (
     BLOCK_UNTIL,
@@ -322,6 +325,23 @@ class XboxMobileLockMixin:
         if hold is not None:
             if self._mobile_day_is_ours(hold, current):
                 already_ours = bool(hold.get("confirmed"))
+            elif hold.get("confirmed"):
+                # A parent changed the day in the app since our confirmed
+                # lock: theirs stands, as a parent's web override would.
+                _LOGGER.info(
+                    "Xbox schedule of %s was changed since our lock; not locking over it",
+                    account_id,
+                )
+                self._platform_holds.pop(key, None)
+                await self._async_save_platform_holds()
+                self._cancel_mobile_restore(key)
+                self._clear_not_restored_issue(key)
+                return {
+                    "prior": dict(hold.get("prior") or make_override(UNKNOWN)),
+                    "applied": "left_parent_override",
+                    "lock_path": LOCK_PATH_MOBILE_SCHEDULE,
+                    "current": day_details(current),
+                }
             else:
                 # Not (or no longer) our write: what Microsoft holds now, a
                 # parent's change included, is what comes back at unlock.
@@ -430,6 +450,7 @@ class XboxMobileLockMixin:
         self._platform_holds.pop(key, None)
         await self._async_save_platform_holds()
         self._cancel_mobile_restore(key)
+        self._clear_not_restored_issue(key)
         saved = {**hold["saved"], "enabled": hold.get("saved_enabled") is not False}
         result: dict[str, Any] = {
             "prior": dict(hold.get("prior") or make_override(UNKNOWN)),
@@ -495,6 +516,27 @@ class XboxMobileLockMixin:
         if cancel is not None:
             cancel()
 
+    def _not_restored_issue_id(self, key: str) -> str:
+        return f"{XBOX_SCHEDULE_NOT_RESTORED_ISSUE}_{self.entry.entry_id}_{key}"
+
+    def _raise_not_restored_issue(self, key: str, err: Exception) -> None:
+        """A lock past its end whose day is still not back: say so in Repairs."""
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            self._not_restored_issue_id(key),
+            is_fixable=False,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key=XBOX_SCHEDULE_NOT_RESTORED_ISSUE,
+            translation_placeholders={
+                "title": self.entry.title or DOMAIN,
+                "error": str(err)[:200],
+            },
+        )
+
+    def _clear_not_restored_issue(self, key: str) -> None:
+        ir.async_delete_issue(self.hass, DOMAIN, self._not_restored_issue_id(key))
+
     def _cancel_all_mobile_restores(self) -> None:
         for key in list(self._mobile_restore_timers):
             self._cancel_mobile_restore(key)
@@ -513,10 +555,12 @@ class XboxMobileLockMixin:
                     "Could not put the Xbox schedule of %s back at the lock's end "
                     "(retried on the next update): %s", account_id, err,
                 )
+                self._raise_not_restored_issue(key, err)
                 return False
             self._platform_holds.pop(key, None)
             await self._async_save_platform_holds()
             self._cancel_mobile_restore(key)
+            self._clear_not_restored_issue(key)
             _LOGGER.info("Xbox schedule lock of %s ended: %s", account_id, outcome)
         if refresh:
             await self.async_request_refresh()
