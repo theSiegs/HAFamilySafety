@@ -2733,9 +2733,12 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._family_auth_required_polls += 1
         if not self._family_context_dead_end:
             return
-        if getattr(self.web_api, "mobile_schedule_ok", False):
+        if getattr(self.web_api, "mobile_schedule_ok", False) and not self.xbox_features:
             # Schedules run on the mobile API; the expired web context only
             # affects web-only extras, so a daily reauth prompt is not worth it.
+            # With the Xbox features on it is: Xbox play time and the Xbox
+            # lock exist only on the web session, and without a prompt they
+            # stay unknown with no sign that anything is wrong.
             if self._family_auth_required_polls == _FAMILY_AUTH_REQUIRED_POLLS:
                 _LOGGER.info(
                     "Family web context needs an interactive sign-in; schedules keep "

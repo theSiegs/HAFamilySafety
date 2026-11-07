@@ -1223,6 +1223,22 @@ class FamilySafetyWebAPI:
                         "Optional Family web API endpoint answered %s: %s %s",
                         resp.status, endpoint, body[:200],
                     )
+                    if resp.status == 401:
+                        # 403/404 are a child without an Xbox; 401 is the
+                        # session itself being refused (Microsoft's daily
+                        # interactive sign-in, #52). Treat it like any other
+                        # rejected Family request, or the Xbox reads fail on
+                        # every poll while the context still reads "ready"
+                        # and nobody is asked to sign in.
+                        self._mark_web_api("auth_error", endpoint, resp.status)
+                        if self.family_context_state == "ready":
+                            self.family_context_state = "auth_required"
+                            self.family_token_source = None
+                        self._web_csrf = None
+                        _LOGGER.info(
+                            "Family web API refused %s with 401; the Family web "
+                            "session needs a new sign-in", endpoint,
+                        )
                     return None
                 if resp.status in (401, 403):
                     self.last_web_error_code = "AUTH_ERROR"
