@@ -37,7 +37,7 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import FamilySafetyDataUpdateCoordinator
-from .number import _parse_allowance_to_minutes
+from .binary_sensor import MinuteUpdateMixin
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -108,6 +108,7 @@ async def async_setup_entry(
 
     known_accounts: set[str] = set()
     known_xbox_accounts: set[str] = set()
+    known_windows_accounts: set[str] = set()
     known_devices: set[str] = set()
 
     def _add_new_entities() -> None:
@@ -137,6 +138,13 @@ async def async_setup_entry(
                     FamilySafetyXboxScreenTimeSensor(coordinator, entry, account_id),
                     FamilySafetyXboxTimeRemainingSensor(coordinator, entry, account_id),
                 ])
+            if account_id not in known_windows_accounts and isinstance(
+                (account_data or {}).get("screentime_policy"), dict
+            ):
+                known_windows_accounts.add(account_id)
+                entities.append(
+                    FamilySafetyTimeRemainingSensor(coordinator, entry, account_id)
+                )
 
         for device_id in data.get("devices", {}):
             if device_id not in known_devices:
@@ -335,17 +343,21 @@ class FamilySafetyXboxScreenTimeSensor(FamilySafetyAccountSensor):
         return value if isinstance(value, int) else None
 
 
-class FamilySafetyXboxTimeRemainingSensor(FamilySafetyAccountSensor):
-    """Xbox time left today: today's Xbox allowance minus today's Xbox play.
+class FamilySafetyTimeRemainingSensor(MinuteUpdateMixin, FamilySafetyAccountSensor):
+    """Minutes the child may still use a platform today.
 
-    Unknown while either is unknown. With Xbox limits turned off the
-    allowance is 24 h, as the Xbox Family app shows it: Microsoft keeps the
-    last stored allowance in the schedule, but it is not enforced then.
+    The same rules as the "Allowed Now" binary sensor (see
+    screen_time.platform_allowance): 0 while locked, outside today's allowed
+    hours or once the allowance is used; otherwise the smaller of the
+    allowance left and the time to the end of the current allowed window.
+    With limits turned off it counts down to midnight. Unknown while the
+    schedule or today's usage is unknown.
     """
 
     _attr_device_class = SensorDeviceClass.DURATION
     _attr_native_unit_of_measurement = UnitOfTime.MINUTES
     _attr_icon = "mdi:timer-sand"
+    _platform = "Windows"
 
     def __init__(
         self,
@@ -355,46 +367,56 @@ class FamilySafetyXboxTimeRemainingSensor(FamilySafetyAccountSensor):
     ) -> None:
         """Initialize the sensor."""
         super().__init__(coordinator, entry, account_id)
-        self._attr_unique_id = f"{entry.entry_id}_{account_id}_xbox_time_remaining"
-        self._attr_name = f"{self._get_account_name()} Xbox Time Remaining"
+        self._attr_unique_id = (
+            f"{entry.entry_id}_{account_id}_{self._platform.lower()}_time_remaining"
+        )
+        self._attr_name = f"{self._get_account_name()} {self._platform} Time Remaining"
 
-    def _today(self) -> dict[str, Any] | None:
-        schedule = _xbox_schedule(self._get_account_data())
-        if schedule is None:
-            return None
-        day_key = DAY_KEYS[(dt_util.now().weekday() + 1) % 7]
-        day = (schedule.get("dailyRestrictions") or {}).get(day_key)
-        return day if isinstance(day, dict) else None
-
-    def _limits_enabled(self) -> bool:
-        schedule = _xbox_schedule(self._get_account_data()) or {}
-        return schedule.get("isEnabled") is not False
-
-    def _allowance(self, today: dict[str, Any]) -> int:
-        if not self._limits_enabled():
-            return 24 * 60
-        return _parse_allowance_to_minutes(today.get("allowance"))
+    def _status(self) -> dict[str, Any]:
+        return self.coordinator.platform_status(self._account_id, self._platform)
 
     @property
     def native_value(self) -> int | None:
-        """Return the Xbox minutes left today."""
-        today = self._today()
-        used = (self._get_account_data() or {}).get("xbox_today_usage")
-        if today is None or not isinstance(used, int):
-            return None
-        return max(self._allowance(today) - used, 0)
+        """Return the minutes left today."""
+        return self._status()["remaining_minutes"]
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return today's allowance and allowed ranges."""
-        today = self._today()
-        if today is None:
-            return {}
-        return {
-            "limits_enabled": self._limits_enabled(),
-            "allowance_minutes": self._allowance(today),
-            "allowed_ranges": today.get("allottedIntervals") or [],
+        """Return why, today's allowance and allowed ranges."""
+        status = self._status()
+        attrs: dict[str, Any] = {
+            "allowed_now": status["allowed"],
+            "reason": status["reason"],
+            "allowance_minutes": status["allowance_minutes"],
+            "used_minutes": status["used_minutes"],
         }
+        policy = self._schedule()
+        if policy is not None:
+            attrs["limits_enabled"] = policy.get("isEnabled") is not False
+            day_key = DAY_KEYS[(dt_util.now().weekday() + 1) % 7]
+            day = (policy.get("dailyRestrictions") or {}).get(day_key)
+            if isinstance(day, dict):
+                attrs["allowed_ranges"] = (
+                    day.get("allottedIntervals") or day.get("allowedIntervals") or []
+                )
+                if isinstance(attrs["allowed_ranges"], list) and all(
+                    isinstance(item, bool) for item in attrs["allowed_ranges"]
+                ):
+                    attrs["allowed_ranges"] = []
+        return attrs
+
+    def _schedule(self) -> dict[str, Any] | None:
+        policy = (self._get_account_data() or {}).get("screentime_policy")
+        return policy if isinstance(policy, dict) else None
+
+
+class FamilySafetyXboxTimeRemainingSensor(FamilySafetyTimeRemainingSensor):
+    """Xbox time left today (Xbox schedule, Xbox play time, Xbox lock)."""
+
+    _platform = "Xbox"
+
+    def _schedule(self) -> dict[str, Any] | None:
+        return _xbox_schedule(self._get_account_data())
 
 
 class FamilySafetyAccountInfoSensor(FamilySafetyAccountSensor):

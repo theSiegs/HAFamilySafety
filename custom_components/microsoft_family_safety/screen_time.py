@@ -1,4 +1,4 @@
-"""Pure screen-time helpers: platform overrides as Microsoft reports them.
+"""Pure screen-time helpers: overrides, and whether a platform is allowed now.
 
 No Home Assistant state and no I/O here, so every rule can be unit tested.
 
@@ -16,6 +16,7 @@ as unknown, never as "not blocked".
 from __future__ import annotations
 
 from datetime import datetime
+import re
 from typing import Any
 
 from homeassistant.util import dt as dt_util
@@ -143,3 +144,178 @@ def active_until(record: dict[str, Any] | None, now: datetime | None = None) -> 
     if until is None or until <= (now or dt_util.utcnow()):
         return None
     return until
+
+
+# ----------------------------------------------------------------------
+# Allowed now / time remaining
+# ----------------------------------------------------------------------
+
+_DAY_KEYS = ("sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday")
+
+REASON_LOCKED = "locked"
+REASON_EXTRA_TIME = "extra_time"
+REASON_NO_LIMITS = "no_limits"
+REASON_OUTSIDE_HOURS = "outside_allowed_hours"
+REASON_ALLOWANCE_USED = "allowance_used"
+REASON_WITHIN_LIMITS = "within_limits"
+REASON_UNKNOWN = "unknown"
+
+
+def parse_allowance_minutes(allowance: str | int | float | None) -> int:
+    """Parse Microsoft allowance values ("HH:MM:SS", "PT2H30M") to total minutes."""
+    if allowance is None:
+        return 0
+    if isinstance(allowance, (int, float)):
+        return int(allowance)
+    try:
+        text = str(allowance).strip()
+        if text.upper().startswith("PT"):
+            match = re.fullmatch(
+                r"PT(?:(\d+)H)?(?:(\d+)M)?(?:\d+(?:\.\d+)?S)?",
+                text.upper(),
+            )
+            if not match:
+                return 0
+            return int(match.group(1) or 0) * 60 + int(match.group(2) or 0)
+        parts = text.split(":")
+        hours = int(parts[0])
+        minutes = int(parts[1]) if len(parts) > 1 else 0
+        return hours * 60 + minutes
+    except (TypeError, ValueError, IndexError):
+        return 0
+
+
+def _clock_minutes(value: Any) -> int | None:
+    """"HH:MM[:SS]" or .NET "1.00:00:00" (midnight at the end) to minutes."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    days = 0
+    head = text.split(":")[0]
+    if "." in head:
+        day_part, text = text.split(".", 1)
+        try:
+            days = int(day_part or 0)
+        except ValueError:
+            return None
+    try:
+        parts = [int(float(p)) for p in text.split(":")[:2]] + [0]
+    except ValueError:
+        return None
+    total = days * 1440 + parts[0] * 60 + parts[1]
+    return total if 0 <= total <= 1440 else None
+
+
+def day_slots(day: dict[str, Any]) -> list[bool] | None:
+    """The day's 48 half-hour slots; None when the day carries no windows."""
+    for key in ("timeline", "allowedIntervals", "AllowedIntervals"):
+        value = day.get(key)
+        if isinstance(value, list) and len(value) == 48 and all(
+            isinstance(item, bool) for item in value
+        ):
+            return list(value)
+    for key in ("allowedIntervals", "AllowedIntervals", "allottedIntervals"):
+        value = day.get(key)
+        if not isinstance(value, list):
+            continue
+        slots = [False] * 48
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            begin = _clock_minutes(item.get("begin") or item.get("Begin") or item.get("start"))
+            end = _clock_minutes(item.get("end") or item.get("End"))
+            if begin is None or end is None or end <= begin:
+                continue
+            for slot in range(begin // 30, min(48, -(-end // 30))):
+                slots[slot] = True
+        return slots
+    return None
+
+
+def platform_allowance(
+    policy: dict[str, Any] | None,
+    used_minutes: int | None,
+    now: datetime,
+    current_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Whether a platform may be used at ``now`` (local time), and for how long.
+
+    Takes, in this order: an active override (a blockUntil locks, an
+    allowUntil grants time until it ends), limits turned off, today's allowed
+    hours, then today's allowance against today's usage. The minutes left are
+    the smaller of the allowance left and the time to the end of the current
+    allowed window (midnight at the latest); 0 whenever not allowed.
+
+    Returns ``allowed`` (None when unknown), ``remaining_minutes`` (None when
+    unknown), ``reason`` and the inputs used, for the entities' attributes.
+    """
+    minute_of_day = now.hour * 60 + now.minute + now.second / 60
+    to_midnight = int(1440 - minute_of_day)
+    result: dict[str, Any] = {
+        "allowed": None,
+        "remaining_minutes": None,
+        "reason": REASON_UNKNOWN,
+        "allowance_minutes": None,
+        "used_minutes": used_minutes,
+        "in_allowed_hours": None,
+        "override": current_override,
+    }
+
+    kind = (current_override or {}).get("type")
+    if kind == BLOCK_UNTIL and (
+        current_override.get("valid_until") is None
+        or active_until(current_override, dt_util.as_utc(now)) is not None
+    ):
+        return {**result, "allowed": False, "remaining_minutes": 0, "reason": REASON_LOCKED}
+    if kind == ALLOW_UNTIL:
+        until = active_until(current_override, dt_util.as_utc(now))
+        if until is not None:
+            left = int((until - dt_util.as_utc(now)).total_seconds() // 60)
+            return {
+                **result, "allowed": True, "remaining_minutes": min(left, to_midnight),
+                "reason": REASON_EXTRA_TIME,
+            }
+
+    if not isinstance(policy, dict):
+        return result
+    enabled = policy.get("isEnabled", policy.get("IsEnabled"))
+    if enabled is False:
+        return {
+            **result, "allowed": True, "remaining_minutes": to_midnight,
+            "reason": REASON_NO_LIMITS,
+        }
+    daily = policy.get("dailyRestrictions") or policy.get("DailyRestrictions")
+    day_key = _DAY_KEYS[(now.weekday() + 1) % 7]
+    day = (
+        daily.get(day_key) or daily.get(day_key.capitalize())
+        if isinstance(daily, dict)
+        else None
+    )
+    if not isinstance(day, dict):
+        return result
+
+    allowance = parse_allowance_minutes(day.get("allowance", day.get("Allowance")))
+    result["allowance_minutes"] = allowance
+    slots = day_slots(day) or [True] * 48
+    slot = min(int(minute_of_day // 30), 47)
+    in_hours = slots[slot]
+    result["in_allowed_hours"] = in_hours
+    if not in_hours:
+        return {**result, "allowed": False, "remaining_minutes": 0, "reason": REASON_OUTSIDE_HOURS}
+    end_slot = slot
+    while end_slot < 48 and slots[end_slot]:
+        end_slot += 1
+    to_window_end = int(end_slot * 30 - minute_of_day)
+
+    if allowance >= 1440:
+        left = to_window_end
+    elif used_minutes is None:
+        return result
+    else:
+        left = max(allowance - int(used_minutes), 0)
+    if left <= 0:
+        return {**result, "allowed": False, "remaining_minutes": 0, "reason": REASON_ALLOWANCE_USED}
+    return {
+        **result, "allowed": True, "remaining_minutes": min(left, to_window_end),
+        "reason": REASON_WITHIN_LIMITS,
+    }
