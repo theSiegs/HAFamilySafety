@@ -59,6 +59,20 @@ class AppPauser:
     def __init__(self, hass, entry_id: str) -> None:
         self._store: Store = Store(hass, STORAGE_VERSION, f"{DOMAIN}.app_pause.{entry_id}")
         self._lock = asyncio.Lock()
+        #: The stored record, kept in memory for the entities' attributes.
+        self._cache: dict[str, Any] = {}
+
+    async def async_load(self) -> None:
+        """Read the store once at setup, for saved()."""
+        self._cache = await self._store.async_load() or {}
+
+    def saved(self, account_id: Any) -> dict[str, Any]:
+        """app id -> saved state, for one child (from memory)."""
+        return dict(self._cache.get(str(account_id)) or {})
+
+    async def _async_save(self, data: dict[str, Any]) -> None:
+        self._cache = data
+        await self._store.async_save(data)
 
     async def async_saved(self, account_id: str) -> dict[str, Any]:
         """app id -> saved state, for one child."""
@@ -90,7 +104,7 @@ class AppPauser:
                     new_record = True
                     # Saved before the write: a block that went through but
                     # answered an error must still be resumable.
-                    await self._store.async_save(data)
+                    await self._async_save(data)
                 try:
                     await coordinator.async_block_app(account_id, app_id)
                 except HomeAssistantError as err:
@@ -110,7 +124,7 @@ class AppPauser:
                 paused.append(app_id)
             if not saved:
                 data.pop(account_id, None)
-            await self._store.async_save(data)
+            await self._async_save(data)
         return {"account_id": account_id, "paused": paused, "skipped": skipped}
 
     async def async_resume(
@@ -139,5 +153,5 @@ class AppPauser:
                 data[account_id] = saved
             else:
                 data.pop(account_id, None)
-            await self._store.async_save(data)
+            await self._async_save(data)
         return {"account_id": account_id, "resumed": resumed, "skipped": skipped}

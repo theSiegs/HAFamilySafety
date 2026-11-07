@@ -38,6 +38,7 @@ from .app_usage import EVENT_APP_USAGE, AppUsageGrowthTracker
 from . import site_sync
 from .auth.addon_client import AddonCookieClient
 from .screen_time import (
+    ALLOW_UNTIL,
     BLOCK_UNTIL,
     NO_OVERRIDE,
     UNKNOWN,
@@ -56,6 +57,7 @@ from .const import (
     DEFAULT_STRICT_MODE,
     EVENT_LOCK_REASSERTED,
     EVENT_REQUEST,
+    EVENT_REQUEST_RESOLVED,
     DEFAULT_XBOX_FEATURES,
     CONF_API_KEY,
     CONF_AUTH_URL,
@@ -261,6 +263,14 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: only after _REQUEST_FORGET_POLLS misses, so one empty or failed read
         #: does not make every open request "new" again.
         self._seen_request_ids: dict[str, int] | None = None
+        #: request id -> account id, from the polls that listed it.
+        self._request_accounts: dict[str, str | None] = {}
+        #: request id -> (outcome, minutes) for requests approve_request /
+        #: deny_request handled, so their resolution says "via: service".
+        self._handled_requests: dict[str, tuple[str, int | None]] = {}
+        #: Requests whose resolution was already reported (insertion ordered,
+        #: capped), so one that comes back and leaves again is not reported twice.
+        self._resolved_requests: dict[str, None] = {}
         #: hold key -> when strict mode last placed that lock again.
         self._last_reassert: dict[str, datetime] = {}
         if not self._mobile_only:
@@ -326,6 +336,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._policy_key(key): value for key, value in data.items()
             }
         await self._async_load_platform_holds()
+        await self.app_pauser.async_load()
         auth_state = await self._auth_store.async_load()
         if (
             isinstance(auth_state, dict)
@@ -1032,6 +1043,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     applied = "hold_expired"
                 else:
                     current = await self._async_read_platform_override(account_id, platform)
+                    left_current = current
                     if current is not None and not self._is_own_lock(hold, current):
                         # An unconfirmed hold is a lock that never went through.
                         applied = (
@@ -1048,7 +1060,11 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         self._platform_override_until.pop(
                             (str(account_id), platform.lower()), None
                         )
-                    return {"prior": prior, "applied": applied}
+                    result: dict[str, Any] = {"prior": prior, "applied": applied}
+                    if applied == "left_parent_override":
+                        # What the parent has in force, so a caller can match it.
+                        result["current"] = self._override_details(left_current)
+                    return result
             restore_until = active_until(prior)
             if restore_until is not None and prior["type"] == BLOCK_UNTIL:
                 await self._async_write_platform_override(
@@ -1184,6 +1200,14 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         requests = [r for r in pending if isinstance(r, dict) and r.get("id") is not None]
         ids = {str(r["id"]) for r in requests}
         seen = self._seen_request_ids
+        for request in requests:
+            puid = request.get("puid")
+            self._request_accounts[str(request["id"])] = str(puid) if puid is not None else None
+        if seen is not None:
+            # Listed on the previous poll (0 misses) and gone now: resolved.
+            for request_id, misses in seen.items():
+                if misses == 0 and request_id not in ids:
+                    self._fire_request_resolved(request_id)
         tracked: dict[str, int] = {request_id: 0 for request_id in ids}
         for request_id, misses in (seen or {}).items():
             if request_id not in ids and misses + 1 < _REQUEST_FORGET_POLLS:
@@ -1211,6 +1235,29 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "requested_time": request.get("requestedTime"),
                 },
             )
+
+    _RESOLVED_MEMORY = 500
+
+    def _fire_request_resolved(self, request_id: str) -> None:
+        """Fire microsoft_family_safety_request_resolved once for a request that left the list."""
+        if request_id in self._resolved_requests:
+            return
+        self._resolved_requests[request_id] = None
+        while len(self._resolved_requests) > self._RESOLVED_MEMORY:
+            self._resolved_requests.pop(next(iter(self._resolved_requests)))
+        handled = self._handled_requests.pop(request_id, None)
+        outcome, minutes = handled if handled else ("unknown", None)
+        self.hass.bus.async_fire(
+            EVENT_REQUEST_RESOLVED,
+            {
+                "entry_id": self.entry.entry_id,
+                "account_id": self._request_accounts.get(request_id),
+                "request_id": request_id,
+                "outcome": outcome,
+                "minutes": minutes,
+                "via": "service" if handled else "app",
+            },
+        )
 
     def _fire_app_usage_events(self, accounts_data: dict[str, Any]) -> None:
         """Fire microsoft_family_safety_app_usage for each app that grew since the last poll."""
@@ -1271,22 +1318,26 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self.api is None:
             return False
         try:
-            return await self.api.approve_pending_request(
+            result = await self.api.approve_pending_request(
                 request_id, extension_time * 10
             )
         except ValueError as err:
             await self._async_request_gone("approve", request_id, err)
-        return False
+            return False
+        self._handled_requests[str(request_id)] = ("approved", int(extension_time) // 60)
+        return result
 
     async def async_deny_request(self, request_id: str) -> bool:
         """Deny a pending screen time request."""
         if self.api is None:
             return False
         try:
-            return await self.api.deny_pending_request(request_id)
+            result = await self.api.deny_pending_request(request_id)
         except ValueError as err:
             await self._async_request_gone("deny", request_id, err)
-        return False
+            return False
+        self._handled_requests[str(request_id)] = ("denied", None)
+        return result
 
     async def _async_request_gone(
         self, action: str, request_id: str, err: ValueError
@@ -1889,6 +1940,92 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             now or dt_util.now(),
             current,
         )
+
+    @staticmethod
+    def _local_iso(value: Any) -> str | None:
+        parsed = parse_utc(value)
+        return dt_util.as_local(parsed).isoformat() if parsed else None
+
+    @classmethod
+    def _override_details(cls, current: dict[str, Any] | None) -> dict[str, Any]:
+        """``{type, valid_until (UTC), override_until (local), allow_until (local)}``."""
+        kind = (current or {}).get("type") or NO_OVERRIDE
+        until = (current or {}).get("valid_until") if kind in (BLOCK_UNTIL, ALLOW_UNTIL) else None
+        return {
+            "type": kind,
+            "valid_until": until,
+            "override_until": cls._local_iso(until),
+            "allow_until": cls._local_iso(until) if kind == ALLOW_UNTIL else None,
+        }
+
+    def platform_hold_state(self, account_id: Any, platform: str) -> dict[str, Any]:
+        """Who decides a platform's lock now: ``ours``, ``parent`` or ``none``.
+
+        From what the poll already holds, no extra request:
+
+        * ``ours``: we hold a lock (lock_platform, not run out) and Microsoft
+          still shows our blockUntil (within 2 minutes of the end we set).
+        * ``parent``: an override is in force that is not ours (a lock or
+          extra time from the Family Safety app), or we hold a lock but
+          Microsoft shows it cancelled or ending at another time.
+        * ``none``: nothing in force and no hold of ours.
+
+        The Xbox override comes from the Xbox policy read every poll. For
+        Windows only the mobile aggregator's "locked" flag is polled, without
+        an end, so a Windows lock with a hold of ours reads as ``ours``, one
+        without as ``parent``, and extra time on Windows is not seen.
+        Also returns ``override``, ``override_until`` and ``allow_until``
+        (local ISO).
+        """
+        account = self.account_data(account_id) or {}
+        if platform.lower() == "xbox":
+            policy = account.get("xbox_policy")
+            current = parse_platform_override(policy, "Xbox") if policy is not None else None
+        elif platform in (account.get("blocked_platforms") or []):
+            until = self._platform_override_until.get((str(account_id), platform.lower()))
+            current = make_override(BLOCK_UNTIL, until)
+        elif account.get("blocked_platforms") is not None:
+            current = make_override(NO_OVERRIDE)
+        else:
+            current = None
+        hold = self._platform_holds.get(self._hold_key(account_id, platform))
+        if hold is not None and (
+            not hold.get("confirmed") or not self._hold_in_force(hold, dt_util.utcnow())
+        ):
+            hold = None
+        kind = (current or {}).get("type")
+        if hold is not None and kind == BLOCK_UNTIL and (
+            current.get("valid_until") is None or self._is_own_lock(hold, current)
+        ):
+            who = "ours"
+        elif kind in (BLOCK_UNTIL, ALLOW_UNTIL):
+            who = "parent"
+        elif hold is not None and kind == NO_OVERRIDE:
+            who = "parent"
+        elif hold is not None:
+            who = "ours"  # unreadable: nothing says otherwise
+        else:
+            who = "none"
+        details = self._override_details(current)
+        return {
+            "hold": who,
+            "override": details["type"] if current is not None else None,
+            "override_until": details["override_until"],
+            "allow_until": details["allow_until"],
+        }
+
+    def paused_apps(self, account_id: Any) -> dict[str, str]:
+        """app id -> ``ours`` (still blocked by our pause) or ``parent`` (changed since)."""
+        account = self.account_data(account_id) or {}
+        blocked = {
+            app.get("app_id"): bool(app.get("blocked"))
+            for app in account.get("applications") or []
+            if isinstance(app, dict)
+        }
+        return {
+            app_id: "ours" if blocked.get(app_id) else "parent"
+            for app_id in self.app_pauser.saved(account_id)
+        }
 
     def is_account_locked(self, account_id: str) -> bool | None:
         account = self.account_data(account_id)

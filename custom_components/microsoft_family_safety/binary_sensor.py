@@ -98,8 +98,9 @@ class FamilySafetyAllowedNowSensor(
             "allowance_minutes": status["allowance_minutes"],
             "used_minutes": status["used_minutes"],
             "in_allowed_hours": status["in_allowed_hours"],
-            "override": (status.get("override") or {}).get("type"),
-            "override_until": (status.get("override") or {}).get("valid_until"),
+            # Who decides the lock now (ours / parent / none) and what is in
+            # force: override, override_until and allow_until (local ISO).
+            **self.coordinator.platform_hold_state(self._account_id, self._platform),
         }
 
 

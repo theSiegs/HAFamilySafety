@@ -280,6 +280,7 @@ class FamilySafetyPlatformLockSwitch(CoordinatorEntity, SwitchEntity):
             ATTR_USER_ID: self._account_id,
             ATTR_PLATFORM: self._platform,
             ATTR_BLOCKED: self.is_on,
+            **self.coordinator.platform_hold_state(self._account_id, self._platform),
         }
 
     async def async_turn_on(self, **kwargs: Any) -> None:

@@ -62,13 +62,18 @@ def app_platform(app_id: str) -> str | None:
 
 
 def apps_attribute(
-    applications: list[dict[str, Any]] | None, *, used_only: bool = False
+    applications: list[dict[str, Any]] | None,
+    *,
+    used_only: bool = False,
+    paused: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Every app in Family Link's ``apps`` shape: ``{package, name, minutes}``, most used first.
 
     ``package`` is Microsoft's app id, which carries the platform, so an app
     on two platforms is two entries; ``platform`` says which. No icons: the
     list must stay small, and the attribute is not recorded anyway.
+    An app pause_app paused carries ``paused``: ``ours`` while still blocked,
+    ``parent`` once someone unblocked it.
     """
     apps = [
         {
@@ -80,6 +85,9 @@ def apps_attribute(
         for app in applications or []
         if isinstance(app, dict) and app.get("app_id")
     ]
+    for app in apps:
+        if paused and app["package"] in paused:
+            app["paused"] = paused[app["package"]]
     if used_only:
         apps = [app for app in apps if app["minutes"] > 0]
     return sorted(apps, key=lambda app: (-app["minutes"], app["name"].lower()))

@@ -337,7 +337,10 @@ class FamilySafetyScreenTimeSensor(FamilySafetyAccountSensor):
             "raw_microsoft_ms": account_data.get("raw_today_screentime_ms"),
             "last_api_poll": account_data.get("screen_time_polled_at"),
             # Family Link's shape, as Hearth reads it: the apps used today.
-            "apps": apps_attribute(account_data.get("applications"), used_only=True),
+            "apps": apps_attribute(
+                account_data.get("applications"), used_only=True,
+                paused=self.coordinator.paused_apps(self._account_id),
+            ),
             "update_interval_seconds": (
                 int(self.coordinator.update_interval.total_seconds())
                 if self.coordinator.update_interval
@@ -567,11 +570,18 @@ class FamilySafetyApplicationCountSensor(FamilySafetyAccountSensor):
         # the summary is. "applications" keeps its old shape for the example
         # dashboards that read it.
         applications = account_data.get("applications", [])
+        paused = self.coordinator.paused_apps(self._account_id)
+        names = {app.get("app_id"): app.get("app_name") for app in applications}
         return {
             **usage_summary(applications),
             "applications": applications,
             # Every app (Family Link's shape), used today or not.
-            "apps": apps_attribute(applications),
+            "apps": apps_attribute(applications, paused=paused),
+            # The apps pause_app paused: ours while blocked, parent once released.
+            "paused_apps": [
+                {"package": app_id, "name": names.get(app_id) or app_id, "paused": who}
+                for app_id, who in sorted(paused.items())
+            ],
         }
 
 
