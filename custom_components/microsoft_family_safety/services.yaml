@@ -48,7 +48,7 @@ unblock_app:
 
 lock_platform:
   name: Lock Platform
-  description: Lock a platform (Windows/Xbox/Mobile) for a child account until a time. The first lock saves the override Microsoft had in force (a parent's own lock, or none) so unlock_platform can put it back; a lock already in force that ends later is kept. Answers with the saved prior state and the lock applied.
+  description: "Lock a platform (Windows/Xbox/Mobile) for a child account until a time. The first lock saves the override Microsoft had in force (a parent's own lock, or none) so unlock_platform can put it back; a lock already in force that ends later is kept. Answers with the saved prior state and the lock applied. Keep strict mode off when another integration (Hearth, for example) manages these locks: strict mode would place a lock again after a parent released it in the Family Safety app, fighting the parent's decision."
   fields:
     account_id:
       name: Account ID
@@ -90,7 +90,7 @@ lock_platform:
 
 unlock_platform:
   name: Unlock Platform
-  description: Unlock a platform (Windows/Xbox/Mobile) for a child account. Puts back the lock that was in force before lock_platform if it has not run out yet, otherwise cancels the lock. Answers with the prior state and what was applied.
+  description: "Unlock a platform (Windows/Xbox/Mobile) for a child account. Puts back the lock that was in force before lock_platform if it has not run out yet, otherwise cancels the lock. Answers with the prior state and what was applied. Keep strict mode off when another integration (Hearth, for example) manages these locks: strict mode would place a lock again after a parent released it in the Family Safety app, fighting the parent's decision."
   fields:
     account_id:
       name: Account ID

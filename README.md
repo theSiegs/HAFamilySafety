@@ -175,7 +175,14 @@ Legacy and native mode are mutually exclusive per config entry; there is no auto
 | Update interval (seconds) | 30 – 3600 | 300 (5 min) | |
 | Monitored platforms | Windows / Xbox / Mobile | Windows | One lock switch per platform. Xbox also decides whether the web session is used, see [below](#xbox-and-the-web-session) |
 | Users allowed to control Microsoft Family Safety | list of Home Assistant users | *(empty: everybody)* | See [Who can control the integration](#who-can-control-the-integration) |
+| Strict mode | on / off | off | Places a `lock_platform` lock again when it is cancelled elsewhere; see [Strict mode](#strict-mode) |
 | Allow insecure local HTTP authentication (testing only) | on / off | off | See below |
+
+#### Strict mode
+
+When on, a Windows or Xbox lock placed by `microsoft_family_safety.lock_platform` that Microsoft reports as cancelled before its end (released in the Family Safety app, for example) is placed again on the next update, at most every 10 minutes, and `microsoft_family_safety_lock_reasserted` is fired. `unlock_platform` ends it.
+
+**Keep strict mode off when another integration manages the locks**, such as Hearth: it would lock again right after a parent's own unlock in the Family Safety app and fight the parent's decision. Such an integration should read the `hold` attribute instead (`ours`, `parent` or `none`, on the Allowed Now binary sensors and the platform lock switches) and adopt the parent's change.
 
 #### Who can control the integration
 
@@ -366,6 +373,8 @@ data:
   platform: "Windows"
   duration_hours: 24
 ```
+
+Both actions can answer with what they did (`response_variable`): `{prior, applied}`. `applied` is `"left_parent_override"` when a parent changed the lock in the Family Safety app since; the answer then has `current: {type, valid_until, override_until, allow_until}`. Strict mode must stay off when another integration manages these locks (see [Strict mode](#strict-mode)).
 
 ```yaml
 # Unlock a single platform
