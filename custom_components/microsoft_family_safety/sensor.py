@@ -45,7 +45,7 @@ from .app_usage import (
     top_apps,
     usage_summary,
 )
-from .binary_sensor import MinuteUpdateMixin
+from .entity_base import MinuteUpdateMixin
 from .site_sync import site_lists
 
 _LOGGER = logging.getLogger(__name__)
@@ -536,7 +536,7 @@ class FamilySafetyApplicationCountSensor(FamilySafetyAccountSensor):
 
     _attr_icon = "mdi:apps"
     _attr_state_class = SensorStateClass.MEASUREMENT
-    _unrecorded_attributes = frozenset({"apps"})
+    _unrecorded_attributes = frozenset({"apps", "applications"})
 
     def __init__(
         self,
@@ -562,12 +562,16 @@ class FamilySafetyApplicationCountSensor(FamilySafetyAccountSensor):
         if not account_data:
             return {}
 
-        # A summary only: the full list (dozens of apps with icon URLs) went
-        # over the recorder's 16 KB attribute limit.
+        # The full list (dozens of apps with icon URLs) can go over the
+        # recorder's 16 KB attribute limit, so it and "apps" are not recorded;
+        # the summary is. "applications" keeps its old shape for the example
+        # dashboards that read it.
+        applications = account_data.get("applications", [])
         return {
-            **usage_summary(account_data.get("applications", [])),
+            **usage_summary(applications),
+            "applications": applications,
             # Every app (Family Link's shape), used today or not.
-            "apps": apps_attribute(account_data.get("applications")),
+            "apps": apps_attribute(applications),
         }
 
 
@@ -800,16 +804,11 @@ class FamilySafetyWebFilterSensor(FamilySafetyAccountSensor):
         account_data = self._get_account_data()
         if not account_data:
             return None
-        web_data = account_data.get("web_browsing")
-        if web_data is None:
-            return "unknown"
-        if isinstance(web_data, dict):
-            # API returns "enabled" (not "isEnabled")
-            is_enabled = web_data.get("enabled", web_data.get("isEnabled", web_data.get("IsEnabled")))
-            if is_enabled is True:
-                return "enabled"
-            if is_enabled is False:
-                return "disabled"
+        is_enabled = self.coordinator.web_filter_enabled(self._account_id)
+        if is_enabled is True:
+            return "enabled"
+        if is_enabled is False:
+            return "disabled"
         return "unknown"
 
     @property

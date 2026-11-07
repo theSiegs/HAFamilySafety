@@ -26,7 +26,8 @@ ATTR_ENTITY_ID = "entity_id"
 #: Fields every per-child service accepts; at least one of them is required.
 TARGET_FIELDS: dict[Any, Any] = {
     vol.Optional(ATTR_ACCOUNT_ID): cv.string,
-    vol.Optional(ATTR_ENTITY_ID): cv.entity_id,
+    # One entity, or a list (what a "target:" with entities gives).
+    vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
 }
 
 
@@ -101,7 +102,15 @@ def resolve_account_id(hass: HomeAssistant, data: dict[str, Any]) -> str:
     account_id = data.get(ATTR_ACCOUNT_ID)
     if account_id:
         return str(account_id)
-    entity_id = data.get(ATTR_ENTITY_ID)
-    if entity_id:
-        return account_from_entity(hass, entity_id)
+    entity_ids = data.get(ATTR_ENTITY_ID) or []
+    if isinstance(entity_ids, str):
+        entity_ids = [entity_ids]
+    accounts = list(dict.fromkeys(account_from_entity(hass, e) for e in entity_ids))
+    if len(accounts) > 1:
+        raise ServiceValidationError(
+            f"The entities {', '.join(entity_ids)} belong to {len(accounts)} different "
+            "children; target one child per call."
+        )
+    if accounts:
+        return accounts[0]
     raise ServiceValidationError("Give the child: account_id or entity_id.")

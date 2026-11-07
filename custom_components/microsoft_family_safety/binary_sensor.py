@@ -1,20 +1,18 @@
 """Binary sensor platform for Microsoft Family Safety: may the child play now?"""
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
 
 from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
-from .const import ATTR_FIRST_NAME, ATTR_PLATFORM, ATTR_SURNAME, ATTR_USER_ID, DOMAIN
+from .const import ATTR_PLATFORM, ATTR_USER_ID, DOMAIN
 from .coordinator import FamilySafetyDataUpdateCoordinator
+from .entity_base import ChildEntityMixin, MinuteUpdateMixin
 from .screen_time import downtime_window
 
 #: Platform -> the account data key holding its schedule.
@@ -52,35 +50,9 @@ async def async_setup_entry(
     entry.async_on_unload(coordinator.async_add_listener(_add_new_entities))
 
 
-class MinuteUpdateMixin:
-    """Re-evaluate every minute: allowed hours and time left move with the clock."""
-
-    async def async_added_to_hass(self) -> None:
-        await super().async_added_to_hass()
-        self.async_on_remove(
-            async_track_time_change(self.hass, self._async_minute_tick, second=0)
-        )
-
-    _last_snapshot: Any = None
-
-    def _snapshot(self) -> Any:
-        """What the entity shows; the tick writes only when it changed."""
-        value = self.is_on if isinstance(self, BinarySensorEntity) else self.native_value
-        return value, tuple(sorted((self.extra_state_attributes or {}).items(), key=str))
-
-    @callback
-    def _async_minute_tick(self, _now: datetime) -> None:
-        snapshot = self._snapshot()
-        if snapshot != self._last_snapshot:
-            self.async_write_ha_state()
-
-    @callback
-    def async_write_ha_state(self) -> None:
-        self._last_snapshot = self._snapshot()
-        super().async_write_ha_state()
-
-
-class FamilySafetyAllowedNowSensor(MinuteUpdateMixin, CoordinatorEntity, BinarySensorEntity):
+class FamilySafetyAllowedNowSensor(
+    ChildEntityMixin, MinuteUpdateMixin, CoordinatorEntity, BinarySensorEntity
+):
     """On while the child may use the platform right now.
 
     The minutes left and used move every minute: they are not recorded.
@@ -104,23 +76,10 @@ class FamilySafetyAllowedNowSensor(MinuteUpdateMixin, CoordinatorEntity, BinaryS
         self._platform = platform
         self._entry = entry
         self._attr_unique_id = f"{entry.entry_id}_{account_id}_{platform.lower()}_allowed_now"
-        self._attr_name = f"{self._account_data().get(ATTR_FIRST_NAME, 'Unknown')} {platform} Allowed Now"
+        self._attr_name = f"{self._first_name()} {platform} Allowed Now"
         self._attr_icon = "mdi:microsoft-xbox" if platform == "Xbox" else "mdi:microsoft-windows"
 
-    def _account_data(self) -> dict[str, Any]:
-        return ((self.coordinator.data or {}).get("accounts") or {}).get(self._account_id) or {}
 
-    @property
-    def device_info(self) -> DeviceInfo:
-        """Link to the child's device."""
-        account = self._account_data()
-        full_name = f"{account.get(ATTR_FIRST_NAME, 'Unknown')} {account.get(ATTR_SURNAME, '')}".strip()
-        return DeviceInfo(
-            identifiers={(DOMAIN, self._account_id)},
-            name=f"{full_name} (Family Safety)",
-            manufacturer="Microsoft",
-            model="Family Safety Account",
-        )
 
     @property
     def is_on(self) -> bool | None:
@@ -144,7 +103,9 @@ class FamilySafetyAllowedNowSensor(MinuteUpdateMixin, CoordinatorEntity, BinaryS
         }
 
 
-class FamilySafetyDowntimeSensor(MinuteUpdateMixin, CoordinatorEntity, BinarySensorEntity):
+class FamilySafetyDowntimeSensor(
+    ChildEntityMixin, MinuteUpdateMixin, CoordinatorEntity, BinarySensorEntity
+):
     """On while the current local time is outside today's allowed hours.
 
     ``downtime_start`` / ``downtime_end`` give the current downtime, or the
@@ -166,28 +127,14 @@ class FamilySafetyDowntimeSensor(MinuteUpdateMixin, CoordinatorEntity, BinarySen
         self._platform = platform
         self._entry = entry
         self._attr_unique_id = f"{entry.entry_id}_{account_id}_{platform.lower()}_downtime"
-        first = self._account_data().get(ATTR_FIRST_NAME, "Unknown")
-        self._attr_name = f"{first} {platform} Downtime Active"
+        self._attr_name = f"{self._first_name()} {platform} Downtime Active"
         self._attr_icon = "mdi:sleep"
 
-    def _account_data(self) -> dict[str, Any]:
-        return ((self.coordinator.data or {}).get("accounts") or {}).get(self._account_id) or {}
 
     def _window(self) -> dict[str, Any]:
         policy = self._account_data().get(SCHEDULE_KEYS[self._platform])
         return downtime_window(policy if isinstance(policy, dict) else None, dt_util.now())
 
-    @property
-    def device_info(self) -> DeviceInfo:
-        """Link to the child's device."""
-        account = self._account_data()
-        full_name = f"{account.get(ATTR_FIRST_NAME, 'Unknown')} {account.get(ATTR_SURNAME, '')}".strip()
-        return DeviceInfo(
-            identifiers={(DOMAIN, self._account_id)},
-            name=f"{full_name} (Family Safety)",
-            manufacturer="Microsoft",
-            model="Family Safety Account",
-        )
 
     @property
     def is_on(self) -> bool | None:

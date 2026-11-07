@@ -127,13 +127,18 @@ async def test_usage_event_fires_for_apps_that_grew(hass):
     assert events[0].data["account_id"] == CHILD
 
 
-async def test_applications_sensor_no_longer_carries_the_full_list(hass):
+async def test_applications_attribute_keeps_its_old_shape_unrecorded(hass):
     coord, entry = _coordinator(hass, 0)
     count = sensor.FamilySafetyApplicationCountSensor(coord, entry, CHILD)
     attrs = count.extra_state_attributes
-    assert "applications" not in attrs
+    # The example dashboards read applications[].usage_minutes.
+    assert attrs["applications"] == coord.data["accounts"][CHILD]["applications"]
+    assert {"app_id", "app_name", "blocked", "icon", "usage_minutes"} <= set(attrs["applications"][0])
     assert attrs["blocked_count"] == 1
     assert count.native_value == 3
+    # It can exceed the recorder's limit: not recorded (the summary is).
+    assert "applications" in count._unrecorded_attributes
+    assert "blocked_count" not in count._unrecorded_attributes
 
 
 async def test_apps_attribute_in_family_link_shape(hass):

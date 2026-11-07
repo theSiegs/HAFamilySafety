@@ -177,10 +177,16 @@ def parse_allowance_minutes(allowance: str | int | float | None) -> int:
             if not match:
                 return 0
             return int(match.group(1) or 0) * 60 + int(match.group(2) or 0)
-        parts = text.split(":")
+        days = 0
+        head, _, rest = text.partition(":")
+        if "." in head:
+            # .NET TimeSpan "d.hh:mm:ss": "1.00:00:00" is a whole day.
+            day_part, head = head.split(".", 1)
+            days = int(day_part)
+        parts = [head, *rest.split(":")] if rest else [head]
         hours = int(parts[0])
         minutes = int(parts[1]) if len(parts) > 1 else 0
-        return hours * 60 + minutes
+        return days * 1440 + hours * 60 + minutes
     except (TypeError, ValueError, IndexError):
         return 0
 

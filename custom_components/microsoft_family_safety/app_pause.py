@@ -24,6 +24,7 @@ from typing import Any
 
 import voluptuous as vol
 
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.storage import Store
 
@@ -72,6 +73,7 @@ class AppPauser:
             paused: list[str] = []
             skipped: dict[str, str] = {}
             for app_id in dict.fromkeys(apps):
+                new_record = False
                 if app_id in saved:
                     # Paused already: block again in case it was released
                     # elsewhere, but keep the state saved by the first pause.
@@ -85,12 +87,24 @@ class AppPauser:
                         skipped[app_id] = "already blocked"
                         continue
                     saved[app_id] = {"blocked": False}
+                    new_record = True
                     # Saved before the write: a block that went through but
                     # answered an error must still be resumable.
                     await self._store.async_save(data)
                 try:
                     await coordinator.async_block_app(account_id, app_id)
-                except Exception as err:  # noqa: BLE001 - reported per app
+                except HomeAssistantError as err:
+                    # Microsoft answered and refused (or the app is gone): the
+                    # app was not blocked by us, so nothing is ours to resume.
+                    # Keeping the record would let a later resume_app unblock
+                    # an app a parent blocks in the meantime.
+                    if new_record:
+                        saved.pop(app_id, None)
+                    skipped[app_id] = f"block refused: {err}"[:200]
+                    continue
+                except Exception as err:  # noqa: BLE001 - may have gone through
+                    # A network failure: the block may have been applied, so
+                    # the record stays and resume_app can undo it.
                     skipped[app_id] = f"block failed: {err}"[:200]
                     continue
                 paused.append(app_id)

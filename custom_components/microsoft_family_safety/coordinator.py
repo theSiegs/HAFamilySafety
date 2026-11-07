@@ -84,6 +84,10 @@ _FAMILY_TOKEN_REJECTED = "web_family_token_rejected"
 _FAMILY_AUTH_REQUIRED_POLLS = 2
 #: Locks this integration holds on a platform, with the state before them.
 PLATFORM_HOLD_STORAGE_KEY = f"{DOMAIN}.platform_holds"
+#: Strict mode's read of a Windows/Mobile override gives up after this long.
+_STRICT_READ_TIMEOUT = 15
+#: Polls in a row a pending request must be missing before its id is forgotten.
+_REQUEST_FORGET_POLLS = 3
 #: Strict mode re-places one lock at most this often, so a lock Microsoft
 #: keeps reporting as cancelled cannot turn into a write on every poll.
 _STRICT_REASSERT_COOLDOWN = timedelta(minutes=10)
@@ -253,7 +257,10 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._app_usage_tracker = AppUsageGrowthTracker()
         #: Ids of the pending requests seen on the last poll; None before the
         #: first, which only sets the baseline (a restart is not news).
-        self._seen_request_ids: set[str] | None = None
+        #: request id -> polls in a row it has been missing. An id is forgotten
+        #: only after _REQUEST_FORGET_POLLS misses, so one empty or failed read
+        #: does not make every open request "new" again.
+        self._seen_request_ids: dict[str, int] | None = None
         #: hold key -> when strict mode last placed that lock again.
         self._last_reassert: dict[str, datetime] = {}
         if not self._mobile_only:
@@ -542,6 +549,21 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.debug("Could not load web cookies: %s", err)
             if not self.entry.data.get(CONF_AUTH_URL):
                 self._request_reauth("web_credentials_missing")
+
+    def account_data(self, account_id: Any) -> dict[str, Any] | None:
+        """A child's polled data, whether the id comes as int or str.
+
+        The roster keys accounts by Microsoft's id as the mobile API gives it
+        (an int), while service calls and the web API pass it as a str.
+        """
+        accounts = (self.data or {}).get("accounts") or {}
+        if account_id in accounts:
+            return accounts[account_id]
+        key = self._policy_key(account_id)
+        return next(
+            (value for acc_id, value in accounts.items() if self._policy_key(acc_id) == key),
+            None,
+        )
 
     def get_account(self, account_id: str) -> Account | None:
         """Get the raw pyfamilysafety Account object.
@@ -957,6 +979,26 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             and abs(ours - theirs) <= self._OWN_LOCK_TOLERANCE
         )
 
+    async def async_release_platform(self, account_id: str, platform: str) -> None:
+        """Cancel any lock on the platform and forget the hold: the lock switch's off.
+
+        Unlike unlock_platform, nothing saved is put back. Someone turning the
+        switch off wants the platform free, and a restored parent lock would
+        flip the switch straight back on.
+        """
+        account = self.get_account(account_id)
+        if account is None:
+            raise ValueError(f"Account {account_id} not found")
+        self._check_platform_lockable(platform)
+        key = self._hold_key(account_id, platform)
+        async with self._hold_lock(key):
+            await self._async_load_platform_holds()
+            await self._async_write_platform_override(
+                account, account_id, platform, NO_OVERRIDE
+            )
+            if self._platform_holds.pop(key, None) is not None:
+                await self._async_save_platform_holds()
+
     async def async_unlock_platform(self, account_id: str, platform: str) -> dict[str, Any]:
         """Unlock a platform, putting back the override saved by the first lock.
 
@@ -1052,6 +1094,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         await self._async_load_platform_holds()
         now = dt_util.utcnow()
+        candidates: list[tuple[str, str, str, datetime]] = []
         for key, hold in list(self._platform_holds.items()):
             until = parse_utc(hold.get("until"))
             if not hold.get("confirmed") or until is None or until <= now:
@@ -1059,13 +1102,29 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             account_id = str(hold.get("account_id"))
             platform = str(hold.get("platform") or key.split("|", 1)[-1])
             if platform.lower() == "xbox":
-                state = xbox_overrides.get(account_id)
                 read_at = (xbox_read_at or {}).get(account_id)
                 confirmed_at = parse_utc(hold.get("confirmed_at"))
                 if read_at is not None and confirmed_at is not None and confirmed_at > read_at:
                     continue
-            else:
-                state = await self._async_read_platform_override(account_id, platform)
+            candidates.append((key, account_id, platform, until))
+
+        async def read_back(account_id: str, platform: str) -> Any:
+            if platform.lower() == "xbox":
+                return xbox_overrides.get(account_id)
+            # Other platforms read their route now: all at once, each capped,
+            # so a slow Microsoft cannot hold the poll for minutes.
+            try:
+                return await asyncio.wait_for(
+                    self._async_read_platform_override(account_id, platform),
+                    _STRICT_READ_TIMEOUT,
+                )
+            except (TimeoutError, asyncio.TimeoutError):
+                return None
+
+        states = await asyncio.gather(
+            *(read_back(account_id, platform) for _, account_id, platform, _ in candidates)
+        )
+        for (key, account_id, platform, until), state in zip(candidates, states):
             if not isinstance(state, dict) or state.get("type") != NO_OVERRIDE:
                 continue
             last = self._last_reassert.get(key)
@@ -1124,7 +1183,12 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         requests = [r for r in pending if isinstance(r, dict) and r.get("id") is not None]
         ids = {str(r["id"]) for r in requests}
-        seen, self._seen_request_ids = self._seen_request_ids, ids
+        seen = self._seen_request_ids
+        tracked: dict[str, int] = {request_id: 0 for request_id in ids}
+        for request_id, misses in (seen or {}).items():
+            if request_id not in ids and misses + 1 < _REQUEST_FORGET_POLLS:
+                tracked[request_id] = misses + 1
+        self._seen_request_ids = tracked
         if seen is None:
             return
         for request in requests:
@@ -1180,8 +1244,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except AggregatorException as err:
             # Seen on 2026-11-05: HTTP 500 "aggregator error", override applied anyway.
             await self.async_refresh()
-            accounts = (self.data or {}).get("accounts", {})
-            blocked = accounts.get(str(account_id), {}).get("blocked_platforms", [])
+            blocked = (self.account_data(account_id) or {}).get("blocked_platforms", [])
             if (platform in blocked) != (override == OverrideType.UNTIL):
                 raise HomeAssistantError(
                     f"Microsoft answered an error and {platform} has not changed yet; "
@@ -1373,7 +1436,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         right after its start would send the old start back to Microsoft and
         undo the first write (seen with a script setting both in a row).
         """
-        account = ((self.data or {}).get("accounts") or {}).get(child_id)
+        account = self.account_data(child_id)
         policy = account.get("screentime_policy") if isinstance(account, dict) else None
         daily = policy.get("dailyRestrictions") if isinstance(policy, dict) else None
         if not isinstance(daily, dict):
@@ -1417,7 +1480,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self.async_request_refresh()
 
     def _set_xbox_policy_field(self, child_id: str, update) -> None:
-        account = ((self.data or {}).get("accounts") or {}).get(child_id)
+        account = self.account_data(child_id)
         policy = account.get("xbox_screentime_policy") if isinstance(account, dict) else None
         if isinstance(policy, dict):
             update(policy)
@@ -1490,7 +1553,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Microsoft accepted it: show the new state now. The refresh below is
         # debounced, and until it runs the switch would fall back to the value
         # of the previous poll.
-        account = ((self.data or {}).get("accounts") or {}).get(child_id)
+        account = self.account_data(child_id)
         if isinstance(account, dict):
             account["app_limits_enabled"] = bool(enabled)
             self.async_update_listeners()
@@ -1702,12 +1765,11 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         by_url = {
             url: sorted(set(domains) & blocked_hosts) for url, domains in synced.items()
         }
-        enabled = web.get("enabled", web.get("isEnabled", web.get("IsEnabled")))
         return {
             "account_id": account_id,
             "blocked": stored[0],
             "allowed": stored[1],
-            "filter_enabled": enabled if isinstance(enabled, bool) else None,
+            "filter_enabled": self._web_enabled(web),
             "from_list": sorted({d for domains in by_url.values() for d in domains}),
             "from_list_by_url": by_url,
         }
@@ -1717,6 +1779,15 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         blocked, _ = await self._async_read_site_lists(account_id)
         data = await self._site_sync_store.async_load() or {}
         pushed = set((data.get(account_id) or {}).get(url) or [])
+        if pushed and not blocked:
+            # Same guard as the sync: an answer without any blocked site
+            # cannot tell which of ours are still there, and forgetting them
+            # would leave them blocked for good.
+            raise HomeAssistantError(
+                f"Microsoft returned no blocked websites although {url} added "
+                f"{len(pushed)} for this child; the answer looks incomplete, so "
+                "nothing was changed or forgotten."
+            )
         remove = sorted(pushed & set(blocked))
         removed, failed = await site_sync.run_bounded(
             remove, lambda site: self.web_api.remove_website(account_id, site)
@@ -1739,8 +1810,11 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def web_filter_enabled(self, account_id: Any) -> bool | None:
         """Whether the child's web filter (Microsoft Edge) is on; None if unknown."""
-        account = ((self.data or {}).get("accounts") or {}).get(account_id) or {}
-        web = account.get("web_browsing")
+        return self._web_enabled((self.account_data(account_id) or {}).get("web_browsing"))
+
+    @staticmethod
+    def _web_enabled(web: Any) -> bool | None:
+        """The on/off of a web restrictions answer (Microsoft spells it "enabled")."""
         if not isinstance(web, dict):
             return None
         value = web.get("enabled", web.get("isEnabled", web.get("IsEnabled")))
@@ -1751,7 +1825,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise RuntimeError("Web API not initialized")
         await self.web_api.toggle_web_filter(child_id, enabled)
         # Show the new state at once; the next read confirms it.
-        account = ((self.data or {}).get("accounts") or {}).get(child_id)
+        account = self.account_data(child_id)
         if isinstance(account, dict) and isinstance(account.get("web_browsing"), dict):
             account["web_browsing"] = {**account["web_browsing"], "enabled": bool(enabled)}
             self.async_update_listeners()
@@ -1791,7 +1865,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         Windows schedule and the time of the child's Windows devices.
         """
         data = self.data or {}
-        account = (data.get("accounts") or {}).get(account_id) or {}
+        account = self.account_data(account_id) or {}
         if platform.lower() == "xbox":
             policy = account.get("xbox_screentime_policy")
             used = account.get("xbox_today_usage")
@@ -1817,7 +1891,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
     def is_account_locked(self, account_id: str) -> bool | None:
-        account = (self.data or {}).get("accounts", {}).get(account_id)
+        account = self.account_data(account_id)
         if not account:
             return None
         policy = account.get("screentime_policy")
@@ -1970,7 +2044,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         written while it is off would show as applied and do nothing; a
         restore puts the flag back as it was before the lock.
         """
-        account = (self.data or {}).get("accounts", {}).get(account_id) or {}
+        account = self.account_data(account_id) or {}
         policy = account.get("screentime_policy")
         current = policy.get("isEnabled") if isinstance(policy, dict) else None
         if current is enabled or self.web_api is None:
@@ -2069,7 +2143,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if locked:
             # All days at 0 → fully locked, which is still "limits enabled".
             return True
-        account = (self.data or {}).get("accounts", {}).get(account_id)
+        account = self.account_data(account_id)
         policy = (account or {}).get("screentime_policy")
         if not isinstance(policy, dict):
             return None
@@ -2463,7 +2537,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # returns a replacement.  This is not a screen-time usage guard:
                 # it applies only to configuration/policy payloads and never
                 # modifies measured usage values.
-                previous = ((self.data or {}).get("accounts", {}).get(account_id) or {})
+                previous = (self.account_data(account_id) or {})
                 for key in ("web_browsing", "content_settings", "screentime_policy", "app_limits_enabled", "xbox_screentime_policy"):
                     if web_data.get(key) is None and previous.get(key) is not None:
                         web_data[key] = previous.get(key)
