@@ -1551,6 +1551,15 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             data = await self._site_sync_store.async_load() or {}
             pushed = set((data.get(account_id) or {}).get(url) or [])
             blocked_set = set(blocked)
+            if pushed and not blocked_set:
+                # The mobile read without ?exceptions=true answers an empty list
+                # (api_client.block_website); a read that has lost every site
+                # this list added is not trusted to decide anything.
+                raise HomeAssistantError(
+                    f"Microsoft returned no blocked websites although {url} added "
+                    f"{len(pushed)} for this child; the answer looks incomplete, so "
+                    "nothing was changed."
+                )
             wanted: list[str] = []
             skipped: list[str] = []
             for domain in domains:

@@ -226,3 +226,20 @@ async def test_administrators_only(hass, rig, aioclient_mock):
     admin = MockUser(is_owner=True).add_to_hass(hass)
     result = await _sync(hass, user=admin)
     assert result["added"]["count"] == 1
+
+
+async def test_a_read_that_lost_every_site_changes_nothing(hass, rig, aioclient_mock):
+    _serve(aioclient_mock, "a.example\nb.example\n")
+    await _sync(hass)
+    rig.web_api.writes.clear()
+    real = rig.web_api.get_web_browsing_settings
+
+    async def empty(child_id):
+        return {"enabled": True, "exceptions": []}  # as the read without ?exceptions=true
+
+    rig.web_api.get_web_browsing_settings = empty
+    _serve(aioclient_mock, "a.example\n")
+    with pytest.raises(HomeAssistantError, match="incomplete"):
+        await _sync(hass)
+    assert rig.web_api.writes == []
+    rig.web_api.get_web_browsing_settings = real
