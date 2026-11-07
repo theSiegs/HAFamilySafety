@@ -125,3 +125,72 @@ async def test_without_the_xbox_features_the_mobile_schedules_need_no_sign_in(ha
         await coord._async_track_family_context()
 
     coord._request_reauth.assert_not_called()
+
+
+def _warming(api: FamilySafetyWebAPI):
+    """A Family bootstrap that loads the page and scrapes a token again."""
+
+    async def warm():
+        api._web_csrf = "token"
+        api.family_context_state = "ready"
+        return "token"
+
+    return AsyncMock(side_effect=warm)
+
+
+async def test_a_dropped_family_token_is_rebuilt_for_the_xbox_reads(hass) -> None:
+    coord = _coordinator(hass, xbox_features=True)
+    api = _api(401)
+    api.family_context_state = "unknown"  # a reload without a usable token
+    api._web_csrf = None
+    api._warm_family_context = _warming(api)
+    coord.web_api = api
+
+    await coord._async_ensure_family_context()
+
+    api._warm_family_context.assert_awaited_once()
+    assert api.family_context_state == "ready"
+
+
+@pytest.mark.parametrize("state", ["ready", "auth_required", "missing"])
+async def test_a_context_that_is_not_unknown_is_left_alone(hass, state: str) -> None:
+    coord = _coordinator(hass, xbox_features=True)
+    api = _api(401)
+    api.family_context_state = state
+    api._warm_family_context = _warming(api)
+    coord.web_api = api
+
+    await coord._async_ensure_family_context()
+
+    api._warm_family_context.assert_not_awaited()
+
+
+async def test_a_mobile_only_entry_never_bootstraps_the_family_page(hass) -> None:
+    coord = _coordinator(hass, xbox_features=False)
+    api = _api(401)
+    api.family_context_state = "unknown"
+    api._warm_family_context = _warming(api)
+    coord.web_api = api
+
+    await coord._async_ensure_family_context()
+
+    api._warm_family_context.assert_not_awaited()
+
+
+async def test_a_refusal_that_outlasts_the_token_reset_asks_for_a_sign_in(hass) -> None:
+    """Poll after poll: the token is dropped, reloaded as unknown, rebuilt, refused again."""
+    coord = _coordinator(hass, xbox_features=True)
+    api = _api(401)
+    api._warm_family_context = _warming(api)
+    coord.web_api = api
+
+    for _ in range(2):
+        await coord._async_ensure_family_context()
+        api._xbox_report_next_fetch.clear()  # the next poll is past the minimum interval
+        await api.get_xbox_screentime_usage(CHILD, "UTC", "2026-11-07")
+        await coord._async_track_family_context()
+        # The next poll reloads the cookies without the rejected token.
+        api.family_context_state = "unknown"
+        api._web_csrf = None
+
+    coord._request_reauth.assert_called_once_with("family_context_auth_required")

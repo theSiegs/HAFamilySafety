@@ -2538,7 +2538,12 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # 200. Reporting "connected" there hides the exact state the user must
         # act on, so the Family context is part of the verdict.
         family_state = self.web_api.family_context_state if self.web_api else "unavailable"
-        family_ok = family_state in ("ready", "unknown")
+        # "unknown" (no Family token yet) is fine for the schedules, which run
+        # on the mobile API, but with the Xbox features on it means no Xbox
+        # play time and no Xbox lock: that is not "connected".
+        family_ok = family_state == "ready" or (
+            family_state == "unknown" and not self.xbox_features
+        )
         web_ok = web_authenticated is True and family_ok
         state = "connected" if mobile_ok and web_ok else "degraded" if mobile_ok else "disconnected"
         if self._mobile_only:
@@ -2711,6 +2716,34 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _family_context_dead_end(self) -> bool:
         return self._family_auth_required_polls >= _FAMILY_AUTH_REQUIRED_POLLS
 
+    async def _async_ensure_family_context(self) -> None:
+        """Rebuild the Family context the Xbox reads need when there is none.
+
+        Everything but the Xbox reads runs on the mobile API, and the Xbox reads
+        are isolated: they never bootstrap the Family SPA themselves, and they
+        only run while the context is "ready". Once a token is dropped (a
+        rejected request, or a reload without a persisted token) the context
+        sits at "unknown" for good, the Xbox reads are skipped every poll, and
+        _async_track_family_context never sees anything to escalate. Warming
+        it here either restores the token or ends on a login page
+        (auth_required), which is then counted like any other refusal.
+        """
+        web_api = self.web_api
+        if (
+            not self._native_web_auth
+            or not self.xbox_features
+            or web_api is None
+            or not web_api.has_web_cookies
+            or web_api.family_context_state != "unknown"
+            or float(getattr(web_api, "_family_web_backoff_until", 0.0) or 0.0)
+            > time.monotonic()
+        ):
+            return
+        try:
+            await web_api._warm_family_context()
+        except Exception as err:  # noqa: BLE001 - never fail the poll for it
+            _LOGGER.debug("Could not rebuild the Family context: %r", err)
+
     async def _async_track_family_context(self) -> None:
         """Escalate a Family bootstrap that keeps landing on a login page.
 
@@ -2832,6 +2865,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         if self.web_api.web_session_state == "missing"
                         else "web_session_expired"
                     )
+            await self._async_ensure_family_context()
             await self.api.update()
             if not getattr(self.api, "accounts", None):
                 self.api.accounts = []
