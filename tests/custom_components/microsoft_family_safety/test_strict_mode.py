@@ -112,3 +112,18 @@ async def test_windows_lock_is_read_back_from_its_route(hass, web):
     await hass.async_block_till_done()
 
     assert [(p, k) for p, k, _ in web.writes] == [("windows", "blockUntil")]
+
+
+async def test_a_read_taken_before_the_lock_does_not_count(hass, web):
+    coord = _coordinator(hass, web, strict=True)
+    read_at = dt_util.utcnow() - timedelta(seconds=5)  # the poll read the policy...
+    await _locked(coord)  # ...then the lock was placed
+
+    await coord._async_enforce_holds({CHILD: NONE}, {CHILD: read_at})
+    await hass.async_block_till_done()
+    assert web.writes == []
+
+    # A read taken after the lock is believed.
+    await coord._async_enforce_holds({CHILD: NONE}, {CHILD: dt_util.utcnow()})
+    await hass.async_block_till_done()
+    assert [(p, k) for p, k, _ in web.writes] == [("xbox", "blockUntil")]

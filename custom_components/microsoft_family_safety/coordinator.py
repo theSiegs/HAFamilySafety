@@ -922,6 +922,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 account, account_id, platform, BLOCK_UNTIL, target
             )
             hold["confirmed"] = True
+            hold["confirmed_at"] = iso_utc(dt_util.utcnow())
             await self._async_save_platform_holds()
             return {"prior": dict(hold["prior"]), "applied": make_override(BLOCK_UNTIL, target)}
 
@@ -1014,7 +1015,11 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await self._async_save_platform_holds()
             return {"prior": prior, "applied": applied}
 
-    async def _async_enforce_holds(self, xbox_overrides: dict[str, Any]) -> None:
+    async def _async_enforce_holds(
+        self,
+        xbox_overrides: dict[str, Any],
+        xbox_read_at: dict[str, datetime] | None = None,
+    ) -> None:
         """Strict mode: put back a lock of ours that Microsoft reports as cancelled.
 
         Only a hold this integration confirmed, whose end is still ahead, and
@@ -1022,6 +1027,10 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         never triggers a write. The Xbox read-back is the policy this poll
         already fetched; other platforms read their override route. The write
         runs in the background, after this poll, so its refresh does not nest.
+
+        The Xbox policy was read earlier in the poll: a lock confirmed after
+        that read (``xbox_read_at``) is not judged by it, since the read
+        predates the lock.
         """
         if not self._strict_mode:
             return
@@ -1035,6 +1044,10 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             platform = str(hold.get("platform") or key.split("|", 1)[-1])
             if platform.lower() == "xbox":
                 state = xbox_overrides.get(account_id)
+                read_at = (xbox_read_at or {}).get(account_id)
+                confirmed_at = parse_utc(hold.get("confirmed_at"))
+                if read_at is not None and confirmed_at is not None and confirmed_at > read_at:
+                    continue
             else:
                 state = await self._async_read_platform_override(account_id, platform)
             if not isinstance(state, dict) or state.get("type") != NO_OVERRIDE:
@@ -2332,6 +2345,8 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             devices_data: dict[str, Any] = {}
             #: account id -> Xbox override read this poll (strict mode).
             xbox_overrides: dict[str, Any] = {}
+            #: account id -> when that Xbox policy read started.
+            xbox_read_at: dict[str, datetime] = {}
             new_accounts: dict[str, Account] = {}
             new_devices: dict[str, Device] = {}
             for account in self.api.accounts:
@@ -2407,6 +2422,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # backoff, which then skips this read in the same poll (the
                 # policy itself answers 200 for such a child).
                 xbox_policy: dict | None = None
+                policy_read_at = dt_util.utcnow()
                 if xbox_gate:
                     try:
                         xbox_policy = await self.web_api.get_xbox_screentime_policy(
@@ -2447,13 +2463,14 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     xbox_overrides[str(account_id)] = parse_platform_override(
                         xbox_policy, "Xbox"
                     )
+                    xbox_read_at[str(account_id)] = policy_read_at
             await self._async_track_family_context()
             await self._async_sync_roster_notification(accounts_data)
             self._accounts = new_accounts
             if self.app_usage_sensors > 0:
                 self._fire_app_usage_events(accounts_data)
             try:
-                await self._async_enforce_holds(xbox_overrides)
+                await self._async_enforce_holds(xbox_overrides, xbox_read_at)
             except Exception as err:  # noqa: BLE001 - never fail the poll for it
                 _LOGGER.debug("Strict mode check failed: %r", err)
             self._devices = new_devices
