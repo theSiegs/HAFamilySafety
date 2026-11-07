@@ -66,7 +66,7 @@ class FakeWebAPI:
         self.apply_then_fail = False
 
     async def get_xbox_screentime_policy(self, child_id):
-        return self.xbox_policy
+        return self.xbox_policy if self.has_web_cookies else None
 
     async def get_device_overrides(self, child_id):
         return self.windows
@@ -378,3 +378,51 @@ async def test_service_answers_with_prior_and_applied(hass, service):
     }
     # Without asking for it, as existing callers do, nothing changes.
     assert await _call(hass, duration_hours=2) is None
+
+
+# --- unlock only touches a lock that is still ours --------------------------
+
+
+async def test_unlock_after_our_hold_ran_out_writes_nothing(coordinator, web):
+    web.xbox_policy = _xbox_policy("blockUntil", _hours(1))  # a parent lock before ours
+    await coordinator.async_lock_platform(CHILD, "Xbox", _hours(3))
+    key = coordinator._hold_key(CHILD, "Xbox")
+    coordinator._platform_holds[key]["until"] = iso_utc(_hours(-0.1))
+    web.writes.clear()
+
+    result = await coordinator.async_unlock_platform(CHILD, "Xbox")
+
+    assert result["applied"] == "hold_expired"
+    assert web.writes == []
+    assert coordinator.platform_hold(CHILD, "Xbox") is None
+
+
+@pytest.mark.parametrize(
+    "parent",
+    [
+        lambda: _xbox_policy("blockUntil", _hours(8)),  # a longer lock
+        lambda: _xbox_policy("allowUntil", _hours(1)),  # extra time
+        lambda: _xbox_policy("cancel"),  # released from the app
+    ],
+)
+async def test_unlock_leaves_a_parent_change_alone(coordinator, web, parent):
+    await coordinator.async_lock_platform(CHILD, "Xbox", _hours(3))
+    web.xbox_policy = parent()
+    web.writes.clear()
+
+    result = await coordinator.async_unlock_platform(CHILD, "Xbox")
+
+    assert result["applied"] == "left_parent_override"
+    assert web.writes == []
+    assert coordinator.platform_hold(CHILD, "Xbox") is None
+
+
+async def test_unlock_when_the_state_cannot_be_read_still_unlocks(coordinator, web):
+    await coordinator.async_lock_platform(CHILD, "Xbox", _hours(3))
+    web.xbox_policy = None  # read failed or backed off
+    web.writes.clear()
+
+    result = await coordinator.async_unlock_platform(CHILD, "Xbox")
+
+    assert web.writes[-1][1] == "cancel"
+    assert result["applied"]["type"] == "none"

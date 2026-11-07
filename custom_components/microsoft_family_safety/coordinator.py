@@ -925,13 +925,34 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self._async_save_platform_holds()
             return {"prior": dict(hold["prior"]), "applied": make_override(BLOCK_UNTIL, target)}
 
+    #: How far Microsoft's blockUntil may sit from the end we recorded and still
+    #: be ours (it stores the value we send, give or take rounding).
+    _OWN_LOCK_TOLERANCE = timedelta(minutes=2)
+
+    def _is_own_lock(self, hold: dict[str, Any], current: dict[str, Any] | None) -> bool:
+        if not isinstance(current, dict) or current.get("type") != BLOCK_UNTIL:
+            return False
+        ours = parse_utc(hold.get("until"))
+        theirs = parse_utc(current.get("valid_until"))
+        return (
+            ours is not None
+            and theirs is not None
+            and abs(ours - theirs) <= self._OWN_LOCK_TOLERANCE
+        )
+
     async def async_unlock_platform(self, account_id: str, platform: str) -> dict[str, Any]:
         """Unlock a platform, putting back the override saved by the first lock.
 
-        A saved blockUntil still in the future is sent again; anything else
-        (nothing saved, nothing in force before, an override that has run out
-        since, or an allowUntil, whose write format is not known) ends in a
-        cancel. Returns ``{"prior": ..., "applied": ...}``.
+        * No hold: cancel, as before this integration tracked its locks.
+        * Our hold has run out: forget it; nothing is sent
+          (``applied: "hold_expired"``).
+        * Microsoft still shows our blockUntil (or cannot be read): put back a
+          saved blockUntil still in the future, else cancel. A saved allowUntil
+          cannot be written (no capture shows how), so that also cancels.
+        * A parent changed it since (another blockUntil, extra time, or a
+          cancel): leave it, forget the hold (``applied: "left_parent_override"``).
+
+        Returns ``{"prior": ..., "applied": ...}``.
         """
         account = self.get_account(account_id)
         if account is None:
@@ -946,6 +967,29 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if hold and isinstance(hold.get("prior"), dict)
                 else None
             )
+            if hold is not None:
+                applied: Any = None
+                if not self._hold_in_force(hold, dt_util.utcnow()) and hold.get("until"):
+                    applied = "hold_expired"
+                else:
+                    current = await self._async_read_platform_override(account_id, platform)
+                    if current is not None and not self._is_own_lock(hold, current):
+                        # An unconfirmed hold is a lock that never went through.
+                        applied = (
+                            "left_parent_override" if hold.get("confirmed") else "not_locked"
+                        )
+                        _LOGGER.info(
+                            "%s of %s was changed since our lock (%s); left as it is",
+                            platform, account_id, current.get("type"),
+                        )
+                if applied is not None:
+                    self._platform_holds.pop(key, None)
+                    await self._async_save_platform_holds()
+                    if applied == "hold_expired":
+                        self._platform_override_until.pop(
+                            (str(account_id), platform.lower()), None
+                        )
+                    return {"prior": prior, "applied": applied}
             restore_until = active_until(prior)
             if restore_until is not None and prior["type"] == BLOCK_UNTIL:
                 await self._async_write_platform_override(
