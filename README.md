@@ -176,6 +176,7 @@ Legacy and native mode are mutually exclusive per config entry; there is no auto
 | Monitored platforms | Windows / Xbox / Mobile | Windows | One lock switch per platform. Xbox also decides whether the web session is used, see [below](#xbox-and-the-web-session) |
 | Users allowed to control Microsoft Family Safety | list of Home Assistant users | *(empty: everybody)* | See [Who can control the integration](#who-can-control-the-integration) |
 | Strict mode | on / off | off | Places a `lock_platform` lock again when it is cancelled elsewhere; see [Strict mode](#strict-mode) |
+| Xbox lock without the web session | on / off | on | Locks the Xbox through today's Xbox schedule while the web session is down; see [below](#xbox-lock-without-the-web-session) |
 | Allow insecure local HTTP authentication (testing only) | on / off | off | See below |
 
 #### Strict mode
@@ -204,6 +205,18 @@ Xbox play time and the Xbox lock are the only features that still need the Micro
 - **Xbox unticked** (the default for new installs): the integration runs on the mobile token only. The sign-in is the short one of the Family Safety app, no browser cookies are stored, the connection sensor no longer reports `degraded` for a missing web session, and the Xbox lock and Xbox play time are not created. The Xbox daily limits stay: the Xbox Screen Time Limits switch and the `number.{prefix}_xbox_{day}_limit` entities run on the mobile token, so they work in this mode too.
 
 Unticking Xbox later takes effect at once; the web credentials already stored stay unused and are removed at the next reauthentication. Ticking it again starts a reauthentication so the web session can be captured. Xbox entities created earlier stay in the entity list as unavailable; remove them there if you like.
+
+#### Xbox lock without the web session
+
+With **Xbox lock without the web session: use today's Xbox schedule** on (the default), an Xbox lock keeps working while the web session waits for its sign-in. When the web route cannot be used (no Family context, a context that needs a sign-in, or the Xbox lock request answering 401), `lock_platform` on Xbox (and the Xbox lock switch):
+
+1. reads **today's** Xbox schedule day exactly as Microsoft holds it (allowance and allowed hours, and whether the Xbox schedule is on) and saves it with the lock, on disk, before writing anything;
+2. sets today's Xbox allowance to **0** through the mobile token (the allowed hours stay as they are; a schedule that was off is turned on for the lock and off again afterwards);
+3. puts the saved day back at `unlock_platform` (or the switch turned off), at the end of the lock, and **at midnight in any case**: such a lock never lasts past midnight and is never carried to the next day. A restart that missed the moment puts it back on the first update.
+
+The day is only put back while it still shows the lock: when a parent changed it in the Family Safety app meanwhile, the parent's day is kept and `unlock_platform` answers `left_parent_override`. Whenever the web route works, the web lock is used as before. The answers of `lock_platform` and `unlock_platform` and the attributes of the lock switch and Allowed Now sensor carry `lock_path`: `web` or `mobile_schedule`.
+
+While such a lock holds, the switch reads locked, `hold` is `ours` with `override: blockUntil` until the lock's end, and `allowance_minutes` shows the saved allowance, not the 0 written; the Xbox daily limit number for today shows 0. It needs a separate Xbox schedule (Family Safety's "per device type" limits); otherwise the lock fails with a clear error and nothing is changed. Extra time on the Xbox (`add_time_bonus`, `cancel_time_bonus`) still needs the web session and fails with a clear error without it. Turn the option off to have the Xbox lock refuse instead, as before.
 
 #### Insecure local HTTP authentication
 
@@ -374,7 +387,7 @@ data:
   duration_hours: 24
 ```
 
-Both actions can answer with what they did (`response_variable`): `{prior, applied}`. `applied` is `"left_parent_override"` when a parent changed the lock in the Family Safety app since; the answer then has `current: {type, valid_until, override_until, allow_until}`. Strict mode must stay off when another integration manages these locks (see [Strict mode](#strict-mode)).
+Both actions can answer with what they did (`response_variable`): `{prior, applied, lock_path}`. `applied` is `"left_parent_override"` when a parent changed the lock in the Family Safety app since; the answer then has `current: {type, valid_until, override_until, allow_until}`. `lock_path` is `web`, or `mobile_schedule` for an Xbox lock placed through today's schedule while the web session was down (see [Xbox lock without the web session](#xbox-lock-without-the-web-session)); such a lock ends at midnight at the latest, and its `current` describes the schedule day (`allowance_minutes`, `allotted_intervals`, `schedule_enabled`). Strict mode must stay off when another integration manages these locks (see [Strict mode](#strict-mode)).
 
 #### Extra time (experimental)
 
@@ -547,6 +560,19 @@ service: microsoft_family_safety.set_acquisition_policy
 data:
   account_id: "1234567890123456"
   require_approval: true
+```
+
+### Xbox token probe (diagnostic)
+
+`probe_xbox_token` checks, inside Home Assistant, whether the Microsoft sign-in the integration already holds can also get an Xbox Live token (which would make the Xbox reads possible without the 24-hour web session). It uses the stored mobile refresh token to ask `login.live.com` for scope `service::user.auth.xboxlive.com::MBI_SSL`, then tries Xbox user authentication (RPS ticket `t=`, then `d=`) and XSTS (`http://xboxlive.com`, `RETAIL`). It answers per step with HTTP status, error codes, the granted scope, expiry in seconds and the **names** of the XSTS `xui` claims. No token, gamertag or Xbox user id is returned or logged, and a refresh token in Microsoft's answer is thrown away: the integration keeps its own.
+
+**The risk, and why `confirm_risk: true` is required.** Microsoft documents for its identity platform that a refresh token is not tied to a scope and that using it does not revoke it ([Refresh tokens](https://learn.microsoft.com/en-us/entra/identity-platform/refresh-tokens)), and the integration already rotates this token through the same endpoint without trouble. It does not document this for the older `login.live.com/oauth20_token.srf` endpoint used here. If that endpoint ever revoked the old token on use, the integration would need a new sign-in. The probe holds off the integration's own token refresh while it runs, then runs one normal refresh and reports it as `family_refresh_after` (`ok: false` means: sign in again). Administrators only; `entry_id` is needed only with several entries.
+
+```yaml
+service: microsoft_family_safety.probe_xbox_token
+data:
+  confirm_risk: true
+response_variable: probe
 ```
 
 ### Reauthentication
