@@ -34,6 +34,7 @@ from homeassistant.util import dt as dt_util
 from ._pyfamilysafety_compat import apply_patches, is_stale_roster_error
 from .api_client import FamilySafetyWebAPI
 from .app_pause import AppPauser
+from .xbox_mobile_lock import XboxMobileLockMixin
 from .app_usage import EVENT_APP_USAGE, AppUsageGrowthTracker
 from . import site_sync
 from .auth.addon_client import AddonCookieClient
@@ -53,6 +54,7 @@ from .const import (
     CONF_APP_USAGE_SENSORS,
     CONF_STRICT_MODE,
     DEFAULT_APP_USAGE_SENSORS,
+    LOCK_PATH_WEB,
     CONF_XBOX_FEATURES,
     DEFAULT_STRICT_MODE,
     EVENT_LOCK_REASSERTED,
@@ -176,7 +178,9 @@ def _ms_to_minutes(milliseconds: int | float | None) -> int:
     return int(milliseconds / 60000)
 
 
-class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
+class FamilySafetyDataUpdateCoordinator(
+    XboxMobileLockMixin, DataUpdateCoordinator[dict[str, Any]]
+):
     """Fetch and coordinate Microsoft Family Safety state."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -280,6 +284,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._resolved_requests: dict[str, None] = {}
         #: hold key -> when strict mode last placed that lock again.
         self._last_reassert: dict[str, datetime] = {}
+        self._init_xbox_mobile_lock(entry)
         if not self._mobile_only:
             ir.async_delete_issue(hass, DOMAIN, f"{XBOX_LOCK_ISSUE}_{entry.entry_id}")
 
@@ -932,9 +937,14 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     ) -> dict[str, Any]:
         """Lock a platform until ``valid_until`` (default 24 h).
 
-        Returns ``{"prior": ..., "applied": ...}``: the override saved on the
-        first lock (kept unchanged by later ones) and the one now sent. A
-        blockUntil already in force that ends later is kept, never shortened.
+        Returns ``{"prior": ..., "applied": ..., "lock_path": ...}``: the
+        override saved on the first lock (kept unchanged by later ones) and the
+        one now sent. A blockUntil already in force that ends later is kept,
+        never shortened.
+
+        Xbox without the Family web session (and the option on): today's Xbox
+        schedule day is set to no time instead and put back by the lock's end,
+        midnight at the latest (xbox_mobile_lock.py); ``lock_path`` says which.
         """
         account = self.get_account(account_id)
         if account is None:
@@ -942,6 +952,63 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._check_platform_lockable(platform)
         requested = dt_util.as_utc(valid_until or (dt_util.now() + timedelta(hours=24)))
         key = self._hold_key(account_id, platform)
+        fallback = platform.lower() == "xbox" and self._xbox_mobile_fallback
+        if fallback:
+            async with self._hold_lock(key):
+                await self._async_load_platform_holds()
+                hold = self._platform_holds.get(key)
+                web_hold_holds = (
+                    hold is not None
+                    and not self._is_mobile_hold(hold)
+                    and hold.get("confirmed")
+                    and self._hold_in_force(hold, dt_util.utcnow())
+                )
+                mobile_in_force = self._is_mobile_hold(hold) and self._hold_in_force(
+                    hold, dt_util.utcnow()
+                )
+                if mobile_in_force or (self._xbox_web_unavailable() and not web_hold_holds):
+                    if hold is not None and not self._is_mobile_hold(hold):
+                        # A web lock that never went through or has run out.
+                        self._platform_holds.pop(key, None)
+                    return await self._async_lock_xbox_mobile(account_id, requested, key)
+                if self._is_mobile_hold(hold):
+                    # Our schedule lock ended and the web works again: its day
+                    # goes back before the web lock takes over.
+                    await self._async_put_back_mobile_day(account_id, hold)
+                    self._platform_holds.pop(key, None)
+                    await self._async_save_platform_holds()
+                    self._cancel_mobile_restore(key)
+        try:
+            result = await self._async_lock_platform_web(
+                account, account_id, platform, requested, key
+            )
+        except HomeAssistantError:
+            if not fallback or not self._xbox_web_failed_for_session():
+                raise
+            async with self._hold_lock(key):
+                hold = self._platform_holds.get(key)
+                if hold is not None and not self._is_mobile_hold(hold):
+                    if hold.get("confirmed_at") and self._hold_in_force(hold, dt_util.utcnow()):
+                        # An earlier web lock of ours is still in force there.
+                        raise
+                    self._platform_holds.pop(key, None)
+                _LOGGER.info(
+                    "Xbox web lock refused (Family web session); locking today's "
+                    "Xbox schedule instead"
+                )
+                return await self._async_lock_xbox_mobile(account_id, requested, key)
+        result["lock_path"] = LOCK_PATH_WEB
+        return result
+
+    async def _async_lock_platform_web(
+        self,
+        account: Account,
+        account_id: str,
+        platform: str,
+        requested: datetime,
+        key: str,
+    ) -> dict[str, Any]:
+        """lock_platform through the override routes (web, or mobile for Windows/Mobile)."""
         async with self._hold_lock(key):
             await self._async_load_platform_holds()
             now = dt_util.utcnow()
@@ -956,6 +1023,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "account_id": str(account_id),
                     "platform": platform,
                     "prior": current if current is not None else make_override(UNKNOWN),
+                    "path": LOCK_PATH_WEB,
                     "until": None,
                     "confirmed": False,
                     "created": iso_utc(now),
@@ -1022,6 +1090,16 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return None
         return bonus
 
+    def _check_xbox_bonus_possible(self, platform: str, action: str) -> None:
+        """Xbox extra time exists only on the Family web session: say so when it is down."""
+        if platform.lower() == "xbox" and self._xbox_web_unavailable():
+            raise HomeAssistantError(
+                f"Cannot {action} Xbox extra time: it needs the Family web session, "
+                "which is not available (Microsoft asks for a new sign-in). Nothing "
+                "was changed. Sign in again (microsoft_family_safety.request_reauth), "
+                "or change the Xbox daily limit instead."
+            )
+
     def _web_error_code(self, platform: str) -> str | None:
         if self.web_api is None:
             return None
@@ -1081,6 +1159,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if account is None:
             raise ValueError(f"Account {account_id} not found")
         self._check_platform_lockable(platform)
+        self._check_xbox_bonus_possible(platform, "give")
         until = dt_util.as_utc(until)
         key = self._hold_key(account_id, platform)
         async with self._hold_lock(key):
@@ -1105,8 +1184,21 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     f"{self._web_error_code(platform) or 'unknown'}, read back "
                     f"{current if current is not None else 'nothing (the read failed)'}."
                 )
-            released = self._platform_holds.pop(key, None) is not None
+            released_hold = self._platform_holds.get(key)
+            released = released_hold is not None
+            if self._is_mobile_hold(released_hold):
+                # The extra time replaces our schedule lock: its day goes back.
+                try:
+                    await self._async_put_back_mobile_day(account_id, released_hold)
+                    self._cancel_mobile_restore(key)
+                except Exception as err:  # noqa: BLE001 - put back by its end anyway
+                    _LOGGER.warning(
+                        "Could not put the Xbox schedule of %s back after extra time: %s",
+                        account_id, err,
+                    )
+                    released = False
             if released:
+                self._platform_holds.pop(key, None)
                 await self._async_save_platform_holds()
             self._platform_override_until.pop((str(account_id), platform.lower()), None)
             self._bonuses[key] = {
@@ -1132,6 +1224,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if account is None:
             raise ValueError(f"Account {account_id} not found")
         self._check_platform_lockable(platform)
+        self._check_xbox_bonus_possible(platform, "cancel")
         key = self._hold_key(account_id, platform)
         async with self._hold_lock(key):
             await self._async_load_bonuses()
@@ -1172,6 +1265,17 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         key = self._hold_key(account_id, platform)
         async with self._hold_lock(key):
             await self._async_load_platform_holds()
+            hold = self._platform_holds.get(key)
+            if platform.lower() == "xbox" and self._is_mobile_hold(hold):
+                await self._async_unlock_xbox_mobile(account_id, key, hold)
+                return
+            if (
+                platform.lower() == "xbox"
+                and hold is None
+                and self._xbox_mobile_fallback
+                and self._xbox_web_unavailable()
+            ):
+                return  # nothing of ours to release, and no web session to cancel with
             await self._async_write_platform_override(
                 account, account_id, platform, NO_OVERRIDE
             )
@@ -1190,13 +1294,32 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         * A parent changed it since (another blockUntil, extra time, or a
           cancel): leave it, forget the hold (``applied: "left_parent_override"``).
 
-        Returns ``{"prior": ..., "applied": ...}``.
+        A mobile-schedule Xbox lock puts the saved day back (same result
+        codes; ``left_parent_override`` when a parent changed the day since).
+
+        Returns ``{"prior": ..., "applied": ..., "lock_path": ...}``.
         """
         account = self.get_account(account_id)
         if account is None:
             raise ValueError(f"Account {account_id} not found")
         self._check_platform_lockable(platform)
         key = self._hold_key(account_id, platform)
+        if platform.lower() == "xbox":
+            async with self._hold_lock(key):
+                await self._async_load_platform_holds()
+                hold = self._platform_holds.get(key)
+                if self._is_mobile_hold(hold):
+                    return await self._async_unlock_xbox_mobile(account_id, key, hold)
+                if hold is None and self._xbox_mobile_fallback and self._xbox_web_unavailable():
+                    return await self._async_xbox_not_locked(account_id)
+        result = await self._async_unlock_platform_web(account, account_id, platform, key)
+        result["lock_path"] = LOCK_PATH_WEB
+        return result
+
+    async def _async_unlock_platform_web(
+        self, account: Account, account_id: str, platform: str, key: str
+    ) -> dict[str, Any]:
+        """unlock_platform through the override routes."""
         async with self._hold_lock(key):
             await self._async_load_platform_holds()
             hold = self._platform_holds.get(key)
@@ -1283,6 +1406,8 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             until = parse_utc(hold.get("until"))
             if not hold.get("confirmed") or until is None or until <= now:
                 continue
+            if self._is_mobile_hold(hold):
+                continue  # a schedule lock, not an override strict mode can read
             account_id = str(hold.get("account_id"))
             platform = str(hold.get("platform") or key.split("|", 1)[-1])
             if platform.lower() == "xbox":
@@ -2097,6 +2222,12 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             policy = account.get("screentime_policy")
             used = self._windows_usage(data, account)
             current = None
+        if platform.lower() == "xbox":
+            mobile = self._xbox_mobile_lock_status(
+                account_id, policy, used, now or dt_util.now()
+            )
+            if mobile is not None:
+                return mobile
         if platform in (account.get("blocked_platforms") or []) and (
             current is None or current.get("type") != BLOCK_UNTIL
         ):
@@ -2149,6 +2280,9 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         account = self.account_data(account_id) or {}
         if platform.lower() == "xbox":
+            mobile = self._xbox_mobile_hold_state(account_id)
+            if mobile is not None:
+                return mobile
             policy = account.get("xbox_policy")
             current = parse_platform_override(policy, "Xbox") if policy is not None else None
         elif platform in (account.get("blocked_platforms") or []):
@@ -2160,7 +2294,9 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             current = None
         hold = self._platform_holds.get(self._hold_key(account_id, platform))
         if hold is not None and (
-            not hold.get("confirmed") or not self._hold_in_force(hold, dt_util.utcnow())
+            not hold.get("confirmed")
+            or not self._hold_in_force(hold, dt_util.utcnow())
+            or self._is_mobile_hold(hold)
         ):
             hold = None
         kind = (current or {}).get("type")
@@ -2194,6 +2330,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "override": details["type"] if current is not None else None,
             "override_until": details["override_until"],
             "allow_until": details["allow_until"],
+            "lock_path": hold.get("path", LOCK_PATH_WEB) if hold is not None else None,
         }
 
     def paused_apps(self, account_id: Any) -> dict[str, str]:
@@ -2992,6 +3129,12 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         xbox_policy, "Xbox"
                     )
                     xbox_read_at[str(account_id)] = policy_read_at
+            try:
+                await self._async_check_mobile_holds()
+            except Exception as err:  # noqa: BLE001 - never fail the poll for it
+                _LOGGER.debug("Xbox schedule lock check failed: %r", err)
+            for account_id, account_data in accounts_data.items():
+                self._apply_xbox_mobile_lock_state(account_id, account_data)
             await self._async_track_family_context()
             await self._async_sync_roster_notification(accounts_data)
             self._accounts = new_accounts
@@ -3150,6 +3293,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._roster_notification_sent = True
 
     async def async_cleanup(self) -> None:
+        self._cancel_all_mobile_restores()
         self._accounts.clear()
         self._devices.clear()
         if self.web_api:

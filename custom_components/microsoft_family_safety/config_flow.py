@@ -29,6 +29,8 @@ from .const import (
     CONF_ALLOWED_USERS,
     CONF_STRICT_MODE,
     DEFAULT_STRICT_MODE,
+    CONF_XBOX_LOCK_MOBILE_FALLBACK,
+    DEFAULT_XBOX_LOCK_MOBILE_FALLBACK,
     CONF_APP_USAGE_SENSORS,
     DEFAULT_APP_USAGE_SENSORS,
     CONF_XBOX_FEATURES,
@@ -1517,6 +1519,13 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
                         CONF_STRICT_MODE,
                         default=self._config_entry.options.get(
                             CONF_STRICT_MODE, DEFAULT_STRICT_MODE
+                        ),
+                    ): cv.boolean,
+                    vol.Optional(
+                        CONF_XBOX_LOCK_MOBILE_FALLBACK,
+                        default=self._config_entry.options.get(
+                            CONF_XBOX_LOCK_MOBILE_FALLBACK,
+                            DEFAULT_XBOX_LOCK_MOBILE_FALLBACK,
                         ),
                     ): cv.boolean,
                     vol.Optional(

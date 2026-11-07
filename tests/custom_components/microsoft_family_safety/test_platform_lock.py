@@ -149,7 +149,9 @@ async def test_unlock_with_nothing_saved_cancels(coordinator, web):
     result = await coordinator.async_unlock_platform(CHILD, "Xbox")
 
     assert [(p, k) for p, k, _ in web.writes] == [("xbox", "cancel")]
-    assert result == {"prior": None, "applied": {"type": "none", "valid_until": None}}
+    assert result == {
+        "prior": None, "applied": {"type": "none", "valid_until": None}, "lock_path": "web",
+    }
 
 
 async def test_unlock_discards_a_prior_lock_that_has_run_out(coordinator, web):
@@ -202,6 +204,8 @@ async def test_403_without_any_write_reports_the_failure(coordinator, web):
 
 
 async def test_no_web_session_refuses_the_xbox_lock(coordinator, web):
+    # With the mobile-schedule fallback off (test_xbox_mobile_lock.py covers it on).
+    coordinator._xbox_mobile_fallback = False
     web.has_web_cookies = False
     with pytest.raises(HomeAssistantError, match="web session"):
         await coordinator.async_lock_platform(CHILD, "Xbox", _hours(2))

@@ -43,7 +43,10 @@ async def test_no_lock_is_none(rig):
     coord, _ = rig
     _poll(coord)
     state = coord.platform_hold_state(CHILD, "Xbox")
-    assert state == {"hold": "none", "override": "none", "override_until": None, "allow_until": None}
+    assert state == {
+        "hold": "none", "override": "none", "override_until": None, "allow_until": None,
+        "lock_path": None,
+    }
 
 
 async def test_our_lock_is_ours(rig):

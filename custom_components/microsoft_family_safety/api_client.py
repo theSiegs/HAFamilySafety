@@ -2104,6 +2104,61 @@ class FamilySafetyWebAPI:
         )
         return True
 
+    async def get_mobile_xbox_day(self, child_id: str, day_of_week: int) -> dict[str, Any]:
+        """One day of the Xbox schedule exactly as Microsoft holds it, read now.
+
+        ``{"allowance": ms, "allottedIntervals": [{begin, end}, ...], "enabled": bool}``,
+        the raw values, so a later write can put them back unchanged (the
+        Xbox lock without the web session saves and restores this). Raises
+        FamilySafetyWebAPIError when there is no separate Xbox schedule or
+        the day is incomplete: nothing could be restored faithfully.
+        """
+        payload = await self._get_mobile_schedules(child_id)
+        matches = [
+            schedule for schedule in payload.get("schedules") or []
+            if isinstance(schedule, dict) and str(schedule.get("appliesTo")).lower() == "xbox"
+        ]
+        if payload.get("mode") != "PerDeviceType" or len(matches) != 1:
+            raise FamilySafetyWebAPIError("A separate, unambiguous Xbox schedule is required")
+        schedule = matches[0]
+        current = (schedule.get("dailyRestrictions") or {}).get(DAY_KEYS[day_of_week])
+        if (
+            not isinstance(current, dict)
+            or type(current.get("allowance")) is not int
+            or current["allowance"] < 0
+            or not isinstance(current.get("allottedIntervals"), list)
+            or any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("begin"), str)
+                or not isinstance(item.get("end"), str)
+                for item in current["allottedIntervals"]
+            )
+        ):
+            raise FamilySafetyWebAPIError("The Xbox day is incomplete")
+        return {
+            "allowance": current["allowance"],
+            "allottedIntervals": [
+                {"begin": item["begin"], "end": item["end"]}
+                for item in current["allottedIntervals"]
+            ],
+            "enabled": schedule.get("enabled") is not False,
+        }
+
+    async def set_mobile_xbox_day(
+        self,
+        child_id: str,
+        day_of_week: int,
+        allowance_ms: int,
+        intervals: list[dict[str, str]],
+    ) -> None:
+        """Write one Xbox day's allowance (ms) and intervals in one PATCH, as given."""
+        if type(allowance_ms) is not int or allowance_ms < 0:
+            raise ValueError("allowance_ms must be a non-negative int")
+        await self._patch_mobile_day(
+            child_id, day_of_week, allowance_ms=allowance_ms,
+            intervals=[dict(item) for item in intervals], platform="Xbox",
+        )
+
     async def _patch_mobile_day(
         self,
         child_id: str,
@@ -2170,10 +2225,15 @@ class FamilySafetyWebAPI:
             "mode": payload.get("mode") or "PerDeviceType",
             "time": self._mobile_now(),
         }
-        await self._request(
-            "PATCH", f"/v4/devicelimits/schedules/{child_id}",
-            json_data=body, extra_headers={"Plat-Info": "Windows"},
-        )
+        try:
+            await self._request(
+                "PATCH", f"/v4/devicelimits/schedules/{child_id}",
+                json_data=body, extra_headers={"Plat-Info": "Windows"},
+            )
+        finally:
+            # The payload read before the write is stale now: a read within
+            # max_age must not hand it out as current.
+            self._mobile_schedule_cache.pop(str(child_id), None)
 
     async def set_mobile_schedule_enabled(
         self, child_id: str, enabled: bool, platform: str = "Windows"
@@ -2192,6 +2252,7 @@ class FamilySafetyWebAPI:
                 },
                 extra_headers={"Plat-Info": "Windows"},
             )
+            self._mobile_schedule_cache.pop(str(child_id), None)
         return True
 
     async def set_mobile_screentime_allowance(

@@ -40,6 +40,13 @@ DEFAULT_XBOX_FEATURES: Final = True
 CONF_STRICT_MODE: Final = "strict_mode"
 DEFAULT_STRICT_MODE: Final = False
 EVENT_LOCK_REASSERTED: Final = f"{DOMAIN}_lock_reasserted"
+# Xbox lock without the Family web session: today's Xbox schedule day is set
+# to no time (mobile API) and put back at unlock, at its end or at midnight.
+CONF_XBOX_LOCK_MOBILE_FALLBACK: Final = "xbox_lock_mobile_fallback"
+DEFAULT_XBOX_LOCK_MOBILE_FALLBACK: Final = True
+#: How an Xbox lock was placed (``lock_path`` attribute and service answers).
+LOCK_PATH_WEB: Final = "web"
+LOCK_PATH_MOBILE_SCHEDULE: Final = "mobile_schedule"
 #: Fired once for each pending request (more time, an app) that appears.
 EVENT_REQUEST: Final = f"{DOMAIN}_request"
 #: Fired once when a pending request leaves the list (approved, denied, expired).
@@ -135,6 +142,7 @@ SERVICE_GET_SITES: Final = "get_sites"
 SERVICE_ADD_TIME_BONUS: Final = "add_time_bonus"
 SERVICE_CANCEL_TIME_BONUS: Final = "cancel_time_bonus"
 SERVICE_RESUME_APP: Final = "resume_app"
+SERVICE_PROBE_XBOX_TOKEN: Final = "probe_xbox_token"
 
 ALL_SERVICES: Final = [
     SERVICE_BLOCK_APP,
@@ -162,6 +170,7 @@ ALL_SERVICES: Final = [
     SERVICE_GET_SITES,
     SERVICE_ADD_TIME_BONUS,
     SERVICE_CANCEL_TIME_BONUS,
+    SERVICE_PROBE_XBOX_TOKEN,
 ]
 
 # Platforms
