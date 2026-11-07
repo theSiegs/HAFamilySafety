@@ -44,7 +44,10 @@ from .screen_time import (
     parse_utc,
 )
 from .const import (
+    CONF_STRICT_MODE,
     CONF_XBOX_FEATURES,
+    DEFAULT_STRICT_MODE,
+    EVENT_LOCK_REASSERTED,
     DEFAULT_XBOX_FEATURES,
     CONF_API_KEY,
     CONF_AUTH_URL,
@@ -73,6 +76,9 @@ _FAMILY_TOKEN_REJECTED = "web_family_token_rejected"
 _FAMILY_AUTH_REQUIRED_POLLS = 2
 #: Locks this integration holds on a platform, with the state before them.
 PLATFORM_HOLD_STORAGE_KEY = f"{DOMAIN}.platform_holds"
+#: Strict mode re-places one lock at most this often, so a lock Microsoft
+#: keeps reporting as cancelled cannot turn into a write on every poll.
+_STRICT_REASSERT_COOLDOWN = timedelta(minutes=10)
 #: Repair issue raised when an Xbox lock is asked of a mobile-only entry.
 XBOX_LOCK_ISSUE = "xbox_lock_needs_xbox_features"
 
@@ -225,6 +231,9 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._platform_holds: dict[str, dict[str, Any]] = {}
         self._platform_holds_loaded = False
         self._platform_hold_locks: dict[str, asyncio.Lock] = {}
+        self._strict_mode = bool(entry.options.get(CONF_STRICT_MODE, DEFAULT_STRICT_MODE))
+        #: hold key -> when strict mode last placed that lock again.
+        self._last_reassert: dict[str, datetime] = {}
         if not self._mobile_only:
             ir.async_delete_issue(hass, DOMAIN, f"{XBOX_LOCK_ISSUE}_{entry.entry_id}")
 
@@ -944,6 +953,75 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._platform_holds.pop(key, None)
                 await self._async_save_platform_holds()
             return {"prior": prior, "applied": applied}
+
+    async def _async_enforce_holds(self, xbox_overrides: dict[str, Any]) -> None:
+        """Strict mode: put back a lock of ours that Microsoft reports as cancelled.
+
+        Only a hold this integration confirmed, whose end is still ahead, and
+        only on an explicit "nothing in force" read-back: an unreadable answer
+        never triggers a write. The Xbox read-back is the policy this poll
+        already fetched; other platforms read their override route. The write
+        runs in the background, after this poll, so its refresh does not nest.
+        """
+        if not self._strict_mode:
+            return
+        await self._async_load_platform_holds()
+        now = dt_util.utcnow()
+        for key, hold in list(self._platform_holds.items()):
+            until = parse_utc(hold.get("until"))
+            if not hold.get("confirmed") or until is None or until <= now:
+                continue
+            account_id = str(hold.get("account_id"))
+            platform = str(hold.get("platform") or key.split("|", 1)[-1])
+            if platform.lower() == "xbox":
+                state = xbox_overrides.get(account_id)
+            else:
+                state = await self._async_read_platform_override(account_id, platform)
+            if not isinstance(state, dict) or state.get("type") != NO_OVERRIDE:
+                continue
+            last = self._last_reassert.get(key)
+            if last is not None and now - last < _STRICT_REASSERT_COOLDOWN:
+                continue
+            self._last_reassert[key] = now
+            self.entry.async_create_background_task(
+                self.hass,
+                self._async_reassert_hold(key, account_id, platform, until),
+                f"{DOMAIN} reassert {platform} lock",
+            )
+
+    async def _async_reassert_hold(
+        self, key: str, account_id: str, platform: str, until: datetime
+    ) -> None:
+        """Place a held lock again and fire ``microsoft_family_safety_lock_reasserted``."""
+        async with self._hold_lock(key):
+            hold = self._platform_holds.get(key)
+            if hold is None or parse_utc(hold.get("until")) != until:
+                return  # unlocked or re-locked meanwhile
+            account = self.get_account(account_id)
+            if account is None:
+                return
+            try:
+                await self._async_write_platform_override(
+                    account, account_id, platform, BLOCK_UNTIL, until
+                )
+            except Exception as err:  # noqa: BLE001 - retried after the cooldown
+                _LOGGER.warning(
+                    "Strict mode could not lock %s of %s again: %s", platform, account_id, err
+                )
+                return
+        _LOGGER.info(
+            "Strict mode: the %s lock of %s read back as cancelled and was placed again",
+            platform, account_id,
+        )
+        self.hass.bus.async_fire(
+            EVENT_LOCK_REASSERTED,
+            {
+                "entry_id": self.entry.entry_id,
+                "account_id": account_id,
+                "platform": platform,
+                "until": iso_utc(until),
+            },
+        )
 
     async def _override_platform_mobile(
         self,
@@ -1938,6 +2016,8 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.api.accounts = []
             accounts_data: dict[str, Any] = {}
             devices_data: dict[str, Any] = {}
+            #: account id -> Xbox override read this poll (strict mode).
+            xbox_overrides: dict[str, Any] = {}
             new_accounts: dict[str, Account] = {}
             new_devices: dict[str, Device] = {}
             for account in self.api.accounts:
@@ -2049,9 +2129,17 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 accounts_data[account_id]["xbox_policy"] = (
                     xbox_policy if xbox_policy is not None else previous.get("xbox_policy")
                 )
+                if xbox_policy is not None:
+                    xbox_overrides[str(account_id)] = parse_platform_override(
+                        xbox_policy, "Xbox"
+                    )
             await self._async_track_family_context()
             await self._async_sync_roster_notification(accounts_data)
             self._accounts = new_accounts
+            try:
+                await self._async_enforce_holds(xbox_overrides)
+            except Exception as err:  # noqa: BLE001 - never fail the poll for it
+                _LOGGER.debug("Strict mode check failed: %r", err)
             self._devices = new_devices
             pending = getattr(self.api, "pending_requests", None) or []
             self._is_retrying_auth = False
