@@ -11,9 +11,11 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from .const import ATTR_FIRST_NAME, ATTR_PLATFORM, ATTR_SURNAME, ATTR_USER_ID, DOMAIN
 from .coordinator import FamilySafetyDataUpdateCoordinator
+from .screen_time import downtime_window
 
 #: Platform -> the account data key holding its schedule.
 SCHEDULE_KEYS = {"Windows": "screentime_policy", "Xbox": "xbox_screentime_policy"}
@@ -39,6 +41,9 @@ async def async_setup_entry(
                 known.add((account_id, platform))
                 entities.append(
                     FamilySafetyAllowedNowSensor(coordinator, entry, account_id, platform)
+                )
+                entities.append(
+                    FamilySafetyDowntimeSensor(coordinator, entry, account_id, platform)
                 )
         if entities:
             async_add_entities(entities)
@@ -136,4 +141,70 @@ class FamilySafetyAllowedNowSensor(MinuteUpdateMixin, CoordinatorEntity, BinaryS
             "in_allowed_hours": status["in_allowed_hours"],
             "override": (status.get("override") or {}).get("type"),
             "override_until": (status.get("override") or {}).get("valid_until"),
+        }
+
+
+class FamilySafetyDowntimeSensor(MinuteUpdateMixin, CoordinatorEntity, BinarySensorEntity):
+    """On while the current local time is outside today's allowed hours.
+
+    ``downtime_start`` / ``downtime_end`` give the current downtime, or the
+    next one, as local ISO times. The same values are also given as
+    ``bedtime_start`` / ``bedtime_end``, the names of Family Link's Bedtime
+    Active sensor, which Hearth reads to know when a lock starts and ends.
+    Off with limits turned off; unknown while the schedule is unknown.
+    """
+
+    def __init__(
+        self,
+        coordinator: FamilySafetyDataUpdateCoordinator,
+        entry: ConfigEntry,
+        account_id: str,
+        platform: str,
+    ) -> None:
+        super().__init__(coordinator)
+        self._account_id = account_id
+        self._platform = platform
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_{account_id}_{platform.lower()}_downtime"
+        first = self._account_data().get(ATTR_FIRST_NAME, "Unknown")
+        self._attr_name = f"{first} {platform} Downtime Active"
+        self._attr_icon = "mdi:sleep"
+
+    def _account_data(self) -> dict[str, Any]:
+        return ((self.coordinator.data or {}).get("accounts") or {}).get(self._account_id) or {}
+
+    def _window(self) -> dict[str, Any]:
+        policy = self._account_data().get(SCHEDULE_KEYS[self._platform])
+        return downtime_window(policy if isinstance(policy, dict) else None, dt_util.now())
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Link to the child's device."""
+        account = self._account_data()
+        full_name = f"{account.get(ATTR_FIRST_NAME, 'Unknown')} {account.get(ATTR_SURNAME, '')}".strip()
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._account_id)},
+            name=f"{full_name} (Family Safety)",
+            manufacturer="Microsoft",
+            model="Family Safety Account",
+        )
+
+    @property
+    def is_on(self) -> bool | None:
+        """True during downtime."""
+        return self._window()["active"]
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """The current or next downtime."""
+        window = self._window()
+        start = window["start"].isoformat() if window["start"] else None
+        end = window["end"].isoformat() if window["end"] else None
+        return {
+            ATTR_USER_ID: self._account_id,
+            ATTR_PLATFORM: self._platform,
+            "downtime_start": start,
+            "downtime_end": end,
+            "bedtime_start": start,
+            "bedtime_end": end,
         }

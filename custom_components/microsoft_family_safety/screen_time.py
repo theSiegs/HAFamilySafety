@@ -15,7 +15,7 @@ as unknown, never as "not blocked".
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 from typing import Any
 
@@ -319,3 +319,57 @@ def platform_allowance(
         **result, "allowed": True, "remaining_minutes": min(left, to_window_end),
         "reason": REASON_WITHIN_LIMITS,
     }
+
+
+def _day_of(policy: dict[str, Any], day: datetime) -> dict[str, Any] | None:
+    daily = policy.get("dailyRestrictions") or policy.get("DailyRestrictions")
+    if not isinstance(daily, dict):
+        return None
+    key = _DAY_KEYS[(day.weekday() + 1) % 7]
+    value = daily.get(key) or daily.get(key.capitalize())
+    return value if isinstance(value, dict) else None
+
+
+def downtime_window(policy: dict[str, Any] | None, now: datetime) -> dict[str, Any]:
+    """Downtime (outside the allowed hours) now, or the next one.
+
+    Returns ``active`` (None when the schedule is unknown) and ``start`` /
+    ``end`` (local, aware) of the current downtime, or of the next one within
+    the next day; both None when there is none. With limits off there is no
+    downtime. A day without allowed-hour information counts as allowed.
+    """
+    result: dict[str, Any] = {"active": None, "start": None, "end": None}
+    if not isinstance(policy, dict):
+        return result
+    if policy.get("isEnabled", policy.get("IsEnabled")) is False:
+        return {**result, "active": False}
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    days = [midnight + timedelta(days=offset) for offset in (-1, 0, 1)]
+    if _day_of(policy, days[1]) is None:
+        return result
+    timeline: list[bool] = []
+    for day in days:
+        data = _day_of(policy, day)
+        timeline.extend((day_slots(data) if data else None) or [True] * 48)
+    index = 48 + min(int((now.hour * 60 + now.minute) // 30), 47)
+
+    def at(slot: int) -> datetime:
+        return days[0] + timedelta(minutes=30 * slot)
+
+    if not timeline[index]:
+        start = index
+        while start > 0 and not timeline[start - 1]:
+            start -= 1
+        end = index
+        while end < len(timeline) and not timeline[end]:
+            end += 1
+        return {"active": True, "start": at(start), "end": at(end)}
+    start = index
+    while start < len(timeline) and timeline[start]:
+        start += 1
+    if start >= len(timeline):
+        return {**result, "active": False}
+    end = start
+    while end < len(timeline) and not timeline[end]:
+        end += 1
+    return {"active": False, "start": at(start), "end": at(end)}

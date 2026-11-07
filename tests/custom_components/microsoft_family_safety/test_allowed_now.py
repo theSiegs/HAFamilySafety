@@ -150,7 +150,7 @@ async def test_entities_for_both_platforms(hass, coordinator):
     await sensor.async_setup_entry(hass, entry, sensors.extend)
 
     assert sorted(e.unique_id.split("_", 2)[-1] for e in binaries) == [
-        "windows_allowed_now", "xbox_allowed_now"
+        "windows_allowed_now", "windows_downtime", "xbox_allowed_now", "xbox_downtime"
     ]
     remaining = [e for e in sensors if isinstance(e, sensor.FamilySafetyTimeRemainingSensor)]
     assert sorted(e.unique_id.split("_", 2)[-1] for e in remaining) == [
@@ -195,3 +195,45 @@ async def test_volatile_attributes_are_not_recorded_and_user_id_is_there(hass, c
     assert "used_minutes" in remaining._unrecorded_attributes
     assert allowed.extra_state_attributes["user_id"] == CHILD
     assert remaining.extra_state_attributes["user_id"] == CHILD
+
+
+# --- Downtime Active ----------------------------------------------------------
+
+from custom_components.microsoft_family_safety.screen_time import downtime_window  # noqa: E402
+
+
+def test_downtime_now_spans_the_night():
+    # Allowed 07:00-20:00 every day; at 22:00 the downtime runs 20:00 -> 07:00.
+    window = downtime_window(_policy(), _at(22, 0))
+    assert window["active"] is True
+    assert window["start"] == _at(20, 0)
+    assert window["end"] == _at(7, 0) + timedelta(days=1)
+    # Early morning: it started the evening before.
+    window = downtime_window(_policy(), _at(6, 0))
+    assert (window["start"], window["end"]) == (_at(20, 0) - timedelta(days=1), _at(7, 0))
+
+
+def test_next_downtime_during_allowed_hours():
+    window = downtime_window(_policy(), NOW)
+    assert window["active"] is False
+    assert (window["start"], window["end"]) == (_at(20, 0), _at(7, 0) + timedelta(days=1))
+
+
+def test_no_downtime_with_limits_off_or_unknown():
+    assert downtime_window(_policy(enabled=False), NOW) == {"active": False, "start": None, "end": None}
+    assert downtime_window(None, NOW)["active"] is None
+
+
+async def test_downtime_entities_carry_hearth_lock_attributes(hass, coordinator):
+    coord, entry = coordinator
+    added: list = []
+    await binary_sensor.async_setup_entry(hass, entry, added.extend)
+    downtime = [e for e in added if isinstance(e, binary_sensor.FamilySafetyDowntimeSensor)]
+    assert sorted(e.unique_id.split("_", 2)[-1] for e in downtime) == [
+        "windows_downtime", "xbox_downtime"
+    ]
+    attrs = downtime[0].extra_state_attributes
+    assert attrs["downtime_start"] == attrs["bedtime_start"]
+    assert attrs["downtime_end"] == attrs["bedtime_end"]
+    assert attrs["user_id"] == CHILD
+    assert dt_util.parse_datetime(attrs["downtime_end"]).tzinfo is not None
