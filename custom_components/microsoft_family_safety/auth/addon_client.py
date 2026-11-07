@@ -10,6 +10,7 @@ import aiohttp
 from cryptography.fernet import Fernet
 
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -79,25 +80,25 @@ class AddonCookieClient:
         if not token:
             return None
         try:
-            async with aiohttp.ClientSession() as session:
-                # List all addons to find ours by slug suffix
-                async with session.get(
-                    "http://supervisor/addons",
-                    headers={"Authorization": f"Bearer {token}"},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    if resp.status != 200:
-                        return None
-                    data = await resp.json()
-                    addons = data.get("data", {}).get("addons", [])
-                    for addon in addons:
-                        slug = addon.get("slug", "")
-                        if slug.endswith(_ADDON_SLUG_SUFFIX) and addon.get("state") == "started":
-                            # Docker hostname uses hyphens, slug uses underscores
-                            hostname = slug.replace("_", "-")
-                            url = f"http://{hostname}:{_ADDON_PORT}"
-                            _LOGGER.debug("Resolved addon URL via Supervisor: %s", url)
-                            return url
+            session = async_get_clientsession(self.hass)
+            # List all addons to find ours by slug suffix
+            async with session.get(
+                "http://supervisor/addons",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                addons = data.get("data", {}).get("addons", [])
+                for addon in addons:
+                    slug = addon.get("slug", "")
+                    if slug.endswith(_ADDON_SLUG_SUFFIX) and addon.get("state") == "started":
+                        # Docker hostname uses hyphens, slug uses underscores
+                        hostname = slug.replace("_", "-")
+                        url = f"http://{hostname}:{_ADDON_PORT}"
+                        _LOGGER.debug("Resolved addon URL via Supervisor: %s", url)
+                        return url
         except Exception as err:
             _LOGGER.debug("Could not resolve addon URL via Supervisor: %s", err)
         return None
@@ -107,21 +108,21 @@ class AddonCookieClient:
         api_url = f"{url.rstrip('/')}/api/cookies"
         headers = await self._auth_headers()
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    api_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
-                ) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        cookies = data.get("cookies", [])
-                        _LOGGER.info("Loaded %d cookies from API (%s)", len(cookies), url)
-                        return cookies
-                    if response.status == 404:
-                        _LOGGER.debug("No cookies found at %s", api_url)
-                        return None
-                    await response.text()  # drain body to close connection properly
-                    _LOGGER.debug("API returned status %s from %s", response.status, api_url)
+            session = async_get_clientsession(self.hass)
+            async with session.get(
+                api_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    cookies = data.get("cookies", [])
+                    _LOGGER.info("Loaded %d cookies from API (%s)", len(cookies), url)
+                    return cookies
+                if response.status == 404:
+                    _LOGGER.debug("No cookies found at %s", api_url)
                     return None
+                await response.text()  # drain body to close connection properly
+                _LOGGER.debug("API returned status %s from %s", response.status, api_url)
+                return None
         except aiohttp.ClientError as err:
             _LOGGER.debug("Failed to connect to %s: %s", api_url, err)
             return None
@@ -133,11 +134,11 @@ class AddonCookieClient:
         """Check if auth server API is available at URL."""
         health_url = f"{url.rstrip('/')}/api/health"
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    health_url, timeout=aiohttp.ClientTimeout(total=5)
-                ) as response:
-                    return response.status == 200
+            session = async_get_clientsession(self.hass)
+            async with session.get(
+                health_url, timeout=aiohttp.ClientTimeout(total=5)
+            ) as response:
+                return response.status == 200
         except Exception:
             return False
 
@@ -279,52 +280,52 @@ class AddonCookieClient:
         headers = await self._auth_headers()
         self.last_error_code = None
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    api_url,
-                    params={"childId": child_id},
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=120),
-                ) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        result = data.get("data")
-                        _LOGGER.info(
-                            "Screen time fetched via addon browser for child %s",
-                            child_id,
-                        )
-                        return result
-                    text = await response.text()
-                    # Try to parse detailed error info from addon
-                    detail = text
-                    error_code = None
-                    try:
-                        err_data = json.loads(text)
-                        if isinstance(err_data, dict):
-                            err_detail = err_data.get("detail", {})
-                            if isinstance(err_detail, dict):
-                                ms_status = err_detail.get("microsoft_status", "?")
-                                error_code = err_detail.get("error", "?")
-                                message = err_detail.get("message", "")[:300]
-                                detail = (
-                                    f"code={error_code} microsoft_status={ms_status} "
-                                    f"message={message}"
-                                )
-                    except Exception:
-                        pass
-                    self.last_error_code = error_code
-                    if response.status == 503 and error_code == "BROWSER_BUSY":
-                        _LOGGER.info(
-                            "Addon browser busy (auth in progress), "
-                            "screen time will be fetched on next cycle"
-                        )
-                    else:
-                        _LOGGER.warning(
-                            "Addon screentime API returned %s: %s",
-                            response.status,
-                            detail[:500],
-                        )
-                    return None
+            session = async_get_clientsession(self.hass)
+            async with session.get(
+                api_url,
+                params={"childId": child_id},
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    result = data.get("data")
+                    _LOGGER.info(
+                        "Screen time fetched via addon browser for child %s",
+                        child_id,
+                    )
+                    return result
+                text = await response.text()
+                # Try to parse detailed error info from addon
+                detail = text
+                error_code = None
+                try:
+                    err_data = json.loads(text)
+                    if isinstance(err_data, dict):
+                        err_detail = err_data.get("detail", {})
+                        if isinstance(err_detail, dict):
+                            ms_status = err_detail.get("microsoft_status", "?")
+                            error_code = err_detail.get("error", "?")
+                            message = err_detail.get("message", "")[:300]
+                            detail = (
+                                f"code={error_code} microsoft_status={ms_status} "
+                                f"message={message}"
+                            )
+                except Exception:
+                    pass
+                self.last_error_code = error_code
+                if response.status == 503 and error_code == "BROWSER_BUSY":
+                    _LOGGER.info(
+                        "Addon browser busy (auth in progress), "
+                        "screen time will be fetched on next cycle"
+                    )
+                else:
+                    _LOGGER.warning(
+                        "Addon screentime API returned %s: %s",
+                        response.status,
+                        detail[:500],
+                    )
+                return None
         except aiohttp.ClientError as err:
             _LOGGER.warning("Failed to fetch screentime from addon: %s", err)
             return None
@@ -340,28 +341,28 @@ class AddonCookieClient:
         api_url = f"{url.rstrip('/')}/api/screentime/set-allowance"
         headers = await self._auth_headers()
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    api_url,
-                    json={
-                        "childId": child_id,
-                        "dayOfWeek": day_of_week,
-                        "hours": hours,
-                        "minutes": minutes,
-                    },
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=120),
-                ) as response:
-                    if response.status == 200:
-                        _LOGGER.info(
-                            "Screen time allowance set via addon for child %s day %d",
-                            child_id, day_of_week,
-                        )
-                        return True
-                    text = await response.text()
-                    raise RuntimeError(
-                        f"Addon set-allowance returned {response.status}: {text[:300]}"
+            session = async_get_clientsession(self.hass)
+            async with session.post(
+                api_url,
+                json={
+                    "childId": child_id,
+                    "dayOfWeek": day_of_week,
+                    "hours": hours,
+                    "minutes": minutes,
+                },
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as response:
+                if response.status == 200:
+                    _LOGGER.info(
+                        "Screen time allowance set via addon for child %s day %d",
+                        child_id, day_of_week,
                     )
+                    return True
+                text = await response.text()
+                raise RuntimeError(
+                    f"Addon set-allowance returned {response.status}: {text[:300]}"
+                )
         except aiohttp.ClientError as err:
             raise RuntimeError(f"Failed to call addon set-allowance: {err}") from err
 
@@ -373,26 +374,26 @@ class AddonCookieClient:
         api_url = f"{url.rstrip('/')}/api/screentime/set-intervals"
         headers = await self._auth_headers()
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    api_url,
-                    json={
-                        "childId": child_id,
-                        "dayOfWeek": day_of_week,
-                        "allowedIntervals": allowed_intervals,
-                    },
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=120),
-                ) as response:
-                    if response.status == 200:
-                        _LOGGER.info(
-                            "Screen time intervals set via addon for child %s day %d",
-                            child_id, day_of_week,
-                        )
-                        return True
-                    text = await response.text()
-                    raise RuntimeError(
-                        f"Addon set-intervals returned {response.status}: {text[:300]}"
+            session = async_get_clientsession(self.hass)
+            async with session.post(
+                api_url,
+                json={
+                    "childId": child_id,
+                    "dayOfWeek": day_of_week,
+                    "allowedIntervals": allowed_intervals,
+                },
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as response:
+                if response.status == 200:
+                    _LOGGER.info(
+                        "Screen time intervals set via addon for child %s day %d",
+                        child_id, day_of_week,
                     )
+                    return True
+                text = await response.text()
+                raise RuntimeError(
+                    f"Addon set-intervals returned {response.status}: {text[:300]}"
+                )
         except aiohttp.ClientError as err:
             raise RuntimeError(f"Failed to call addon set-intervals: {err}") from err

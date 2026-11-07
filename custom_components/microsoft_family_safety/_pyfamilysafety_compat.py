@@ -76,6 +76,7 @@ from pyfamilysafety.exceptions import HttpException, Unauthorized
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.util import dt as dt_util
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -297,6 +298,10 @@ async def _patched_perform_refresh(self: Authenticator) -> None:
             ) from err
 
         _set_access_token(self, str(access_token))
+        # Deliberately naive local time, not dt_util.now(): pyfamilysafety
+        # 1.1.2 compares ``expires < datetime.now()`` itself (api.py), and an
+        # aware value there raises TypeError. Only the expiry instant matters,
+        # and authenticator_access_token_expired() compares like with like.
         self.expires = datetime.now() + timedelta(seconds=expires_seconds)
         self.refresh_token = str(refresh_token)
         if payload.get("user_id") is not None:
@@ -825,8 +830,10 @@ def authenticator_access_token_expired(authenticator: Authenticator) -> bool:
     expires = getattr(authenticator, "expires", None)
     if expires is None:
         return True
+    # Compare like with like: the library and _patched_perform_refresh store a
+    # naive local expiry (see there); an aware one is compared in its own zone.
     now = (
-        datetime.now(tz=expires.tzinfo)
+        dt_util.now(expires.tzinfo)
         if getattr(expires, "tzinfo", None)
         else datetime.now()
     )
