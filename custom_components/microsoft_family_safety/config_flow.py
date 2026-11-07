@@ -29,6 +29,8 @@ from .const import (
     CONF_ALLOWED_USERS,
     CONF_STRICT_MODE,
     DEFAULT_STRICT_MODE,
+    CONF_APP_USAGE_SENSORS,
+    DEFAULT_APP_USAGE_SENSORS,
     CONF_XBOX_FEATURES,
     DEFAULT_XBOX_FEATURES,
     AVAILABLE_PLATFORMS,
@@ -1505,6 +1507,12 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
                         CONF_ALLOWED_USERS,
                         default=current_allowed,
                     ): users_selector,
+                    vol.Optional(
+                        CONF_APP_USAGE_SENSORS,
+                        default=self._config_entry.options.get(
+                            CONF_APP_USAGE_SENSORS, DEFAULT_APP_USAGE_SENSORS
+                        ),
+                    ): vol.All(vol.Coerce(int), vol.Range(min=0, max=30)),
                     vol.Optional(
                         CONF_STRICT_MODE,
                         default=self._config_entry.options.get(

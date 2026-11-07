@@ -32,6 +32,7 @@ from homeassistant.util import dt as dt_util
 
 from ._pyfamilysafety_compat import apply_patches, is_stale_roster_error
 from .api_client import FamilySafetyWebAPI
+from .app_usage import EVENT_APP_USAGE, AppUsageGrowthTracker
 from .auth.addon_client import AddonCookieClient
 from .screen_time import (
     BLOCK_UNTIL,
@@ -45,7 +46,9 @@ from .screen_time import (
     platform_allowance,
 )
 from .const import (
+    CONF_APP_USAGE_SENSORS,
     CONF_STRICT_MODE,
+    DEFAULT_APP_USAGE_SENSORS,
     CONF_XBOX_FEATURES,
     DEFAULT_STRICT_MODE,
     EVENT_LOCK_REASSERTED,
@@ -233,6 +236,11 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._platform_holds_loaded = False
         self._platform_hold_locks: dict[str, asyncio.Lock] = {}
         self._strict_mode = bool(entry.options.get(CONF_STRICT_MODE, DEFAULT_STRICT_MODE))
+        #: How many of each child's most used apps get a usage sensor; 0 = off.
+        self.app_usage_sensors = int(
+            entry.options.get(CONF_APP_USAGE_SENSORS, DEFAULT_APP_USAGE_SENSORS) or 0
+        )
+        self._app_usage_tracker = AppUsageGrowthTracker()
         #: hold key -> when strict mode last placed that lock again.
         self._last_reassert: dict[str, datetime] = {}
         if not self._mobile_only:
@@ -1023,6 +1031,22 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "until": iso_utc(until),
             },
         )
+
+    def _fire_app_usage_events(self, accounts_data: dict[str, Any]) -> None:
+        """Fire microsoft_family_safety_app_usage for each app that grew since the last poll."""
+        for account_id, account in accounts_data.items():
+            for grew in self._app_usage_tracker.update(
+                account_id, account.get("screen_time_date") or "", account.get("applications")
+            ):
+                self.hass.bus.async_fire(
+                    EVENT_APP_USAGE,
+                    {
+                        "entry_id": self.entry.entry_id,
+                        "account_id": str(account_id),
+                        "first_name": account.get("first_name"),
+                        **grew,
+                    },
+                )
 
     async def _override_platform_mobile(
         self,
@@ -2184,6 +2208,8 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self._async_track_family_context()
             await self._async_sync_roster_notification(accounts_data)
             self._accounts = new_accounts
+            if self.app_usage_sensors > 0:
+                self._fire_app_usage_events(accounts_data)
             try:
                 await self._async_enforce_holds(xbox_overrides)
             except Exception as err:  # noqa: BLE001 - never fail the poll for it

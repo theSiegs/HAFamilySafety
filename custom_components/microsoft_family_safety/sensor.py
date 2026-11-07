@@ -13,6 +13,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory, UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -37,6 +38,7 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import FamilySafetyDataUpdateCoordinator
+from .app_usage import app_usage_unique_id, safe_app_id, top_apps, usage_summary
 from .binary_sensor import MinuteUpdateMixin
 
 _LOGGER = logging.getLogger(__name__)
@@ -110,6 +112,17 @@ async def async_setup_entry(
     known_xbox_accounts: set[str] = set()
     known_windows_accounts: set[str] = set()
     known_devices: set[str] = set()
+    #: (account id, safe app id) of the app usage sensors created so far.
+    known_apps: set[tuple[str, str]] = set()
+    # An app keeps its usage sensor across restarts, even before it is among
+    # today's most used again.
+    remembered: set[tuple[str, str]] = set()
+    if coordinator.app_usage_sensors > 0:
+        for reg in er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id):
+            prefix = f"{entry.entry_id}_"
+            if reg.domain == "sensor" and "_app_usage_" in reg.unique_id:
+                account_id, _, app = reg.unique_id.removeprefix(prefix).partition("_app_usage_")
+                remembered.add((account_id, app))
 
     def _add_new_entities() -> None:
         """Add sensors for accounts/devices that appeared since last update."""
@@ -145,6 +158,23 @@ async def async_setup_entry(
                 entities.append(
                     FamilySafetyTimeRemainingSensor(coordinator, entry, account_id)
                 )
+
+            if coordinator.app_usage_sensors > 0:
+                applications = (account_data or {}).get("applications") or []
+                wanted = {
+                    safe_app_id(app["app_id"])
+                    for app in top_apps(applications, coordinator.app_usage_sensors)
+                } | {app for acct, app in remembered if acct == str(account_id)}
+                for app in applications:
+                    key = (str(account_id), safe_app_id(app.get("app_id", "")))
+                    if key[1] in wanted and key not in known_apps:
+                        known_apps.add(key)
+                        entities.append(
+                            FamilySafetyAppUsageSensor(
+                                coordinator, entry, account_id, app["app_id"],
+                                app.get("app_name") or app["app_id"],
+                            )
+                        )
 
         for device_id in data.get("devices", {}):
             if device_id not in known_devices:
@@ -499,12 +529,57 @@ class FamilySafetyApplicationCountSensor(FamilySafetyAccountSensor):
         if not account_data:
             return {}
 
-        applications = account_data.get("applications", [])
-        blocked_apps = [app for app in applications if app.get("blocked")]
+        # A summary only: the full list (dozens of apps with icon URLs) went
+        # over the recorder's 16 KB attribute limit.
+        return usage_summary(account_data.get("applications", []))
 
+
+class FamilySafetyAppUsageSensor(FamilySafetyAccountSensor):
+    """Minutes one app was used today (opt-in, see app_usage.py)."""
+
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_icon = "mdi:application-cog"
+
+    def __init__(
+        self,
+        coordinator: FamilySafetyDataUpdateCoordinator,
+        entry: ConfigEntry,
+        account_id: str,
+        app_id: str,
+        app_name: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, entry, account_id)
+        self._app_id = app_id
+        self._app_name = app_name
+        self._attr_unique_id = app_usage_unique_id(entry.entry_id, account_id, app_id)
+        self._attr_name = f"{self._get_account_name()} {app_name} Usage"
+
+    def _app(self) -> dict[str, Any] | None:
+        for app in (self._get_account_data() or {}).get("applications", []):
+            if app.get("app_id") == self._app_id:
+                return app
+        return None
+
+    @property
+    def native_value(self) -> float | None:
+        """Return today's minutes; 0 for an app not listed today."""
+        if self._get_account_data() is None:
+            return None
+        app = self._app()
+        return (app or {}).get("usage_minutes", 0) or 0
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the app."""
+        app = self._app() or {}
         return {
-            "blocked_count": len(blocked_apps),
-            "applications": applications,
+            ATTR_USER_ID: self._account_id,
+            "app_id": self._app_id,
+            "app_name": app.get("app_name") or self._app_name,
+            "blocked": app.get("blocked"),
         }
 
 
