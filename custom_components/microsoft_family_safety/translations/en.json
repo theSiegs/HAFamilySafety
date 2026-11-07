@@ -99,6 +99,20 @@
     }
   },
   "services": {
+    "probe_xbox_token": {
+      "name": "Probe Xbox token (diagnostic)",
+      "description": "Administrators only. Checks whether the stored Microsoft sign-in can also get an Xbox Live token, without changing anything the integration uses. Answers with HTTP status codes, error codes, the granted scope and expiry only; no token, gamertag or Xbox user id is returned or logged. Refuses unless confirm_risk is true: see the README.",
+      "fields": {
+        "entry_id": {
+          "name": "Config entry",
+          "description": "The Microsoft Family Safety entry to use. Optional with a single entry."
+        },
+        "confirm_risk": {
+          "name": "Confirm the risk",
+          "description": "Must be true. Using the stored sign-in for another scope is not documented by Microsoft for this sign-in type; in the worst case the integration would need a new sign-in."
+        }
+      }
+    },
     "block_app": {
       "name": "Block Application",
       "description": "Block an application for a child account.",

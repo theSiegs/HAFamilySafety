@@ -46,6 +46,7 @@ from .const import (
     SERVICE_GET_SITES,
     SERVICE_ADD_TIME_BONUS,
     SERVICE_CANCEL_TIME_BONUS,
+    SERVICE_PROBE_XBOX_TOKEN,
     CONF_ALLOWED_USERS,
 )
 from .coordinator import FamilySafetyDataUpdateCoordinator
@@ -167,6 +168,11 @@ SERVICE_ADD_TIME_BONUS_SCHEMA = child_schema({
 
 SERVICE_CANCEL_TIME_BONUS_SCHEMA = child_schema({
     vol.Required("platform"): vol.In(["Windows", "Xbox"]),
+})
+
+SERVICE_PROBE_XBOX_TOKEN_SCHEMA = vol.Schema({
+    vol.Optional("entry_id"): cv.string,
+    vol.Optional("confirm_risk", default=False): cv.boolean,
 })
 
 SERVICE_SYNC_SITE_LIST_SCHEMA = child_schema({
@@ -416,6 +422,34 @@ def _register_services(hass: HomeAssistant) -> None:
                 SupportsResponse.OPTIONAL if responds else SupportsResponse.NONE
             ),
         )
+
+
+    async def probe_xbox_token(call: ServiceCall) -> dict:
+        """Administrators only: never per child, the entry's own sign-in."""
+        await async_require_admin(hass, call)
+        coordinators = {
+            entry_id: c for entry_id, c in hass.data.get(DOMAIN, {}).items()
+            if isinstance(c, FamilySafetyDataUpdateCoordinator)
+        }
+        entry_id = call.data.get("entry_id")
+        if entry_id is not None:
+            coordinator = coordinators.get(entry_id)
+            if coordinator is None:
+                raise ServiceValidationError(f"No loaded Microsoft Family Safety entry {entry_id}.")
+        elif len(coordinators) == 1:
+            coordinator = next(iter(coordinators.values()))
+        else:
+            raise ServiceValidationError(
+                "Give entry_id: there is not exactly one Microsoft Family Safety entry."
+            )
+        return await coordinator.async_probe_xbox_token(call.data["confirm_risk"])
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_PROBE_XBOX_TOKEN,
+        guard_service(hass, probe_xbox_token),
+        schema=SERVICE_PROBE_XBOX_TOKEN_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
+    )
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

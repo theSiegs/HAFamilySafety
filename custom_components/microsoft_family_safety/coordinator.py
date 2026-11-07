@@ -35,6 +35,7 @@ from ._pyfamilysafety_compat import apply_patches, is_stale_roster_error
 from .api_client import FamilySafetyWebAPI
 from .app_pause import AppPauser
 from .xbox_mobile_lock import XboxMobileLockMixin
+from .xbox_token_probe import async_probe_xbox_token
 from .app_usage import EVENT_APP_USAGE, AppUsageGrowthTracker
 from . import site_sync
 from .auth.addon_client import AddonCookieClient
@@ -3291,6 +3292,47 @@ class FamilySafetyDataUpdateCoordinator(
             },
         )
         self._roster_notification_sent = True
+
+    async def async_probe_xbox_token(self, confirm_risk: bool = False) -> dict[str, Any]:
+        """probe_xbox_token: can the stored mobile sign-in reach Xbox Live?
+
+        Uses the refresh token the integration holds, in place, and never
+        stores what Microsoft answers (xbox_token_probe.py). The Family token
+        refresh is held off meanwhile, so the stored token cannot rotate under
+        the probe. Afterwards one normal Family refresh checks that the stored
+        token still works.
+        """
+        if not confirm_risk:
+            raise ServiceValidationError(
+                "probe_xbox_token uses the stored Microsoft sign-in for another scope. "
+                "Microsoft does not document whether that endpoint revokes the old "
+                "refresh token on use; if it did, the integration would need a new "
+                "sign-in. Call it again with confirm_risk: true to accept that."
+            )
+        if self.api is None:
+            raise HomeAssistantError("The Microsoft API is not ready yet.")
+        authenticator = self.api.api.authenticator
+        async with authenticator._login_lock:
+            stored = authenticator.refresh_token
+            if not stored:
+                raise HomeAssistantError("No mobile refresh token is stored.")
+            result = await async_probe_xbox_token(async_get_clientsession(self.hass), stored)
+            result["stored_refresh_token_unchanged"] = authenticator.refresh_token == stored
+        check: dict[str, Any] = {}
+        try:
+            await authenticator.perform_refresh()
+        except Exception as err:  # noqa: BLE001 - reported, not raised
+            check = {"ok": False, "error": type(err).__name__}
+            _LOGGER.warning(
+                "The Family token refresh after probe_xbox_token failed (%s): the "
+                "integration may need a new sign-in", type(err).__name__,
+            )
+        else:
+            check = {"ok": True}
+            await self._async_persist_current_auth()
+        result["family_refresh_after"] = check
+        result["entry_id"] = self.entry.entry_id
+        return result
 
     async def async_cleanup(self) -> None:
         self._cancel_all_mobile_restores()
