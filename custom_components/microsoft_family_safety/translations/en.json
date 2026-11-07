@@ -494,6 +494,42 @@
           "description": "Remove every site this list added for the child and forget the list."
         }
       }
+    },
+    "pause_app": {
+      "name": "Pause App",
+      "description": "Block Windows or Xbox apps of a child for now, saving whether each was blocked before its first pause; resume_app puts that back. A repeat pause keeps the first saved state, also after a restart. An app already blocked is skipped and left alone. Answers with the apps paused and skipped.",
+      "fields": {
+        "account_id": {
+          "name": "Account ID",
+          "description": "The user ID of the child account. Give this or an entity of the child."
+        },
+        "entity_id": {
+          "name": "Child entity",
+          "description": "Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID."
+        },
+        "apps": {
+          "name": "Apps",
+          "description": "App ids as the app switches and the apps attribute show them (x:... for Xbox, appx:... or win32:... for Windows). packages is accepted too."
+        }
+      }
+    },
+    "resume_app": {
+      "name": "Resume App",
+      "description": "Unblock the apps pause_app blocked and forget their saved state. Without apps, every paused app of the child. Answers with the apps resumed and skipped.",
+      "fields": {
+        "account_id": {
+          "name": "Account ID",
+          "description": "The user ID of the child account. Give this or an entity of the child."
+        },
+        "entity_id": {
+          "name": "Child entity",
+          "description": "Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID."
+        },
+        "apps": {
+          "name": "Apps",
+          "description": "App ids to resume; leave empty for every paused app of the child."
+        }
+      }
     }
   },
   "issues": {

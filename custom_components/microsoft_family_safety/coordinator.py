@@ -33,6 +33,7 @@ from homeassistant.util import dt as dt_util
 
 from ._pyfamilysafety_compat import apply_patches, is_stale_roster_error
 from .api_client import FamilySafetyWebAPI
+from .app_pause import AppPauser
 from .app_usage import EVENT_APP_USAGE, AppUsageGrowthTracker
 from . import site_sync
 from .auth.addon_client import AddonCookieClient
@@ -243,6 +244,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             hass, STORAGE_VERSION, f"{DOMAIN}.site_sync.{entry.entry_id}"
         )
         self._site_sync_lock = asyncio.Lock()
+        self.app_pauser = AppPauser(hass, entry.entry_id)
         self._strict_mode = bool(entry.options.get(CONF_STRICT_MODE, DEFAULT_STRICT_MODE))
         #: How many of each child's most used apps get a usage sensor; 0 = off.
         self.app_usage_sensors = int(
@@ -569,6 +571,16 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return account.get_application(app_id)
         except (IndexError, ValueError):
             return None
+
+    async def async_pause_app(self, account_id: str, apps: list[str]) -> dict[str, Any]:
+        """Block apps, saving each one's state before its first pause (app_pause.py)."""
+        return await self.app_pauser.async_pause(self, account_id, apps)
+
+    async def async_resume_app(
+        self, account_id: str, apps: list[str] | None = None
+    ) -> dict[str, Any]:
+        """Put back what pause_app saved (every paused app of the child by default)."""
+        return await self.app_pauser.async_resume(self, account_id, apps)
 
     async def async_block_app(self, account_id: str, app_id: str) -> None:
         """Block an application."""
