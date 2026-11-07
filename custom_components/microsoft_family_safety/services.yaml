@@ -407,7 +407,7 @@ block_website:
           integration: microsoft_family_safety
     website:
       name: Website
-      description: The domain to block (e.g., "example.com").
+      description: The domain to block (e.g., "example.com"), or a list of domains.
       required: true
       selector:
         text:
@@ -431,7 +431,7 @@ allow_website:
           integration: microsoft_family_safety
     website:
       name: Website
-      description: The domain to allow (e.g., "example.com").
+      description: The domain to allow (e.g., "example.com"), or a list of domains.
       required: true
       selector:
         text:
@@ -455,7 +455,7 @@ remove_website:
           integration: microsoft_family_safety
     website:
       name: Website
-      description: The domain to remove.
+      description: The domain to remove, or a list of domains.
       required: true
       selector:
         text:

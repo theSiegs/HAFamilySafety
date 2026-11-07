@@ -118,12 +118,15 @@ SERVICE_REMOVE_APP_TIME_LIMIT_SCHEMA = child_schema({
     vol.Optional("platform", default="windows"): vol.In(["windows", "xbox", "mobile"]),
 })
 
+# One site, or several (a list) applied one after the other.
+_WEBSITES = vol.All(cv.ensure_list, [cv.string], vol.Length(min=1))
+
 SERVICE_BLOCK_WEBSITE_SCHEMA = child_schema({
-    vol.Required("website"): cv.string,
+    vol.Required("website"): _WEBSITES,
 })
 
 SERVICE_REMOVE_WEBSITE_SCHEMA = child_schema({
-    vol.Required("website"): cv.string,
+    vol.Required("website"): _WEBSITES,
 })
 
 SERVICE_TOGGLE_WEB_FILTER_SCHEMA = child_schema({

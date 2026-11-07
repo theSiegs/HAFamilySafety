@@ -343,7 +343,7 @@
         },
         "website": {
           "name": "Website",
-          "description": "The domain to block."
+          "description": "The domain to block, or a list of domains."
         }
       }
     },
@@ -361,7 +361,7 @@
         },
         "website": {
           "name": "Website",
-          "description": "The domain to remove."
+          "description": "The domain to remove, or a list of domains."
         }
       }
     },
@@ -465,7 +465,7 @@
         },
         "website": {
           "name": "Website",
-          "description": "The domain to allow."
+          "description": "The domain to allow, or a list of domains."
         }
       }
     }

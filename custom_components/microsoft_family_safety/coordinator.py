@@ -1380,28 +1380,44 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.async_update_listeners()
         await self.async_request_refresh()
 
-    async def async_block_website(self, child_id: str, website: str) -> None:
+    async def _async_change_websites(
+        self, method: str, child_id: str, websites: str | list[str]
+    ) -> None:
+        """Send one website change per site (each is its own PATCH)."""
         if not self.web_api:
             raise RuntimeError("Web API not initialized")
-        await self.web_api.block_website(child_id, website)
+        sites = [websites] if isinstance(websites, str) else list(websites)
+        for site in dict.fromkeys(s.strip() for s in sites if s and s.strip()):
+            await getattr(self.web_api, method)(child_id, site)
         await self.async_request_refresh()
 
-    async def async_remove_website(self, child_id: str, website: str) -> None:
-        if not self.web_api:
-            raise RuntimeError("Web API not initialized")
-        await self.web_api.remove_website(child_id, website)
-        await self.async_request_refresh()
+    async def async_block_website(self, child_id: str, website: str | list[str]) -> None:
+        await self._async_change_websites("block_website", child_id, website)
 
-    async def async_allow_website(self, child_id: str, website: str) -> None:
-        if not self.web_api:
-            raise RuntimeError("Web API not initialized")
-        await self.web_api.allow_website(child_id, website)
-        await self.async_request_refresh()
+    async def async_remove_website(self, child_id: str, website: str | list[str]) -> None:
+        await self._async_change_websites("remove_website", child_id, website)
+
+    async def async_allow_website(self, child_id: str, website: str | list[str]) -> None:
+        await self._async_change_websites("allow_website", child_id, website)
+
+    def web_filter_enabled(self, account_id: Any) -> bool | None:
+        """Whether the child's web filter (Microsoft Edge) is on; None if unknown."""
+        account = ((self.data or {}).get("accounts") or {}).get(account_id) or {}
+        web = account.get("web_browsing")
+        if not isinstance(web, dict):
+            return None
+        value = web.get("enabled", web.get("isEnabled", web.get("IsEnabled")))
+        return value if isinstance(value, bool) else None
 
     async def async_toggle_web_filter(self, child_id: str, enabled: bool) -> None:
         if not self.web_api:
             raise RuntimeError("Web API not initialized")
         await self.web_api.toggle_web_filter(child_id, enabled)
+        # Show the new state at once; the next read confirms it.
+        account = ((self.data or {}).get("accounts") or {}).get(child_id)
+        if isinstance(account, dict) and isinstance(account.get("web_browsing"), dict):
+            account["web_browsing"] = {**account["web_browsing"], "enabled": bool(enabled)}
+            self.async_update_listeners()
         await self.async_request_refresh()
 
     async def async_set_age_rating(self, child_id: str, age: int) -> None:
