@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 from homeassistant import data_entry_flow
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.util import dt as dt_util
 
 from custom_components.microsoft_family_safety import xbox_sisu as sisu
 from custom_components.microsoft_family_safety.const import (
@@ -39,6 +40,7 @@ from .xbox_fakes import (
     PATCH_SESSION,
     SECRETS,
     SISU_AUTH,
+    USER_CODE,
     XboxServer,
     hours as _hours,
     make_rig,
@@ -264,7 +266,9 @@ SETUP = "custom_components.microsoft_family_safety.async_setup_entry"
 INIT_FORM = {"update_interval": 300, "platforms": ["Windows"]}
 
 
-async def _to_the_sign_in_page(hass, entry) -> tuple[dict, str]:
+async def _to_the_sign_in_page(hass, entry, server) -> tuple[dict, str]:
+    """The pasted-address page (Microsoft refusing the code sign-in here)."""
+    server.device_code_status = 400
     result = await hass.config_entries.options.async_init(entry.entry_id)
     assert result["step_id"] == "init"
     result = await hass.config_entries.options.async_configure(
@@ -294,7 +298,7 @@ async def test_the_options_flow_signs_in(hass, server, hass_storage):
     )
     entry.add_to_hass(hass)
     with patch(SETUP, return_value=True):
-        result, state = await _to_the_sign_in_page(hass, entry)
+        result, state = await _to_the_sign_in_page(hass, entry, server)
 
         bad = await hass.config_entries.options.async_configure(
             result["flow_id"], {"redirect_url": "https://login.live.com/oauth20_desktop.srf?code=x&state=nope"},
@@ -327,7 +331,7 @@ async def test_the_flow_checks_the_sign_in_and_offers_xapprove(hass, server, has
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coord
     _expired_issue(hass, entry)
     with patch(SETUP, return_value=True):
-        result, state = await _to_the_sign_in_page(hass, entry)
+        result, state = await _to_the_sign_in_page(hass, entry, server)
         checked = await hass.config_entries.options.async_configure(result["flow_id"], _landed(state))
         assert checked["step_id"] == "xbox_signin_works"
         # The box is ticked for the user.
@@ -353,7 +357,7 @@ async def test_the_flow_says_when_xbox_refuses(hass, server, hass_storage):
     coord._xuids[CHILD] = (CHILD_XUID, "family_name")  # no family read needed
     server.accepts = lambda headers: False
     with patch(SETUP, return_value=True):
-        result, state = await _to_the_sign_in_page(hass, entry)
+        result, state = await _to_the_sign_in_page(hass, entry, server)
         checked = await hass.config_entries.options.async_configure(result["flow_id"], _landed(state))
         assert checked["step_id"] == "xbox_signin_refused"
         assert checked["description_placeholders"]["reason"] == "HTTP 401"
@@ -370,7 +374,7 @@ async def test_an_expired_code_and_a_pasted_link_say_what_to_do(hass, server, ha
     entry = MockConfigEntry(domain=DOMAIN, data={"refresh_token": "x"})
     entry.add_to_hass(hass)
     with patch(SETUP, return_value=True):
-        result, state = await _to_the_sign_in_page(hass, entry)
+        result, state = await _to_the_sign_in_page(hass, entry, server)
         server.code_dead = True
         expired = await hass.config_entries.options.async_configure(result["flow_id"], _landed(state))
         assert expired["errors"] == {"base": "code_expired"}
@@ -390,16 +394,16 @@ async def test_a_closed_dialog_keeps_the_link(hass, server, hass_storage):
     entry = MockConfigEntry(domain=DOMAIN, data={"refresh_token": "x"})
     entry.add_to_hass(hass)
     with patch(SETUP, return_value=True):
-        first, state = await _to_the_sign_in_page(hass, entry)
+        first, state = await _to_the_sign_in_page(hass, entry, server)
         hass.config_entries.options.async_abort(first["flow_id"])
         # Opened again: the same link, so the address copied from it works.
-        second, again = await _to_the_sign_in_page(hass, entry)
+        second, again = await _to_the_sign_in_page(hass, entry, server)
         assert again == state
         checked = await hass.config_entries.options.async_configure(second["flow_id"], _landed(state))
         assert checked["step_id"] == "xbox_signin_unchecked"
         hass.config_entries.options.async_abort(second["flow_id"])
         # After a sign-in the next link is a new one.
-        third, fresh = await _to_the_sign_in_page(hass, entry)
+        third, fresh = await _to_the_sign_in_page(hass, entry, server)
         assert fresh != state
         hass.config_entries.options.async_abort(third["flow_id"])
 
@@ -430,3 +434,137 @@ async def test_the_options_page_shows_the_sign_in(hass, server, hass_storage):
         )
     assert CONF_XBOX_SIGNED_IN_AT not in entry.options
     assert ir.async_get(hass).async_get_issue(DOMAIN, f"xbox_signin_expired_{entry.entry_id}") is None
+
+
+
+# The code sign-in (microsoft.com/link) -------------------------------------------
+
+
+async def test_the_device_code_is_asked_for_the_xbox_client(server):
+    code = await sisu.async_start_device_code(server)
+    assert code.user_code == USER_CODE
+    assert code.verification_uri == "https://www.microsoft.com/link"
+    assert code.expires_at > dt_util.utcnow() + timedelta(minutes=14)
+    assert "device-code-SECRET" not in repr(code)
+
+
+async def test_polling_waits_then_signs_in(server):
+    server.device_polls = ["authorization_pending", "slow_down", "ok"]
+    code = await sisu.async_start_device_code(server)
+    slept: list[float] = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    signed = await sisu.async_wait_for_device_code(server, code, sleep)
+
+    assert slept == [0, 5]  # slow_down adds 5 seconds
+    assert signed.credential["refresh_token"] == "sisu-refresh-2"
+    assert signed.tokens.header() == SISU_AUTH
+    assert server.sisu_calls == [
+        "device_code", "device_poll:authorization_pending", "device_poll:slow_down",
+        "device_poll:ok", "device", "authorize",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("answer", "error"),
+    [("expired_token", sisu.DeviceCodeExpired), ("access_denied", sisu.DeviceCodeDeclined),
+     ("authorization_declined", sisu.DeviceCodeDeclined)],
+)
+async def test_polling_stops_on_expiry_or_refusal(server, answer, error):
+    server.device_polls = [answer]
+    code = await sisu.async_start_device_code(server)
+    with pytest.raises(error):
+        await sisu.async_wait_for_device_code(server, code)
+
+
+async def test_a_code_past_its_time_expires_even_while_pending(server):
+    server.device_polls = []  # pending forever
+    code = await sisu.async_start_device_code(server)
+    code.expires_at = dt_util.utcnow() - timedelta(seconds=1)
+    with pytest.raises(sisu.DeviceCodeExpired):
+        await sisu.async_wait_for_device_code(server, code)
+
+
+@pytest.mark.parametrize("error", ["unsupported_response_type", "invalid_client"])
+async def test_a_refused_device_code_request_is_unavailable(server, error):
+    server.device_code_status = 400
+    server.device_code_error = error
+    with pytest.raises(sisu.DeviceCodeUnavailable) as raised:
+        await sisu.async_start_device_code(server)
+    assert raised.value.reason == error
+
+
+def test_the_erased_address_is_recognised():
+    with pytest.raises(ValueError, match="removed_address"):
+        sisu.code_from_redirect("https://login.live.com/oauth20_desktop.srf?removed=true", "s1")
+    with pytest.raises(ValueError, match="removed_address"):
+        sisu.code_from_redirect("login.live.com/oauth20_desktop.srf?removed=true&lc=1033", "s1")
+
+
+async def _start_sign_in(hass, entry):
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    return await hass.config_entries.options.async_configure(
+        result["flow_id"], {**INIT_FORM, "xbox_sign_in": True},
+    )
+
+
+async def test_the_flow_signs_in_with_a_code(hass, server, hass_storage):
+    coord, entry = await make_rig(hass, server, {CONF_XBOX_XAPPROVE: False}, signed_in=False)
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coord
+    server.device_polls = ["authorization_pending", "ok"]
+    with patch(SETUP, return_value=True):
+        progress = await _start_sign_in(hass, entry)
+        assert progress["type"] == data_entry_flow.FlowResultType.SHOW_PROGRESS
+        assert progress["step_id"] == "xbox_signin_code"
+        assert progress["description_placeholders"] == {
+            "code": USER_CODE, "url": "https://www.microsoft.com/link",
+        }
+        await hass.async_block_till_done()
+        checked = await hass.config_entries.options.async_configure(progress["flow_id"])
+        assert checked["step_id"] == "xbox_signin_works"
+        done = await hass.config_entries.options.async_configure(
+            progress["flow_id"], {CONF_XBOX_XAPPROVE: True},
+        )
+    assert done["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert entry.options[CONF_XBOX_XAPPROVE] is True and entry.options[CONF_XBOX_SIGNED_IN_AT]
+    assert hass_storage[f"{DOMAIN}.xbox_signin.{entry.entry_id}"]["data"]["refresh_token"] == "sisu-refresh-2"
+    assert "device-code-SECRET" not in json.dumps(dict(entry.options))
+
+
+async def test_a_refused_code_sign_in_falls_back_to_the_address(hass, server, hass_storage):
+    entry = MockConfigEntry(domain=DOMAIN, data={"refresh_token": "x"})
+    entry.add_to_hass(hass)
+    server.device_code_status = 400
+    server.device_code_error = "unsupported_response_type"
+    with patch(SETUP, return_value=True):
+        page = await _start_sign_in(hass, entry)
+        assert page["step_id"] == "xbox_signin"
+        why = page["description_placeholders"]["why"]
+        assert "does not offer it" in why and "unsupported_response_type" in why
+        erased = await hass.config_entries.options.async_configure(
+            page["flow_id"],
+            {"redirect_url": "https://login.live.com/oauth20_desktop.srf?removed=true"},
+        )
+        assert erased["errors"] == {"base": "removed_address"}
+        hass.config_entries.options.async_abort(page["flow_id"])
+
+
+async def test_an_expired_code_offers_a_new_one_or_the_address(hass, server, hass_storage):
+    entry = MockConfigEntry(domain=DOMAIN, data={"refresh_token": "x"})
+    entry.add_to_hass(hass)
+    server.device_polls = ["expired_token"]
+    with patch(SETUP, return_value=True):
+        progress = await _start_sign_in(hass, entry)
+        await hass.async_block_till_done()
+        failed = await hass.config_entries.options.async_configure(progress["flow_id"])
+        assert failed["step_id"] == "xbox_signin_code_failed"
+        assert "expired" in failed["description_placeholders"]["reason"]
+        pasted = await hass.config_entries.options.async_configure(
+            progress["flow_id"], {"next": "paste"},
+        )
+        assert pasted["step_id"] == "xbox_signin"
+        assert "you chose" in pasted["description_placeholders"]["why"]
+        hass.config_entries.options.async_abort(progress["flow_id"])
+    assert f"{DOMAIN}.xbox_signin.{entry.entry_id}" not in hass_storage

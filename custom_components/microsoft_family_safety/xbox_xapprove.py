@@ -331,7 +331,7 @@ class XboxXapproveMixin:
         return state if isinstance(state, dict) else None
 
     def _xbox_current_override(self, account: dict[str, Any]) -> dict[str, Any] | None:
-        """The Xbox override in force: xapprove's read first, else the web policy."""
+        """The Xbox override in force, as xapprove last read it; None before a read."""
         state = account.get("xbox_xapprove")
         if isinstance(state, dict):
             return _plain(state)
@@ -587,7 +587,8 @@ class XboxXapproveMixin:
                 }
             restore = active_until(prior)
             if restore is not None and prior.get("type") == BLOCK_UNTIL:
-                # A web lock of ours had extended a parent's earlier block: it comes back.
+                # A hold saved by an older version (its web lock extended a parent's
+                # earlier block): that block comes back. New holds never carry one.
                 after = await self._async_xapprove_put(xuid, OVERRIDE_BLOCK, restore, current)
                 applied: Any = make_override(BLOCK_UNTIL, restore)
             else:

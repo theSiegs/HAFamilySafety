@@ -1,6 +1,7 @@
 """Config flow for Microsoft Family Safety integration."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 import time
@@ -14,7 +15,7 @@ from yarl import URL
 from homeassistant import config_entries
 from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_RECONFIGURE
 import homeassistant.helpers.config_validation as cv
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
@@ -1481,6 +1482,14 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
         self._xbox_pkce: tuple[str, str, str] | None = None
         #: The in-flow check of a new Xbox sign-in: {"outcome", "reason"}.
         self._xbox_check: dict[str, str] = {}
+        #: The device-code sign-in in progress: its code and the polling task.
+        self._xbox_device: xbox_sisu.DeviceCode | None = None
+        self._xbox_device_task: asyncio.Task | None = None
+        self._xbox_signed: xbox_sisu.SignIn | None = None
+        #: Why the code sign-in did not finish (shown on its "failed" page).
+        self._xbox_code_failure = ""
+        #: Why the pasted-address page is shown instead of the code (or "").
+        self._xbox_paste_why = ""
 
     def _xbox_signin_store(self) -> Store:
         return Store(self.hass, 1, f"{XBOX_SIGNIN_STORAGE_KEY}.{self._config_entry.entry_id}")
@@ -1548,7 +1557,9 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
                 )
             elif sign_in:
                 self._pending_data = data
-                return await self.async_step_xbox_signin()
+                # The code sign-in (microsoft.com/link) first; the pasted
+                # address only when Microsoft does not offer it.
+                return await self.async_step_xbox_signin_code()
             return self.async_create_entry(title="", data=data)
         current_interval = self._config_entry.options.get(
             CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL
@@ -1642,7 +1653,10 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
                 code, _, detail = str(err).partition(":")
                 errors["base"] = (
                     code
-                    if code in ("invalid_redirect", "state_mismatch", "signin_error", "pasted_link")
+                    if code in (
+                        "invalid_redirect", "state_mismatch", "signin_error", "pasted_link",
+                        "removed_address",
+                    )
                     else "invalid_redirect"
                 )
             except XapproveError as err:
@@ -1653,30 +1667,129 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
                     errors["base"] = "xbox_signin_failed"
                 detail = str(err)[:200]
             else:
-                entry_id = self._config_entry.entry_id
-                await self._xbox_signin_store().async_save(sign_in.credential)
-                (self.hass.data.get(_XBOX_PKCE_KEY) or {}).pop(entry_id, None)
-                ir.async_delete_issue(self.hass, DOMAIN, f"{XBOX_SIGNIN_EXPIRED_ISSUE}_{entry_id}")
-                self._pending_data[CONF_XBOX_SIGNED_IN_AT] = dt_util.utcnow().isoformat()
-                coordinator = (self.hass.data.get(DOMAIN) or {}).get(entry_id)
-                if coordinator is None or not hasattr(coordinator, "async_check_xbox_signin"):
-                    self._xbox_check = {
-                        "outcome": "unchecked", "reason": "the integration is not running",
-                    }
-                else:
-                    self._xbox_check = await coordinator.async_check_xbox_signin(sign_in)
-                if self._xbox_check.get("outcome") == "works":
-                    # The way probe_xapprove would have saved.
-                    await Store(self.hass, 1, f"{DOMAIN}.xapprove.{entry_id}").async_save(
-                        {"method": "sisu", "found": dt_util.utcnow().isoformat()}
-                    )
-                return await self._async_step_xbox_signin_result()
+                (self.hass.data.get(_XBOX_PKCE_KEY) or {}).pop(self._config_entry.entry_id, None)
+                return await self._async_finish_xbox_sign_in(sign_in)
+        why = (
+            f"The code sign-in could not be used: {self._xbox_paste_why}. Sign in this way instead.\n\n"
+            if self._xbox_paste_why else ""
+        )
         return self.async_show_form(
             step_id="xbox_signin",
             data_schema=vol.Schema({vol.Required("redirect_url"): cv.string}),
             errors=errors,
-            description_placeholders={"url": url, "detail": detail},
+            description_placeholders={"url": url, "detail": detail, "why": why},
         )
+
+    async def _async_finish_xbox_sign_in(self, sign_in: xbox_sisu.SignIn) -> FlowResult:
+        """Save a new Xbox sign-in, check it, and show what the check found."""
+        entry_id = self._config_entry.entry_id
+        await self._xbox_signin_store().async_save(sign_in.credential)
+        ir.async_delete_issue(self.hass, DOMAIN, f"{XBOX_SIGNIN_EXPIRED_ISSUE}_{entry_id}")
+        self._pending_data[CONF_XBOX_SIGNED_IN_AT] = dt_util.utcnow().isoformat()
+        coordinator = (self.hass.data.get(DOMAIN) or {}).get(entry_id)
+        if coordinator is None or not hasattr(coordinator, "async_check_xbox_signin"):
+            self._xbox_check = {
+                "outcome": "unchecked", "reason": "the integration is not running",
+            }
+        else:
+            self._xbox_check = await coordinator.async_check_xbox_signin(sign_in)
+        if self._xbox_check.get("outcome") == "works":
+            # The way probe_xapprove would have saved.
+            await Store(self.hass, 1, f"{DOMAIN}.xapprove.{entry_id}").async_save(
+                {"method": "sisu", "found": dt_util.utcnow().isoformat()}
+            )
+        return await self._async_step_xbox_signin_result()
+
+    # -- The code sign-in (microsoft.com/link) -------------------------------
+
+    async def async_step_xbox_signin_code(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Show a code to enter at microsoft.com/link, and wait for the sign-in.
+
+        Falls back to the pasted-address page when Microsoft does not offer the
+        code sign-in for the Xbox Family Settings client.
+        """
+        session = async_get_clientsession(self.hass)
+        started = False
+        if self._xbox_device_task is None:
+            try:
+                self._xbox_device = await xbox_sisu.async_start_device_code(session)
+            except xbox_sisu.DeviceCodeUnavailable as err:
+                _LOGGER.info("Xbox sign-in: no code sign-in (%s); asking for the address", err.reason)
+                self._xbox_paste_why = f"Microsoft does not offer it for this sign-in ({err.reason})"
+                return await self.async_step_xbox_signin()
+            except XapproveError as err:
+                self._xbox_paste_why = f"it could not start ({err})"
+                return await self.async_step_xbox_signin()
+            self._xbox_device_task = self.hass.async_create_task(
+                xbox_sisu.async_wait_for_device_code(session, self._xbox_device),
+                "microsoft_family_safety xbox code sign-in",
+            )
+            started = True
+        task = self._xbox_device_task
+        # The progress page is always shown once (the task may already be
+        # done: tasks start eagerly); the flow manager comes back when it is.
+        if started or not task.done():
+            device = self._xbox_device
+            return self.async_show_progress(
+                step_id="xbox_signin_code",
+                progress_action="xbox_device_code",
+                description_placeholders={
+                    "code": device.user_code if device else "",
+                    "url": device.verification_uri if device else "",
+                },
+                progress_task=task,
+            )
+        self._xbox_device_task = None
+        self._xbox_device = None
+        try:
+            self._xbox_signed = task.result()
+        except xbox_sisu.DeviceCodeExpired:
+            self._xbox_code_failure = "the code expired before the sign-in was finished"
+        except xbox_sisu.DeviceCodeDeclined as err:
+            self._xbox_code_failure = f"the sign-in was declined ({err.reason})"
+        except XapproveError as err:
+            self._xbox_code_failure = f"Xbox Live refused the sign-in ({str(err)[:200]})"
+        except Exception as err:  # noqa: BLE001 - shown, the flow goes on
+            self._xbox_code_failure = type(err).__name__
+        else:
+            return self.async_show_progress_done(next_step_id="xbox_signin_save")
+        return self.async_show_progress_done(next_step_id="xbox_signin_code_failed")
+
+    async def async_step_xbox_signin_save(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        signed, self._xbox_signed = self._xbox_signed, None
+        if signed is None:
+            return await self.async_step_xbox_signin_code()
+        return await self._async_finish_xbox_sign_in(signed)
+
+    async def async_step_xbox_signin_code_failed(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """The code sign-in did not finish: a new code, or the pasted address."""
+        if user_input is not None:
+            if user_input.get("next") == "paste":
+                self._xbox_paste_why = "you chose to paste the address"
+                return await self.async_step_xbox_signin()
+            return await self.async_step_xbox_signin_code()
+        return self.async_show_form(
+            step_id="xbox_signin_code_failed",
+            data_schema=vol.Schema({
+                vol.Required("next", default="code"): vol.In({
+                    "code": "Get a new code",
+                    "paste": "Sign in by pasting the address instead",
+                }),
+            }),
+            description_placeholders={"reason": self._xbox_code_failure or "-"},
+        )
+
+    @callback
+    def async_remove(self) -> None:
+        """The dialog was closed: stop waiting for the code."""
+        if self._xbox_device_task is not None and not self._xbox_device_task.done():
+            self._xbox_device_task.cancel()
 
     async def _async_step_xbox_signin_result(
         self, user_input: dict[str, Any] | None = None

@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import hashlib
 import json
@@ -79,6 +79,9 @@ AUTHORIZE_URL = "https://login.live.com/oauth20_authorize.srf"
 TOKEN_URL = "https://login.live.com/oauth20_token.srf"
 DEVICE_URL = "https://device.auth.xboxlive.com/device/authenticate"
 SISU_AUTHORIZE_URL = "https://sisu.xboxlive.com/authorize"
+#: The device-code sign-in ("go to microsoft.com/link and enter ABCD-1234").
+DEVICE_CODE_URL = "https://login.live.com/oauth20_connect.srf"
+GRANT_DEVICE_CODE = "urn:ietf:params:oauth:grant-type:device_code"
 RELYING_PARTY = "http://xboxlive.com"
 
 SIGNATURE_VERSION = 1
@@ -144,6 +147,11 @@ def code_from_redirect(url: str, state: str) -> str:
         raise ValueError(f"signin_error:{query['error'][0]}")
     if parts.netloc.lower() == "login.live.com" and parts.path.endswith("oauth20_authorize.srf"):
         raise ValueError("pasted_link")
+    if "removed" in query and not query.get("code"):
+        # The blank page replaces its own address with "?removed=true" once
+        # it has loaded: the code has to be taken from the browser's network
+        # log instead of the address bar.
+        raise ValueError("removed_address")
     if parts.scheme != "https" or parts.netloc.lower() != "login.live.com" or not query.get("code"):
         raise ValueError("invalid_redirect")
     pasted_state = query.get("state", [None])[0]
@@ -499,13 +507,19 @@ class SignIn:
 async def async_sign_in(
     session: aiohttp.ClientSession, redirect: str, state: str, verifier: str
 ) -> SignIn:
-    """Options flow: code -> MSA tokens -> device token -> SISU authorize.
+    """Options flow, the pasted address: code -> MSA tokens -> device token
+    -> SISU authorize.
 
     Raises ValueError (bad redirect) or XapproveError (Microsoft refused a
     step; XboxSignInExpired when the code was expired or already used).
     """
     code = code_from_redirect(redirect, state)
     msa = await async_exchange_code(session, code, verifier)
+    return await async_finish_sign_in(session, msa)
+
+
+async def async_finish_sign_in(session: aiohttp.ClientSession, msa: MsaTokens) -> SignIn:
+    """MSA tokens of the Xbox Family Settings client -> device token -> SISU."""
     if not msa.refresh_token:
         raise XapproveError("sisu_msa_code: no refresh token in the answer")
     key = ProofKey.generate()
@@ -520,3 +534,134 @@ async def async_complete_sign_in(
 ) -> dict[str, Any]:
     """The credential to store (see async_sign_in)."""
     return (await async_sign_in(session, redirect, state, verifier)).credential
+
+
+# ----------------------------------------------------------------------
+# The device-code sign-in
+# ----------------------------------------------------------------------
+#
+# login.live.com's device-code grant: the user opens microsoft.com/link on any
+# device, enters a short code and signs in; meanwhile Home Assistant polls the
+# token endpoint. No address to copy. Whether Microsoft offers it for this
+# client id is not documented: a refusal (unsupported_response_type,
+# invalid_client, ...) is DeviceCodeUnavailable, and the options flow then
+# offers the pasted-address sign-in instead.
+
+
+class DeviceCodeUnavailable(XapproveError):
+    """Microsoft does not offer the device-code sign-in here; ``reason`` says why."""
+
+    def __init__(self, reason: str, status: int | None = None) -> None:
+        self.reason = reason
+        self.status = status
+        super().__init__(f"device code: {reason} (HTTP {status})")
+
+
+class DeviceCodeExpired(XapproveError):
+    """The code was not entered in time."""
+
+
+class DeviceCodeDeclined(XapproveError):
+    """The user declined, or Microsoft refused the sign-in at the code page."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"device code declined: {reason}")
+
+
+@dataclass
+class DeviceCode:
+    """What the user enters where; the device_code itself is never shown."""
+
+    device_code: str = field(repr=False)
+    user_code: str
+    verification_uri: str
+    expires_at: datetime
+    interval: float
+
+
+#: Errors of the device-code request that mean "not offered for this client".
+_DEVICE_CODE_UNSUPPORTED = (
+    "unsupported_response_type", "invalid_client", "unauthorized_client",
+    "invalid_scope", "invalid_request", "unsupported_grant_type",
+)
+
+
+async def async_start_device_code(session: aiohttp.ClientSession) -> DeviceCode:
+    """Ask login.live.com for a user code. DeviceCodeUnavailable if refused."""
+    status, payload, _headers = await _call(session, "POST", DEVICE_CODE_URL, data={
+        "client_id": CLIENT_ID,
+        "scope": SCOPE,
+        "response_type": "device_code",
+    })
+    if (
+        status == 200
+        and isinstance(payload, dict)
+        and isinstance(payload.get("device_code"), str)
+        and isinstance(payload.get("user_code"), str)
+    ):
+        expires_in = payload.get("expires_in")
+        interval = payload.get("interval")
+        return DeviceCode(
+            device_code=payload["device_code"],
+            user_code=payload["user_code"],
+            verification_uri=str(
+                payload.get("verification_uri") or "https://www.microsoft.com/link"
+            ),
+            expires_at=dt_util.utcnow() + timedelta(
+                seconds=int(expires_in) if isinstance(expires_in, (int, float)) else 900
+            ),
+            interval=float(interval) if isinstance(interval, (int, float)) else 5.0,
+        )
+    error = payload.get("error") if isinstance(payload, dict) and isinstance(payload.get("error"), str) else None
+    if status is not None and 400 <= status < 500:
+        raise DeviceCodeUnavailable(error or "refused", status)
+    if status == 200:
+        raise DeviceCodeUnavailable("no code in the answer", status)
+    raise XapproveError(f"device code: HTTP {status}")
+
+
+async def async_poll_device_code(session: aiohttp.ClientSession, code: DeviceCode) -> MsaTokens | None:
+    """One poll: the MSA tokens once the user has signed in, None while pending.
+
+    ``slow_down`` adds 5 seconds to ``code.interval``. Raises DeviceCodeExpired,
+    DeviceCodeDeclined, or XapproveError.
+    """
+    status, payload, _headers = await _call(session, "POST", TOKEN_URL, data={
+        "client_id": CLIENT_ID,
+        "grant_type": GRANT_DEVICE_CODE,
+        "device_code": code.device_code,
+    })
+    if status == 200 and isinstance(payload, dict) and isinstance(payload.get("access_token"), str):
+        expires = payload.get("expires_in")
+        return MsaTokens(
+            payload["access_token"],
+            payload.get("refresh_token") if isinstance(payload.get("refresh_token"), str) else None,
+            dt_util.utcnow() + timedelta(seconds=int(expires)) if isinstance(expires, int) else None,
+        )
+    error = payload.get("error") if isinstance(payload, dict) and isinstance(payload.get("error"), str) else None
+    if error == "authorization_pending":
+        return None
+    if error == "slow_down":
+        code.interval += 5
+        return None
+    if error in ("expired_token", "code_expired"):
+        raise DeviceCodeExpired("the code expired")
+    if error in ("access_denied", "authorization_declined", "bad_verification_code", "invalid_grant"):
+        raise DeviceCodeDeclined(error)
+    raise XapproveError(f"device code poll: HTTP {status}, {error}")
+
+
+async def async_wait_for_device_code(
+    session: aiohttp.ClientSession,
+    code: DeviceCode,
+    sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+) -> SignIn:
+    """Poll until the user has signed in, then finish the Xbox sign-in."""
+    while True:
+        msa = await async_poll_device_code(session, code)
+        if msa is not None:
+            return await async_finish_sign_in(session, msa)
+        if dt_util.utcnow() >= code.expires_at:
+            raise DeviceCodeExpired("the code expired")
+        await sleep(code.interval)

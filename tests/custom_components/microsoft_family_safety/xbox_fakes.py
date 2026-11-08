@@ -44,9 +44,11 @@ SISU_ACCESS = "sisu-access-SECRET"
 DEVICE_TOKEN = "device-token-SECRET"
 SISU_XSTS = "sisu-xsts-SECRET"
 SISU_AUTH = f"XBL3.0 x=4343;{SISU_XSTS}"
+DEVICE_CODE = "device-code-SECRET"
+USER_CODE = "ABCD-1234"
 SECRETS = (
     PARENT_XUID, CHILD_XUID, GAMERTAG, CODE, SISU_ACCESS, DEVICE_TOKEN, SISU_XSTS,
-    "sisu-refresh-", "title-SECRET", "sisu-user-SECRET",
+    "sisu-refresh-", "title-SECRET", "sisu-user-SECRET", DEVICE_CODE,
 )
 
 
@@ -110,6 +112,11 @@ class XboxServer:
         self.jwk: dict | None = None
         self.sisu_calls: list[str] = []
         self.sisu_authorize_status = 200
+        #: The device-code request: 200, or an error status (refused).
+        self.device_code_status = 200
+        self.device_code_error = "unsupported_response_type"
+        #: Answers to the device-code polls, in order: "ok" or an error code.
+        self.device_polls: list[str] = ["ok"]
 
     def state(self) -> dict:
         overrides = []
@@ -133,6 +140,30 @@ class XboxServer:
         self.calls.append((method, url))
         headers = kwargs.get("headers") or {}
         body = kwargs.get("data") if isinstance(kwargs.get("data"), bytes) else b""
+        if url == sisu.DEVICE_CODE_URL:
+            form = kwargs["data"]
+            assert form == {
+                "client_id": sisu.CLIENT_ID, "scope": sisu.SCOPE, "response_type": "device_code",
+            }
+            self.sisu_calls.append("device_code")
+            if self.device_code_status != 200:
+                return FakeResponse(self.device_code_status, {"error": self.device_code_error})
+            return FakeResponse(200, {
+                "device_code": DEVICE_CODE, "user_code": USER_CODE,
+                "verification_uri": "https://www.microsoft.com/link",
+                "expires_in": 900, "interval": 0,
+            })
+        if url == sisu.TOKEN_URL and kwargs["data"].get("grant_type") == sisu.GRANT_DEVICE_CODE:
+            form = kwargs["data"]
+            assert form["client_id"] == sisu.CLIENT_ID and form["device_code"] == DEVICE_CODE
+            answer = self.device_polls.pop(0) if self.device_polls else "authorization_pending"
+            self.sisu_calls.append(f"device_poll:{answer}")
+            if answer != "ok":
+                return FakeResponse(400, {"error": answer})
+            return FakeResponse(200, {
+                "token_type": "bearer", "expires_in": 3600, "scope": sisu.SCOPE,
+                "access_token": SISU_ACCESS, "refresh_token": self._rotate(),
+            })
         if url == sisu.TOKEN_URL:
             form = kwargs["data"]
             assert form["client_id"] == sisu.CLIENT_ID

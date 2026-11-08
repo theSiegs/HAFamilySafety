@@ -104,12 +104,12 @@
       },
       "xbox_signin": {
         "title": "Sign in to Xbox Family Settings",
-        "description": "Use the **parent** Microsoft account: the same one you sign in to Family Safety with, not a child's.\n\n1. Open [this sign-in link]({url}). It opens in a new tab or in your phone's browser. If that browser is already signed in to another Microsoft account, choose **Use another account**, or copy the link (long-press it on a phone) into a private or incognito window.\n2. Sign in with the parent account and accept if Microsoft asks for permission.\n3. You end on a **blank page**: that is expected. Copy its whole address from the address bar; it starts with https://login.live.com/oauth20_desktop.srf?code= . On a phone, tap the address bar, select all and copy, or use the browser's Share > Copy link.\n4. Come back to this page, paste the address below and submit within a few minutes: the code in it expires soon.\n\nClosed this page by mistake? Open Configure and tick the sign-in again within 10 minutes: the same link, and an address you already copied, still work.",
+        "description": "{why}Use the **parent** Microsoft account: the same one you sign in to Family Safety with, not a child's. This way needs a **computer** with Chrome, Edge or Firefox: the page you end on erases its own address (it becomes ...oauth20_desktop.srf?removed=true as soon as it has loaded), so the address has to be copied from the browser's network log, not from the address bar.\n\n1. Open a new private or incognito window and press **F12** to open the developer tools. Go to the **Network** tab and tick **Preserve log**.\n2. In that window, open [this sign-in link]({url}) (right-click it, Copy link address, and paste it into the window).\n3. Sign in with the parent account and accept if Microsoft asks for permission. You end on a blank page.\n4. In the Network tab, find the request named **oauth20_desktop.srf** (type it in the filter box). Right-click it and choose **Copy > Copy URL**. It starts with https://login.live.com/oauth20_desktop.srf?code= .\n5. Paste it below and submit within a few minutes: the code in it expires soon.\n\nClosed this page by mistake? Open Configure and tick the sign-in again within 10 minutes: the same link, and an address you already copied, still work.",
         "data": {
-          "redirect_url": "Address of the blank page"
+          "redirect_url": "The oauth20_desktop.srf address"
         },
         "data_description": {
-          "redirect_url": "The whole address, starting with https://login.live.com/oauth20_desktop.srf?code= . Spaces or quotes around it do no harm."
+          "redirect_url": "Copied from the Network tab (Copy URL), starting with https://login.live.com/oauth20_desktop.srf?code= . Spaces or quotes around it do no harm."
         }
       },
       "xbox_signin_works": {
@@ -132,15 +132,33 @@
         "data": {
           "xbox_xapprove": "Use the Xbox Family Settings API for the Xbox lock and extra time"
         }
+      },
+      "xbox_signin_code": {
+        "title": "Sign in to Xbox Family Settings",
+        "description": "Use the **parent** Microsoft account: the same one you sign in to Family Safety with, not a child's.\n\n1. On any phone or computer, go to **{url}**.\n2. Enter the code **{code}**.\n3. Sign in with the parent account and accept if Microsoft asks for permission.\n\nThis page goes on by itself once you have signed in (the code is valid for about 15 minutes). Keep it open meanwhile."
+      },
+      "xbox_signin_save": {
+        "title": "Sign in to Xbox Family Settings"
+      },
+      "xbox_signin_code_failed": {
+        "title": "The code sign-in did not finish",
+        "description": "The sign-in with the code did not finish: {reason}. Nothing was stored.\n\nGet a new code and try again, or sign in by pasting an address instead (that way needs a computer's browser tools).",
+        "data": {
+          "next": "What next"
+        }
       }
     },
     "error": {
-      "invalid_redirect": "That is not the address of the blank page. Copy the whole address from the address bar of the blank page you land on after signing in; it starts with https://login.live.com/oauth20_desktop.srf?code= . No blank page? Open the link again.",
+      "invalid_redirect": "That is not the address of the sign-in's last page. Copy the oauth20_desktop.srf request's URL from the Network tab; it starts with https://login.live.com/oauth20_desktop.srf?code= .",
       "state_mismatch": "That address comes from an older sign-in link. Open the link on this page, sign in, and paste the new address.",
       "signin_error": "Microsoft stopped the sign-in ({detail}), for example because the permission was declined. Open the link again, sign in with the parent account and accept.",
       "xbox_signin_failed": "Signing in to Xbox Live did not work ({detail}). Nothing was saved and the Xbox lock keeps working the way it did. Try again in a few minutes; if it keeps failing, Microsoft may have blocked this sign-in (see the README).",
       "pasted_link": "That is the sign-in link itself. Open it, sign in, and paste the address of the blank page you land on afterwards.",
-      "code_expired": "Microsoft no longer accepts that code: it expired, was already used, or was cut off when copying. Open the link again (it is quick when the account is still signed in) and paste the new address right away."
+      "code_expired": "Microsoft no longer accepts that code: it expired, was already used, or was cut off when copying. Open the link again (it is quick when the account is still signed in) and paste the new address right away.",
+      "removed_address": "That is the address after the page erased it (?removed=true): the code is no longer in it. Copy the address from the browser's Network tab instead: press F12, tick Preserve log, sign in with the link again, then right-click the oauth20_desktop.srf request and choose Copy > Copy URL."
+    },
+    "progress": {
+      "xbox_device_code": "Use the **parent** Microsoft account: the same one you sign in to Family Safety with, not a child's.\n\n1. On any phone or computer, go to **{url}**.\n2. Enter the code **{code}**.\n3. Sign in with the parent account and accept if Microsoft asks for permission.\n\nThis page goes on by itself once you have signed in (the code is valid for about 15 minutes). Keep it open meanwhile."
     }
   },
   "services": {
