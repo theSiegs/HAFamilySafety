@@ -768,3 +768,22 @@ probe_xbox_token:
       default: false
       selector:
         boolean:
+
+probe_xapprove:
+  name: Probe Xbox Family Settings API (diagnostic)
+  description: "Administrators only. Gets an Xbox Live token from the stored Microsoft sign-in, looks up the children's Xbox user ids and reads the first child's Xbox override from the Xbox Family Settings API (xapprove). Changes nothing. Answers with HTTP status codes, error codes and the override's type and end only; no token, gamertag or Xbox user id is returned or logged. Refuses unless confirm_risk is true: see the README."
+  fields:
+    entry_id:
+      name: Config entry
+      description: The Microsoft Family Safety entry to use. Optional with a single entry.
+      required: false
+      selector:
+        config_entry:
+          integration: microsoft_family_safety
+    confirm_risk:
+      name: Confirm the risk
+      description: "Must be true. Using the stored sign-in for another scope is not documented by Microsoft for this sign-in type; in the worst case the integration would need a new sign-in."
+      required: true
+      default: false
+      selector:
+        boolean:

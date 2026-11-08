@@ -157,6 +157,7 @@ async def async_setup_entry(
                 entities.extend([
                     FamilySafetyXboxScreenTimeSensor(coordinator, entry, account_id),
                     FamilySafetyXboxTimeRemainingSensor(coordinator, entry, account_id),
+                    FamilySafetyXboxOverrideSensor(coordinator, entry, account_id),
                 ])
             if account_id not in known_windows_accounts and isinstance(
                 (account_data or {}).get("screentime_policy"), dict
@@ -404,6 +405,54 @@ class FamilySafetyXboxScreenTimeSensor(FamilySafetyAccountSensor):
         account_data = self._get_account_data()
         value = (account_data or {}).get("xbox_today_usage")
         return value if isinstance(value, int) else None
+
+
+#: Xbox override types as the Xbox Override sensor names them.
+_OVERRIDE_STATES = {"blockUntil": "block", "allowUntil": "allow", "none": "none"}
+
+
+class FamilySafetyXboxOverrideSensor(FamilySafetyAccountSensor):
+    """The Xbox screen-time override in force: block, allow or none.
+
+    Read through the Xbox Family Settings API (xapprove) when that option is
+    on, else from the Xbox policy of the web session. Attributes: ``valid_until``
+    (local ISO), ``ours`` (placed by this integration: a lock_platform lock or
+    add_time_bonus extra time), ``hold`` (ours / bonus_ours / parent / none),
+    ``source`` (xapprove or web) and ``read_at`` for an xapprove read.
+    """
+
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = ["block", "allow", "none"]
+    _attr_icon = "mdi:microsoft-xbox"
+
+    def __init__(
+        self,
+        coordinator: FamilySafetyDataUpdateCoordinator,
+        entry: ConfigEntry,
+        account_id: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, entry, account_id)
+        self._attr_unique_id = f"{entry.entry_id}_{account_id}_xbox_override"
+        self._attr_name = f"{self._get_account_name()} Xbox Override"
+
+    @property
+    def native_value(self) -> str | None:
+        state = self.coordinator.platform_hold_state(self._account_id, "Xbox")
+        return _OVERRIDE_STATES.get(state.get("override") or "")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        state = self.coordinator.platform_hold_state(self._account_id, "Xbox")
+        xapprove = self.coordinator.xapprove_state(self._account_id)
+        return {
+            "valid_until": state.get("override_until"),
+            "ours": state.get("hold") in ("ours", "bonus_ours"),
+            "hold": state.get("hold"),
+            "lock_path": state.get("lock_path"),
+            "source": "xapprove" if xapprove is not None else "web",
+            "read_at": xapprove.get("read_at") if xapprove else None,
+        }
 
 
 class FamilySafetyTimeRemainingSensor(MinuteUpdateMixin, FamilySafetyAccountSensor):

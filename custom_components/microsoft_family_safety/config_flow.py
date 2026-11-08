@@ -31,6 +31,9 @@ from .const import (
     DEFAULT_STRICT_MODE,
     CONF_XBOX_LOCK_MOBILE_FALLBACK,
     DEFAULT_XBOX_LOCK_MOBILE_FALLBACK,
+    CONF_XBOX_XAPPROVE,
+    DEFAULT_XBOX_XAPPROVE,
+    CONF_XBOX_XUIDS,
     CONF_APP_USAGE_SENSORS,
     DEFAULT_APP_USAGE_SENSORS,
     CONF_XBOX_FEATURES,
@@ -1528,6 +1531,18 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
                             DEFAULT_XBOX_LOCK_MOBILE_FALLBACK,
                         ),
                     ): cv.boolean,
+                    vol.Optional(
+                        CONF_XBOX_XAPPROVE,
+                        default=self._config_entry.options.get(
+                            CONF_XBOX_XAPPROVE, DEFAULT_XBOX_XAPPROVE
+                        ),
+                    ): cv.boolean,
+                    vol.Optional(
+                        CONF_XBOX_XUIDS,
+                        description={
+                            "suggested_value": self._config_entry.options.get(CONF_XBOX_XUIDS, "")
+                        },
+                    ): cv.string,
                     vol.Optional(
                         CONF_ALLOW_INSECURE_HTTP_AUTH,
                         default=current_allow_insecure_http_auth,

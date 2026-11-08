@@ -25,6 +25,7 @@ from .const import (
     CONF_WEB_COOKIES,
     CONF_WEB_FAMILY_REFERER,
     CONF_WEB_FAMILY_TOKEN,
+    CONF_XBOX_XUIDS,
     DOMAIN,
 )
 
@@ -43,6 +44,7 @@ TO_REDACT = {
     # people
     CONF_AUTH_USER_ID,
     CONF_ALLOWED_USERS,
+    CONF_XBOX_XUIDS,
     "first_name",
     "surname",
     "profile_picture",

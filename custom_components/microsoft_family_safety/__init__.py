@@ -47,6 +47,7 @@ from .const import (
     SERVICE_ADD_TIME_BONUS,
     SERVICE_CANCEL_TIME_BONUS,
     SERVICE_PROBE_XBOX_TOKEN,
+    SERVICE_PROBE_XAPPROVE,
     CONF_ALLOWED_USERS,
 )
 from .coordinator import FamilySafetyDataUpdateCoordinator
@@ -424,9 +425,8 @@ def _register_services(hass: HomeAssistant) -> None:
         )
 
 
-    async def probe_xbox_token(call: ServiceCall) -> dict:
-        """Administrators only: never per child, the entry's own sign-in."""
-        await async_require_admin(hass, call)
+    def _entry_coordinator(call: ServiceCall) -> FamilySafetyDataUpdateCoordinator:
+        """The entry named by entry_id, or the only one."""
         coordinators = {
             entry_id: c for entry_id, c in hass.data.get(DOMAIN, {}).items()
             if isinstance(c, FamilySafetyDataUpdateCoordinator)
@@ -442,11 +442,27 @@ def _register_services(hass: HomeAssistant) -> None:
             raise ServiceValidationError(
                 "Give entry_id: there is not exactly one Microsoft Family Safety entry."
             )
-        return await coordinator.async_probe_xbox_token(call.data["confirm_risk"])
+        return coordinator
+
+    async def probe_xbox_token(call: ServiceCall) -> dict:
+        """Administrators only: never per child, the entry's own sign-in."""
+        await async_require_admin(hass, call)
+        return await _entry_coordinator(call).async_probe_xbox_token(call.data["confirm_risk"])
+
+    async def probe_xapprove(call: ServiceCall) -> dict:
+        """Administrators only: the xapprove token steps, child lookup and one read."""
+        await async_require_admin(hass, call)
+        return await _entry_coordinator(call).async_probe_xapprove(call.data["confirm_risk"])
 
     hass.services.async_register(
         DOMAIN, SERVICE_PROBE_XBOX_TOKEN,
         guard_service(hass, probe_xbox_token),
+        schema=SERVICE_PROBE_XBOX_TOKEN_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_PROBE_XAPPROVE,
+        guard_service(hass, probe_xapprove),
         schema=SERVICE_PROBE_XBOX_TOKEN_SCHEMA,
         supports_response=SupportsResponse.ONLY,
     )

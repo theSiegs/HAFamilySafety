@@ -48,6 +48,15 @@ XBOX_SCHEDULE_NOT_RESTORED_ISSUE: Final = "xbox_schedule_not_restored"
 #: How an Xbox lock was placed (``lock_path`` attribute and service answers).
 LOCK_PATH_WEB: Final = "web"
 LOCK_PATH_MOBILE_SCHEDULE: Final = "mobile_schedule"
+LOCK_PATH_XAPPROVE: Final = "xapprove"
+# The Xbox through the Xbox Family Settings API (xapprove.py, xbox_xapprove.py):
+# overrides written with an Xbox Live token from the stored mobile sign-in.
+CONF_XBOX_XAPPROVE: Final = "xbox_xapprove"
+DEFAULT_XBOX_XAPPROVE: Final = False
+#: Optional "child=xuid" pairs (child = first name or account id), used before
+#: the automatic lookup in the Xbox family.
+CONF_XBOX_XUIDS: Final = "xbox_xuids"
+XAPPROVE_REFUSED_ISSUE: Final = "xapprove_refused"
 #: Fired once for each pending request (more time, an app) that appears.
 EVENT_REQUEST: Final = f"{DOMAIN}_request"
 #: Fired once when a pending request leaves the list (approved, denied, expired).
@@ -144,6 +153,7 @@ SERVICE_ADD_TIME_BONUS: Final = "add_time_bonus"
 SERVICE_CANCEL_TIME_BONUS: Final = "cancel_time_bonus"
 SERVICE_RESUME_APP: Final = "resume_app"
 SERVICE_PROBE_XBOX_TOKEN: Final = "probe_xbox_token"
+SERVICE_PROBE_XAPPROVE: Final = "probe_xapprove"
 
 ALL_SERVICES: Final = [
     SERVICE_BLOCK_APP,
@@ -172,6 +182,7 @@ ALL_SERVICES: Final = [
     SERVICE_ADD_TIME_BONUS,
     SERVICE_CANCEL_TIME_BONUS,
     SERVICE_PROBE_XBOX_TOKEN,
+    SERVICE_PROBE_XAPPROVE,
 ]
 
 # Platforms

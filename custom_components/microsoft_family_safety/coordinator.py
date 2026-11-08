@@ -35,6 +35,7 @@ from ._pyfamilysafety_compat import apply_patches, is_stale_roster_error
 from .api_client import FamilySafetyWebAPI
 from .app_pause import AppPauser
 from .xbox_mobile_lock import XboxMobileLockMixin
+from .xbox_xapprove import XboxXapproveMixin
 from .xbox_token_probe import async_probe_xbox_token
 from .app_usage import EVENT_APP_USAGE, AppUsageGrowthTracker
 from . import site_sync
@@ -180,7 +181,7 @@ def _ms_to_minutes(milliseconds: int | float | None) -> int:
 
 
 class FamilySafetyDataUpdateCoordinator(
-    XboxMobileLockMixin, DataUpdateCoordinator[dict[str, Any]]
+    XboxXapproveMixin, XboxMobileLockMixin, DataUpdateCoordinator[dict[str, Any]]
 ):
     """Fetch and coordinate Microsoft Family Safety state."""
 
@@ -286,6 +287,7 @@ class FamilySafetyDataUpdateCoordinator(
         #: hold key -> when strict mode last placed that lock again.
         self._last_reassert: dict[str, datetime] = {}
         self._init_xbox_mobile_lock(entry)
+        self._init_xapprove(entry)
         if not self._mobile_only:
             ir.async_delete_issue(hass, DOMAIN, f"{XBOX_LOCK_ISSUE}_{entry.entry_id}")
 
@@ -953,6 +955,14 @@ class FamilySafetyDataUpdateCoordinator(
         self._check_platform_lockable(platform)
         requested = dt_util.as_utc(valid_until or (dt_util.now() + timedelta(hours=24)))
         key = self._hold_key(account_id, platform)
+        if platform.lower() == "xbox" and self._xapprove_usable():
+            # The Xbox Family Settings API first (xbox_xapprove.py); None means
+            # it could not be used and the paths below run as before.
+            async with self._hold_lock(key):
+                await self._async_load_platform_holds()
+                result = await self._async_xapprove_lock(account_id, requested, key)
+            if result is not None:
+                return result
         fallback = platform.lower() == "xbox" and self._xbox_mobile_fallback
         if fallback:
             async with self._hold_lock(key):
@@ -1160,9 +1170,16 @@ class FamilySafetyDataUpdateCoordinator(
         if account is None:
             raise ValueError(f"Account {account_id} not found")
         self._check_platform_lockable(platform)
-        self._check_xbox_bonus_possible(platform, "give")
         until = dt_util.as_utc(until)
         key = self._hold_key(account_id, platform)
+        if platform.lower() == "xbox" and self._xapprove_usable():
+            async with self._hold_lock(key):
+                await self._async_load_platform_holds()
+                await self._async_load_bonuses()
+                result = await self._async_xapprove_bonus(account_id, until, key)
+            if result is not None:
+                return result
+        self._check_xbox_bonus_possible(platform, "give")
         async with self._hold_lock(key):
             await self._async_load_platform_holds()
             await self._async_load_bonuses()
@@ -1225,8 +1242,14 @@ class FamilySafetyDataUpdateCoordinator(
         if account is None:
             raise ValueError(f"Account {account_id} not found")
         self._check_platform_lockable(platform)
-        self._check_xbox_bonus_possible(platform, "cancel")
         key = self._hold_key(account_id, platform)
+        if platform.lower() == "xbox" and self._xapprove_usable():
+            async with self._hold_lock(key):
+                await self._async_load_bonuses()
+                result = await self._async_xapprove_cancel_bonus(account_id, key)
+            if result is not None:
+                return result
+        self._check_xbox_bonus_possible(platform, "cancel")
         async with self._hold_lock(key):
             await self._async_load_bonuses()
             current = await self._async_read_platform_override(account_id, platform)
@@ -1270,6 +1293,9 @@ class FamilySafetyDataUpdateCoordinator(
             if platform.lower() == "xbox" and self._is_mobile_hold(hold):
                 await self._async_unlock_xbox_mobile(account_id, key, hold)
                 return
+            if platform.lower() == "xbox" and self._xapprove_usable():
+                if await self._async_xapprove_release(account_id, key):
+                    return
             if (
                 platform.lower() == "xbox"
                 and hold is None
@@ -1311,6 +1337,10 @@ class FamilySafetyDataUpdateCoordinator(
                 hold = self._platform_holds.get(key)
                 if self._is_mobile_hold(hold):
                     return await self._async_unlock_xbox_mobile(account_id, key, hold)
+                if self._xapprove_usable():
+                    result = await self._async_xapprove_unlock(account_id, key, hold)
+                    if result is not None:
+                        return result
                 if hold is None and self._xbox_mobile_fallback and self._xbox_web_unavailable():
                     return await self._async_xbox_not_locked(account_id)
         result = await self._async_unlock_platform_web(account, account_id, platform, key)
@@ -1458,10 +1488,16 @@ class FamilySafetyDataUpdateCoordinator(
             account = self.get_account(account_id)
             if account is None:
                 return
+            placed = (
+                platform.lower() == "xbox"
+                and self._xapprove_usable()
+                and await self._async_xapprove_reassert(account_id, until)
+            )
             try:
-                await self._async_write_platform_override(
-                    account, account_id, platform, BLOCK_UNTIL, until
-                )
+                if not placed:
+                    await self._async_write_platform_override(
+                        account, account_id, platform, BLOCK_UNTIL, until
+                    )
             except Exception as err:  # noqa: BLE001 - retried after the cooldown
                 _LOGGER.warning(
                     "Strict mode could not lock %s of %s again: %s", platform, account_id, err
@@ -2214,7 +2250,7 @@ class FamilySafetyDataUpdateCoordinator(
         if platform.lower() == "xbox":
             policy = account.get("xbox_screentime_policy")
             used = account.get("xbox_today_usage")
-            current = (
+            current = self._xbox_current_override(account) or (
                 parse_platform_override(account.get("xbox_policy"), "Xbox")
                 if account.get("xbox_policy") is not None
                 else None
@@ -2285,7 +2321,9 @@ class FamilySafetyDataUpdateCoordinator(
             if mobile is not None:
                 return mobile
             policy = account.get("xbox_policy")
-            current = parse_platform_override(policy, "Xbox") if policy is not None else None
+            current = self._xbox_current_override(account) or (
+                parse_platform_override(policy, "Xbox") if policy is not None else None
+            )
         elif platform in (account.get("blocked_platforms") or []):
             until = self._platform_override_until.get((str(account_id), platform.lower()))
             current = make_override(BLOCK_UNTIL, until)
@@ -3130,6 +3168,10 @@ class FamilySafetyDataUpdateCoordinator(
                         xbox_policy, "Xbox"
                     )
                     xbox_read_at[str(account_id)] = policy_read_at
+            try:
+                await self._async_poll_xapprove(accounts_data, xbox_overrides, xbox_read_at)
+            except Exception as err:  # noqa: BLE001 - never fail the poll for it
+                _LOGGER.debug("Xbox overrides through xapprove not read: %r", err)
             try:
                 await self._async_check_mobile_holds()
             except Exception as err:  # noqa: BLE001 - never fail the poll for it
