@@ -177,6 +177,8 @@ Legacy and native mode are mutually exclusive per config entry; there is no auto
 | Users allowed to control Microsoft Family Safety | list of Home Assistant users | *(empty: everybody)* | See [Who can control the integration](#who-can-control-the-integration) |
 | Strict mode | on / off | off | Places a `lock_platform` lock again when it is cancelled elsewhere; see [Strict mode](#strict-mode) |
 | Xbox lock without the web session | on / off | off | Locks the Xbox through today's Xbox schedule while the web session is down; see [below](#xbox-lock-without-the-web-session) |
+| Xbox lock and extra time through the Xbox Family Settings API (xapprove) | on / off | off | Locks, unlocks and gives Xbox extra time without the web session; see [below](#xbox-through-the-xbox-family-settings-api-xapprove) |
+| Xbox user ids | `child=xuid, ...` | *(empty: looked up)* | Only if the automatic lookup fails; see [below](#xbox-through-the-xbox-family-settings-api-xapprove) |
 | Allow insecure local HTTP authentication (testing only) | on / off | off | See below |
 
 #### Strict mode
@@ -216,7 +218,35 @@ With **Xbox lock without the web session: use today's Xbox schedule** on (off by
 
 The day is only put back while it still shows the lock: when a parent changed it in the Family Safety app meanwhile, the parent's day is kept and `unlock_platform` answers `left_parent_override`. A new `lock_platform` on that child then answers `left_parent_override` too, without writing over the parent's day. If the saved day cannot be put back once the lock has ended, it is retried at every update and a Repairs issue ("An Xbox schedule was not put back") stays up until it succeeds. Whenever the web route works, the web lock is used as before. The answers of `lock_platform` and `unlock_platform` and the attributes of the lock switch and Allowed Now sensor carry `lock_path`: `web` or `mobile_schedule`.
 
-While such a lock holds, the switch reads locked, `hold` is `ours` with `override: blockUntil` until the lock's end, and `allowance_minutes` shows the saved allowance, not the 0 written; the Xbox daily limit number for today shows 0. It needs a separate Xbox schedule (Family Safety's "per device type" limits); otherwise the lock fails with a clear error and nothing is changed. Extra time on the Xbox (`add_time_bonus`, `cancel_time_bonus`) still needs the web session and fails with a clear error without it. Turn the option off to have the Xbox lock refuse instead, as before.
+While such a lock holds, the switch reads locked, `hold` is `ours` with `override: blockUntil` until the lock's end, and `allowance_minutes` shows the saved allowance, not the 0 written; the Xbox daily limit number for today shows 0. It needs a separate Xbox schedule (Family Safety's "per device type" limits); otherwise the lock fails with a clear error and nothing is changed. Extra time on the Xbox (`add_time_bonus`, `cancel_time_bonus`) still needs the web session and fails with a clear error without it, unless the xapprove option is on. Turn the option off to have the Xbox lock refuse instead, as before. With the xapprove option on (next section), the Xbox lock and Xbox extra time go through the Xbox Family Settings API first and need neither the web session nor this fallback.
+
+#### Xbox through the Xbox Family Settings API (xapprove)
+
+The Xbox Family Settings app pauses a child's Xbox and gives extra time through its own API, `https://xapprove.xboxlive.com`, signed with an Xbox Live token instead of the Family web session. With **Xbox lock and extra time through the Xbox Family Settings API (xapprove)** on (off by default), the integration does the same, with an Xbox Live token it gets from **its own stored Microsoft sign-in** (the steps of [`probe_xbox_token`](#xbox-token-probe-diagnostic): the `MBI_SSL` Xbox scope, Xbox user authentication, XSTS for `http://xboxlive.com`). It does not use the Xbox app's own identity. The tokens are kept in memory only, the Xbox user token for about two weeks and the XSTS token for about 16 hours, so the stored sign-in is used for the Xbox scope again only when the Xbox user token runs out, or after a restart.
+
+What it does, for the Xbox only (Windows is unchanged):
+
+| Call | Request | When |
+|------|---------|------|
+| `lock_platform` (and the Xbox lock switch on) | `overrideType` 2, block until the lock's end (`until`, or `duration_hours` as before; Hearth sends midnight) | Nothing in force, or only an override of ours. A lock of ours already in force until then or later is kept, with no write. |
+| `unlock_platform` | `overrideType` 100, cancel | Only when the block in force is ours (its end within 2 minutes of the one we sent). |
+| Xbox lock switch off | `overrideType` 100, cancel | Whatever is in force, as before for the switch. |
+| `add_time_bonus` | `overrideType` 1, allow until `now + minutes` (or `until`) | Nothing in force, or only an override of ours. |
+| `cancel_time_bonus` | `overrideType` 100, cancel | Only extra time (an allow) in force; a block is never touched. |
+
+Each write goes to `target` 1 (screen time on all of the child's Xbox consoles), one at a time per child, and is believed only when the reply's `overrides` show it; otherwise the call falls back (below).
+
+**An allow and a block never stand together.** The Xbox Family Settings app always cancels before it switches between extra time and a pause, so when an override of **ours** is in force the integration sends a cancel first, then the new override. It does so also when the new one has the same type (a longer lock): cancelling first is the order the app itself uses, and the server accepting a create on top of an override is not verified.
+
+**A parent's override is left alone.** An override that is not ours (a pause or extra time given in the Xbox Family Settings or Family Safety app, or one that replaced ours) is never cancelled to put ours in: `lock_platform` answers `applied: "left_parent_override"` with `current` and writes nothing, `unlock_platform` answers `left_parent_override` too (or `not_locked` when we held no lock), `add_time_bonus` fails with a clear error, and the `hold` attribute reads `parent`, as for a parent's change on the web route. Hearth therefore sees it as a parent's decision. "Ours" means a block ending within 2 minutes of the lock this integration recorded (a web lock of ours counts: it is the same override), or an allow ending within 2 minutes of the extra time `add_time_bonus` recorded.
+
+**The answers** keep their shape. `lock_path` (in `lock_platform` and `unlock_platform` answers, the lock switch and the Allowed Now sensor) can now also be `xapprove`; `add_time_bonus` and `cancel_time_bonus` answers carry `lock_path: xapprove` when they went that way, and `cancel_time_bonus` adds `ours` (whether the extra time cancelled was ours). Each child with an Xbox gets a sensor **Xbox Override** (`sensor.{prefix}_xbox_override`): `block`, `allow` or `none`, with `valid_until` (local time), `ours`, `hold` (`ours`, `bonus_ours`, `parent`, `none`), `lock_path`, `source` (`xapprove` or `web`) and `read_at`. With the option on, every update reads each child's override through xapprove, and that read wins over the web one.
+
+**The child's Xbox user id.** It is looked up once in the parent's Xbox family (`accounts.xboxlive.com/family/memberXuid(...)`, with the parent's id from the XSTS token): a member whose Microsoft account id matches the child, else the same first and last name as in Family Safety (unique on both sides), else the last child left on both sides. Adults are never matched. If that does not work for a child (`probe_xapprove` says so), enter **Xbox user ids** in the options as `child=xuid` pairs separated by commas, the child given by first name or account id. The ids are kept in memory and in the options only, never logged, and redacted from diagnostics.
+
+**Fallback.** When xapprove cannot be used for a call (no Xbox user id for the child, a network error, a reply that does not show the write) the call goes on through the web route and, if turned on, today's Xbox schedule, exactly as before. When Microsoft **refuses the token** (401 or 403 from a token step or from xapprove, after one retry with fresh tokens), xapprove is left alone for 6 hours, a warning is logged once and a Repairs issue "The Xbox Family Settings API refused the Xbox token" says so; it goes away at the first call that works again.
+
+**The risk.** The same as for `probe_xbox_token`: Microsoft does not document whether using the stored refresh token on the older `login.live.com` endpoint for another scope can revoke it. If it did, the integration would ask for a new sign-in. The Xbox-scope refresh token Microsoft sends back is thrown away; the integration keeps its own. Run [`probe_xapprove`](#xbox-family-settings-api-probe-diagnostic) first and turn the option on when it reads the overrides and `family_refresh_after` is `ok`.
 
 #### Insecure local HTTP authentication
 
@@ -303,6 +333,7 @@ A typical single-child setup with a full app list lands around 85-90 entities.
 | Pending Requests | `sensor.{prefix}_pending_requests` | Request count | `requests` |
 | Web Filter | `sensor.{prefix}_web_filter` | enabled / disabled / unknown | `blockedSites`, `allowedSites`, `contentRatingAge`, `content_settings`, `max_age_rating`, `acquisition_policy` |
 | Screen Time Policy | `sensor.{prefix}_screen_time_policy` | enabled / disabled / unknown | `monday_allowance` … `sunday_allowance`, `*_allowed_intervals`, `daily_restrictions` |
+| Xbox Override | `sensor.{prefix}_xbox_override` | block / allow / none (Xbox features on, child with an Xbox) | `valid_until`, `ours`, `hold`, `lock_path`, `source` (`xapprove` or `web`), `read_at`; see [xapprove](#xbox-through-the-xbox-family-settings-api-xapprove) |
 
 ### Sensors — Per Physical Device
 
@@ -387,11 +418,11 @@ data:
   duration_hours: 24
 ```
 
-Both actions can answer with what they did (`response_variable`): `{prior, applied, lock_path}`. `applied` is `"left_parent_override"` when a parent changed the lock in the Family Safety app since; the answer then has `current: {type, valid_until, override_until, allow_until}`. `lock_path` is `web`, or `mobile_schedule` for an Xbox lock placed through today's schedule while the web session was down (see [Xbox lock without the web session](#xbox-lock-without-the-web-session)); such a lock ends at midnight at the latest, and its `current` describes the schedule day (`allowance_minutes`, `allotted_intervals`, `schedule_enabled`). Strict mode must stay off when another integration manages these locks (see [Strict mode](#strict-mode)).
+Both actions can answer with what they did (`response_variable`): `{prior, applied, lock_path}`. `applied` is `"left_parent_override"` when a parent changed the lock in the Family Safety app since; the answer then has `current: {type, valid_until, override_until, allow_until}`. `lock_path` is `web`, `xapprove` for an Xbox lock placed through the Xbox Family Settings API (see [Xbox through the Xbox Family Settings API](#xbox-through-the-xbox-family-settings-api-xapprove)), or `mobile_schedule` for an Xbox lock placed through today's schedule while the web session was down (see [Xbox lock without the web session](#xbox-lock-without-the-web-session)); such a lock ends at midnight at the latest, and its `current` describes the schedule day (`allowance_minutes`, `allotted_intervals`, `schedule_enabled`). Strict mode must stay off when another integration manages these locks (see [Strict mode](#strict-mode)).
 
 #### Extra time (experimental)
 
-`add_time_bonus` and `cancel_time_bonus` are **experimental: based on an uncaptured request; verified by reading back.** No capture shows how the Family Safety app writes extra time, so `add_time_bonus` sends the captured lock request with `allowUntil` instead of `blockUntil`, then reads the override back and succeeds only when Microsoft reports extra time ending within 2 minutes of what was asked. Otherwise it fails with what was read back (the request and answer are logged at debug level). Extra time replaces a `lock_platform` lock (Microsoft keeps one override per platform), so the lock's hold is released. `cancel_time_bonus` only ever cancels extra time, never a lock. The `hold` attribute reads `bonus_ours` while extra time given here is in force.
+`add_time_bonus` and `cancel_time_bonus` are **experimental: based on an uncaptured request; verified by reading back.** No capture shows how the Family Safety app writes extra time, so `add_time_bonus` sends the captured lock request with `allowUntil` instead of `blockUntil`, then reads the override back and succeeds only when Microsoft reports extra time ending within 2 minutes of what was asked. Otherwise it fails with what was read back (the request and answer are logged at debug level). Extra time replaces a `lock_platform` lock (Microsoft keeps one override per platform), so the lock's hold is released. `cancel_time_bonus` only ever cancels extra time, never a lock. The `hold` attribute reads `bonus_ours` while extra time given here is in force. With the xapprove option on, Xbox extra time is a captured request instead (an allow override, see [Xbox through the Xbox Family Settings API](#xbox-through-the-xbox-family-settings-api-xapprove)) and works without the web session.
 
 ```yaml
 service: microsoft_family_safety.add_time_bonus
@@ -570,6 +601,17 @@ data:
 
 ```yaml
 service: microsoft_family_safety.probe_xbox_token
+data:
+  confirm_risk: true
+response_variable: probe
+```
+
+### Xbox Family Settings API probe (diagnostic)
+
+`probe_xapprove` checks, inside Home Assistant and without changing anything, whether the Xbox through xapprove can work: it runs the token steps from the stored sign-in, looks up the children's Xbox user ids, and reads the first resolved child's override (`GET /api/v1/user/{xuid}/settings/screentime/overrides`). It answers with non-secret facts only: per token step the HTTP status and XErr, whether the XSTS token carries the parent's id (`parent_xuid_claim_present`), the family lookup (`members`, `members_with_xuid`, `adults`, the member field **names**), per child `resolved` and `via` (`option`, `family_id`, `family_name`, `elimination`), and for the read `ok`, `status`/`xerr` on failure, `override_active`, `type`, `raw_type`, `valid_until` and the `actions` the server offers. Like `probe_xbox_token` it needs `confirm_risk: true`, is for administrators, throws away the refresh token Microsoft returns, and ends with one normal refresh reported as `family_refresh_after`. No token, gamertag or Xbox user id is returned or logged.
+
+```yaml
+service: microsoft_family_safety.probe_xapprove
 data:
   confirm_risk: true
 response_variable: probe
