@@ -40,6 +40,7 @@ async def async_setup_entry(
 
     known_accounts: set[str] = set()
     known_apps: set[tuple[str, str]] = set()
+    known_xbox: set[str] = set()
 
     def _add_new_entities() -> None:
         """Add switches for accounts/apps that appeared since last update."""
@@ -62,16 +63,30 @@ async def async_setup_entry(
                     )
                 )
 
+            # The Xbox lock switch: once xapprove has read the child's Xbox
+            # (the Xbox Family Settings sign-in and the option on, any mode).
+            if (
+                coordinator.xapprove_enabled
+                and account_id not in known_xbox
+                and isinstance(account_data.get("xbox_xapprove"), dict)
+            ):
+                known_xbox.add(account_id)
+                entities.append(
+                    FamilySafetyPlatformLockSwitch(
+                        coordinator, entry, account_id, account_name, "Xbox",
+                    )
+                )
+
             if account_id in known_accounts:
                 continue
             known_accounts.add(account_id)
 
-            # Create per-platform lock switches only for selected platforms
-            enabled_platforms = entry.options.get(CONF_PLATFORMS, DEFAULT_PLATFORMS)
-            if not coordinator.xbox_features:
-                enabled_platforms = [
-                    p for p in enabled_platforms if str(p).lower() != "xbox"
-                ]
+            # Per-platform lock switches for the chosen platforms. The Xbox
+            # one is added below, with the Xbox Family Settings sign-in.
+            enabled_platforms = [
+                p for p in entry.options.get(CONF_PLATFORMS, DEFAULT_PLATFORMS)
+                if str(p).lower() != "xbox"
+            ]
             for platform in enabled_platforms:
                 entities.append(
                     FamilySafetyPlatformLockSwitch(

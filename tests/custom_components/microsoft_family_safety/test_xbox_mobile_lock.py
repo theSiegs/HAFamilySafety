@@ -1,9 +1,10 @@
-"""The Xbox lock without the Family web session: today's Xbox schedule day.
+"""The Xbox lock's fallback: today's Xbox schedule day.
 
-While the web session is down (Microsoft's daily sign-in), lock_platform on
-Xbox saves today's Xbox day and sets its allowance to 0 through the mobile
-schedule API; unlock_platform, the lock's end and midnight put the saved day
-back, unless a parent changed it in the app meanwhile.
+When the Xbox Family Settings API cannot be used (here: no Xbox sign-in),
+lock_platform on Xbox saves today's Xbox day and sets its allowance to 0
+through the mobile schedule API; unlock_platform, the lock's end and
+midnight put the saved day back, unless a parent changed it in the app
+meanwhile. The Family web session is never used for the Xbox.
 """
 
 from __future__ import annotations
@@ -28,7 +29,6 @@ from custom_components.microsoft_family_safety.api_client import (
     FamilySafetyWebAPIError,
 )
 from custom_components.microsoft_family_safety.const import (
-    CONF_XBOX_LOCK_MOBILE_FALLBACK,
     DAY_KEYS,
     DOMAIN,
 )
@@ -154,7 +154,6 @@ def _poll(coord) -> None:
 def entry(hass):
     entry = MockConfigEntry(
         domain=DOMAIN, data={"refresh_token": "x"},
-        options={CONF_XBOX_LOCK_MOBILE_FALLBACK: True},
     )
     entry.add_to_hass(hass)
     return entry
@@ -207,50 +206,17 @@ async def test_web_down_locks_today_through_the_schedule(coord, web, noon, hass_
     assert f"{PLATFORM_HOLD_STORAGE_KEY}.{entry.entry_id}" in hass_storage
 
 
-async def test_working_web_session_keeps_the_web_lock(coord, web, noon):
+async def test_a_working_web_session_is_never_used_for_the_xbox(coord, web, noon):
     web.family_context_state = "ready"
-
-    result = await coord.async_lock_platform(CHILD, "Xbox", _in(2))
-
-    assert result["lock_path"] == "web"
-    assert web.web_writes == [("xbox", "blockUntil")]
-    assert web.day_writes == []
-    unlocked = await coord.async_unlock_platform(CHILD, "Xbox")
-    assert unlocked["lock_path"] == "web"
-
-
-async def test_web_401_falls_back_to_the_schedule(coord, web, noon):
-    web.family_context_state = "ready"
-    web.web_fail = "HTTP_401"
 
     result = await coord.async_lock_platform(CHILD, "Xbox", _in(2))
 
     assert result["lock_path"] == "mobile_schedule"
-    assert web.day_writes == [(_today(), 0, EVENING)]
-    assert coord.platform_hold(CHILD, "Xbox")["path"] == "mobile_schedule"
-
-
-async def test_web_403_with_a_live_session_is_not_a_fallback(coord, web, noon):
-    web.family_context_state = "ready"
-    web.web_fail = "HTTP_403"
-
-    with pytest.raises(HomeAssistantError, match="HTTP_403"):
-        await coord.async_lock_platform(CHILD, "Xbox", _in(2))
-    assert web.day_writes == []
-
-
-async def test_option_off_refuses_without_the_web_session(hass, web, noon):
-    entry = MockConfigEntry(
-        domain=DOMAIN, data={"refresh_token": "x"},
-        options={CONF_XBOX_LOCK_MOBILE_FALLBACK: False},
-    )
-    entry.add_to_hass(hass)
-    coord = _make(hass, entry, web)
-    web.has_web_cookies = False
-
-    with pytest.raises(HomeAssistantError, match="web session"):
-        await coord.async_lock_platform(CHILD, "Xbox", _in(2))
-    assert web.day_writes == []
+    assert web.web_writes == []
+    unlocked = await coord.async_unlock_platform(CHILD, "Xbox")
+    assert unlocked["lock_path"] == "mobile_schedule"
+    await coord.async_release_platform(CHILD, "Xbox")
+    assert web.web_writes == []
 
 
 async def test_unreadable_schedule_refuses_and_writes_nothing(coord, web, noon):
@@ -302,17 +268,6 @@ async def test_relock_after_a_parent_change_leaves_the_parents_day(coord, web, n
     assert len(web.day_writes) == writes
     assert web.days[_today()]["allowance"] == 3600 * 1000
     assert coord.platform_hold(CHILD, "Xbox") is None
-
-
-async def test_fallback_is_off_by_default(hass, web, noon):
-    entry = MockConfigEntry(domain=DOMAIN, data={"refresh_token": "x"})
-    entry.add_to_hass(hass)
-    coord = _make(hass, entry, web)
-    web.has_web_cookies = False
-
-    with pytest.raises(HomeAssistantError, match="web session"):
-        await coord.async_lock_platform(CHILD, "Xbox", _in(2))
-    assert web.day_writes == []
 
 
 # Unlock ----------------------------------------------------------------------
@@ -531,7 +486,9 @@ async def test_entities_after_a_parent_change(hass, coord, web, noon, entry):
     state = coord.platform_hold_state(CHILD, "Xbox")
     assert state["hold"] == "none" and state["override"] == "none"
     status = coord.platform_status(CHILD, "Xbox")
-    assert status["allowed"] is True
+    # Not locked; whether the allowance is used up is unknown without Xbox
+    # play time (it came from the Family web session only).
+    assert status["allowed"] is None and status["reason"] != "locked"
     assert status["allowance_minutes"] == 180
     lock = switch.FamilySafetyPlatformLockSwitch(coord, entry, CHILD, "Alex", "Xbox")
     assert "Xbox" not in coord.data["accounts"][CHILD]["blocked_platforms"]
@@ -547,7 +504,7 @@ async def test_state_right_after_the_lock_before_a_poll(coord, web, noon):
 async def test_strict_mode_leaves_a_schedule_lock_alone(hass, web, noon):
     entry = MockConfigEntry(
         domain=DOMAIN, data={"refresh_token": "x"},
-        options={"strict_mode": True, CONF_XBOX_LOCK_MOBILE_FALLBACK: True},
+        options={"strict_mode": True},
     )
     entry.add_to_hass(hass)
     coord = _make(hass, entry, web)
@@ -558,12 +515,12 @@ async def test_strict_mode_leaves_a_schedule_lock_alone(hass, web, noon):
     assert web.web_writes == []
 
 
-# Extra time needs the web session ------------------------------------------------
+# Extra time needs the Xbox Family Settings sign-in ------------------------------
 
 
-async def test_extra_time_on_xbox_fails_clearly_without_the_web_session(coord, web, noon):
-    with pytest.raises(HomeAssistantError, match="web session"):
+async def test_extra_time_on_xbox_fails_clearly_without_the_xbox_sign_in(coord, web, noon):
+    with pytest.raises(HomeAssistantError, match="Xbox Family Settings sign-in"):
         await coord.async_add_time_bonus(CHILD, "Xbox", _in(1))
-    with pytest.raises(HomeAssistantError, match="web session"):
+    with pytest.raises(HomeAssistantError, match="Xbox Family Settings sign-in"):
         await coord.async_cancel_time_bonus(CHILD, "Xbox")
     assert web.web_writes == [] and web.day_writes == []

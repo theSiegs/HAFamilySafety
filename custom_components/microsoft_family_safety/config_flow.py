@@ -37,8 +37,6 @@ from .const import (
     CONF_ALLOWED_USERS,
     CONF_STRICT_MODE,
     DEFAULT_STRICT_MODE,
-    CONF_XBOX_LOCK_MOBILE_FALLBACK,
-    DEFAULT_XBOX_LOCK_MOBILE_FALLBACK,
     CONF_XBOX_XAPPROVE,
     DEFAULT_XBOX_XAPPROVE,
     CONF_XBOX_XUIDS,
@@ -156,13 +154,14 @@ async def _allowed_users_selector(
     )
 
 
-def _wants_xbox(platforms: Any) -> bool:
-    """Ticking Xbox among the monitored platforms turns the Xbox features on.
+def _platforms(platforms: Any) -> list[str]:
+    """The platform lock switches chosen: Xbox is no longer among them.
 
-    Those (Xbox play time, Xbox lock) need the Family web session; without
-    Xbox the entry runs on the mobile token only (see _mobile_only).
+    The Xbox lock comes with the Xbox Family Settings sign-in and xapprove,
+    and never needs the Family web session, so ticking Xbox (older entries)
+    no longer means anything and is dropped.
     """
-    return any(str(p).lower() == "xbox" for p in (platforms or []))
+    return [p for p in (platforms or []) if str(p) in AVAILABLE_PLATFORMS]
 
 
 class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -316,10 +315,10 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 CONF_UPDATE_INTERVAL: user_input.get(
                     CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL
                 ),
-                CONF_PLATFORMS: user_input.get(CONF_PLATFORMS, DEFAULT_PLATFORMS),
-                CONF_XBOX_FEATURES: _wants_xbox(
-                    user_input.get(CONF_PLATFORMS, DEFAULT_PLATFORMS)
-                ),
+                CONF_PLATFORMS: _platforms(user_input.get(CONF_PLATFORMS, DEFAULT_PLATFORMS)),
+                # New entries never hold the Family web session: nothing needs
+                # it any more (the Xbox runs on its own sign-in).
+                CONF_XBOX_FEATURES: False,
                 CONF_ALLOW_INSECURE_HTTP_AUTH: self._allow_insecure_http_auth,
             }
             # New entries are never created in legacy add-on mode any more:
@@ -467,9 +466,10 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def _mobile_only(self) -> bool:
         """Return whether this flow signs in for the mobile API only.
 
-        True when "Xbox features" is off: everything except the Xbox usage
-        report and the Xbox lock runs on the mobile refresh token, so the
-        account.microsoft.com web sign-in, its Family bootstrap and its
+        True for every new entry, and for an older one whose stored "Xbox
+        features" (the web session) is off: everything runs on the mobile
+        refresh token (the Xbox on its own Xbox Family Settings sign-in), so
+        the account.microsoft.com web sign-in, its Family bootstrap and its
         cookies are skipped entirely.
         """
         if self._is_existing_entry_auth_flow():
@@ -1525,7 +1525,12 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
             data = dict(user_input)
             sign_in = bool(data.pop(CONF_XBOX_SIGN_IN, False))
             sign_out = bool(data.pop(CONF_XBOX_SIGN_OUT, False))
-            data[CONF_XBOX_FEATURES] = _wants_xbox(data.get(CONF_PLATFORMS))
+            data[CONF_PLATFORMS] = _platforms(data.get(CONF_PLATFORMS))
+            # Whether the entry keeps the Family web session (older entries) is
+            # left as it is; ticking Xbox no longer turns it on.
+            data[CONF_XBOX_FEATURES] = bool(
+                self._config_entry.options.get(CONF_XBOX_FEATURES, DEFAULT_XBOX_FEATURES)
+            )
             # The add-on fields are gone from the form; keep a legacy entry's
             # values so saving the options does not cut it off its add-on.
             for key in (CONF_AUTH_URL, CONF_API_KEY):
@@ -1548,18 +1553,12 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
         current_interval = self._config_entry.options.get(
             CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL
         )
-        current_platforms = self._config_entry.options.get(
-            CONF_PLATFORMS, DEFAULT_PLATFORMS
+        current_platforms = _platforms(
+            self._config_entry.options.get(CONF_PLATFORMS, DEFAULT_PLATFORMS)
         )
         current_allow_insecure_http_auth = self._config_entry.options.get(
             CONF_ALLOW_INSECURE_HTTP_AUTH, False
         )
-        # Entries created before the option keep the Xbox features (and the
-        # web session) until the user unticks Xbox here.
-        if self._config_entry.options.get(
-            CONF_XBOX_FEATURES, DEFAULT_XBOX_FEATURES
-        ) and not _wants_xbox(current_platforms):
-            current_platforms = [*current_platforms, "Xbox"]
         users_selector, current_allowed = await _allowed_users_selector(
             self.hass, self._config_entry.options.get(CONF_ALLOWED_USERS)
         )
@@ -1591,13 +1590,6 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
                         CONF_STRICT_MODE,
                         default=self._config_entry.options.get(
                             CONF_STRICT_MODE, DEFAULT_STRICT_MODE
-                        ),
-                    ): cv.boolean,
-                    vol.Optional(
-                        CONF_XBOX_LOCK_MOBILE_FALLBACK,
-                        default=self._config_entry.options.get(
-                            CONF_XBOX_LOCK_MOBILE_FALLBACK,
-                            DEFAULT_XBOX_LOCK_MOBILE_FALLBACK,
                         ),
                     ): cv.boolean,
                     vol.Optional(

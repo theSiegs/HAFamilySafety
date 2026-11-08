@@ -1,4 +1,7 @@
-"""add_time_bonus / cancel_time_bonus (experimental): believed only when read back."""
+"""add_time_bonus / cancel_time_bonus (experimental) on Windows: believed only when read back.
+
+Xbox extra time goes through xapprove: test_xbox_xapprove.py.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +18,7 @@ from custom_components.microsoft_family_safety import _register_services
 from custom_components.microsoft_family_safety.const import DOMAIN
 from custom_components.microsoft_family_safety.screen_time import parse_utc
 
-from .test_platform_lock import CHILD, FakeWebAPI, _hours, _make, _xbox_policy
+from .test_platform_lock import CHILD, FakeWebAPI, _hours, _make, _windows
 
 
 @pytest.fixture
@@ -28,20 +31,20 @@ def rig(hass):
 
 
 def _poll(coord):
-    coord.data["accounts"][CHILD]["xbox_policy"] = coord.web_api.xbox_policy
+    """Windows extra time is not visible in a poll: our record decides."""
 
 
 async def test_bonus_applied_and_read_back(rig):
     until = _hours(0.5)
-    result = await rig.async_add_time_bonus(CHILD, "Xbox", until)
+    result = await rig.async_add_time_bonus(CHILD, "Windows", until)
 
-    assert [(p, k) for p, k, _ in rig.web_api.writes] == [("xbox", "allowUntil")]
-    assert result["platform"] == "Xbox"
+    assert [(p, k) for p, k, _ in rig.web_api.writes] == [("windows", "allowUntil")]
+    assert result["platform"] == "Windows"
     assert result["released_hold"] is False
     assert result["read_back"]["type"] == "allowUntil"
     assert parse_utc(result["applied_until"]) == parse_utc(until.isoformat())
     _poll(rig)
-    assert rig.platform_hold_state(CHILD, "Xbox")["hold"] == "bonus_ours"
+    assert rig.platform_hold_state(CHILD, "Windows")["hold"] == "bonus_ours"
 
 
 async def test_a_read_back_that_does_not_match_fails(rig):
@@ -52,7 +55,7 @@ async def test_a_read_back_that_does_not_match_fails(rig):
 
     rig.web_api.set_platform_time_override = ignored
     with pytest.raises(HomeAssistantError, match="did not apply the extra time") as err:
-        await rig.async_add_time_bonus(CHILD, "Xbox", _hours(0.5))
+        await rig.async_add_time_bonus(CHILD, "Windows", _hours(0.5))
     assert "read back" in str(err.value) and "'none'" in str(err.value)
     rig.web_api.set_platform_time_override = original
     assert rig._bonuses == {}
@@ -69,40 +72,34 @@ async def test_an_http_error_fails_without_a_retry(rig):
 
     rig.web_api.set_platform_time_override = failing
     with pytest.raises(HomeAssistantError, match="refused the extra time"):
-        await rig.async_add_time_bonus(CHILD, "Xbox", _hours(0.5))
+        await rig.async_add_time_bonus(CHILD, "Windows", _hours(0.5))
     assert len(calls) == 1
 
 
 async def test_a_bonus_releases_our_lock(rig):
-    await rig.async_lock_platform(CHILD, "Xbox", _hours(3))
-    result = await rig.async_add_time_bonus(CHILD, "Xbox", _hours(0.5))
+    await rig.async_lock_platform(CHILD, "Windows", _hours(3))
+    result = await rig.async_add_time_bonus(CHILD, "Windows", _hours(0.5))
 
     assert result["released_hold"] is True
-    assert rig.platform_hold(CHILD, "Xbox") is None
+    assert rig.platform_hold(CHILD, "Windows") is None
     _poll(rig)
-    assert rig.platform_hold_state(CHILD, "Xbox")["hold"] == "bonus_ours"
+    assert rig.platform_hold_state(CHILD, "Windows")["hold"] == "bonus_ours"
 
 
 async def test_cancel_never_touches_a_lock(rig):
-    rig.web_api.xbox_policy = _xbox_policy("blockUntil", _hours(2))  # a parent's lock
-    result = await rig.async_cancel_time_bonus(CHILD, "Xbox")
+    rig.web_api.windows = _windows("blockUntil", _hours(2))  # a parent's lock
+    result = await rig.async_cancel_time_bonus(CHILD, "Windows")
     assert result["cancelled"] is False
     assert rig.web_api.writes == []
 
 
 async def test_cancel_ends_extra_time(rig):
-    await rig.async_add_time_bonus(CHILD, "Xbox", _hours(0.5))
+    await rig.async_add_time_bonus(CHILD, "Windows", _hours(0.5))
     rig.web_api.writes.clear()
-    result = await rig.async_cancel_time_bonus(CHILD, "Xbox")
+    result = await rig.async_cancel_time_bonus(CHILD, "Windows")
     assert result["cancelled"] is True
-    assert [(p, k) for p, k, _ in rig.web_api.writes] == [("xbox", "cancel")]
+    assert [(p, k) for p, k, _ in rig.web_api.writes] == [("windows", "cancel")]
     assert rig._bonuses == {}
-
-
-async def test_extra_time_we_did_not_give_is_parent(rig):
-    rig.web_api.xbox_policy = _xbox_policy("allowUntil", _hours(1))
-    _poll(rig)
-    assert rig.platform_hold_state(CHILD, "Xbox")["hold"] == "parent"
 
 
 async def test_service_takes_minutes_or_until(hass):

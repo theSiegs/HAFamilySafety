@@ -66,17 +66,17 @@ Microsoft Family Safety has **two distinct APIs**, each with its own authenticat
 | API | Base URL | Auth Method | Capabilities |
 |-----|----------|-------------|-------------|
 | **Mobile API** | `mobileaggregator.family.microsoft.com` | OAuth Bearer token (from a long-lived refresh token) | Almost everything: family roster, devices, usage, screen time schedules (Windows and Xbox), account lock, app blocking and app time limits, websites, age rating, ask-to-buy, requests. |
-| **Web API** (private) | `account.microsoft.com/family/api/` | Microsoft session cookies + a `__RequestVerificationToken` antiforgery token | Xbox play time and the Xbox lock. Also a fallback for the schedules. |
+| **Web API** (private) | `account.microsoft.com/family/api/` | Microsoft session cookies + a `__RequestVerificationToken` antiforgery token | Only a fallback for the schedules, on older entries that still hold a web session. Nothing Xbox. |
 
-Since 2.0.17-2.0.21 everything except those two Xbox features runs on the mobile API, the same way the Family Safety app works. That matters because Microsoft makes some accounts renew the web session with an interactive sign-in every 24 hours ([#52](https://github.com/noiwid/HAFamilySafety/issues/52)), while the mobile refresh token lasts. If your children have no Xbox, leave **Xbox** unticked among the monitored platforms and the integration does not use the web session at all (see [Xbox and the web session](#xbox-and-the-web-session)).
+The **Xbox** has its own sign-in and API: the lock and extra time go through the **Xbox Family Settings API** (`xapprove.xboxlive.com`) with a separate [Xbox Family Settings sign-in](#sign-in-to-xbox-family-settings), and fall back to today's Xbox schedule on the mobile API. The Family web session, which Microsoft makes some accounts renew with an interactive sign-in every 24 hours ([#52](https://github.com/noiwid/HAFamilySafety/issues/52)), is never used for the Xbox, and new entries do not create one at all (see [The Xbox and the web session](#the-xbox-and-the-web-session)).
 
 ### How native authentication works
 
 You sign in **once**, in your normal browser, through a short-lived reverse proxy that Home Assistant mounts inside its own HTTP server.
 
-**Without Xbox among the monitored platforms**, that sign-in is the one the Family Safety app uses: Microsoft's mobile OAuth page, which hands back the refresh token for the mobile API, and that is all. No web session is created or stored.
+For a new entry that sign-in is the one the Family Safety app uses: Microsoft's mobile OAuth page, which hands back the refresh token for the mobile API, and that is all. No web session is created or stored.
 
-**With Xbox ticked**, two things happen behind that single sign-in:
+**Older entries that hold a Family web session** (created with Xbox ticked before the Xbox moved to its own sign-in) re-run two steps behind that single sign-in when they reauthenticate:
 
 **Step 1 — Family web session.** The proxy serves the regular `account.microsoft.com` sign-in. Answer **Yes** to "Stay signed in?": that answer is what makes Microsoft issue persistent session cookies (valid for about a year), so the Family session no longer has to be renewed every few hours. (Before 2.0.4 the flow signed in through the mobile app's OAuth page instead, which never asks the question, and sessions expired after about 7 hours.) Once you are signed in, the same tab is redirected a few times so the Family dashboard can be loaded and its `__RequestVerificationToken` read. This part may take up to about 60 seconds; Home Assistant shows a waiting screen.
 
@@ -94,19 +94,20 @@ After the sign-in, Home Assistant talks to both APIs **directly over HTTPS** fro
 Poll loop (default every 5 min)
   ├─ Mobile API   → roster, devices, apps, usage, schedules (Windows + Xbox),
   │                 websites, content restrictions, app limits switch
-  └─ Web API      → Xbox play time report, Xbox lock state (Xbox ticked only)
+  └─ xapprove     → each child's Xbox override (Xbox Family Settings sign-in)
 
 Service call / entity write
   ├─ Mobile API   → schedules, account lock, app blocking and app limits,
-  │                 websites, age rating, ask-to-buy, requests, Xbox limits
-  └─ Web API      → Xbox lock (Xbox ticked only)
+  │                 websites, age rating, ask-to-buy, requests, Xbox limits,
+  │                 the Xbox lock's fallback (today's Xbox schedule)
+  └─ xapprove     → Xbox lock, unlock, extra time
 ```
 
 ### Legacy add-on mode
 
 The `familysafety-playwright/` add-on is being phased out. Since 2.0.22 a new install can no longer choose it (the add-on URL and key fields are gone from the setup and options forms). Existing add-on entries keep working as before, and reauthenticating one (from the notification, Repairs or **Reconfigure**) moves it to the native sign-in for good: its add-on URL and key are cleared and the add-on can then be uninstalled.
 
-The cases the add-on used to cover are handled natively now: an HTTP-only instance can sign in through the manual redirect step as long as **Xbox** is not ticked (the mobile token is all it needs), and the schedules no longer depend on a browser session at all.
+The cases the add-on used to cover are handled natively now: an HTTP-only instance can sign in through the manual redirect step (the mobile token is all a new entry needs), and the schedules no longer depend on a browser session at all.
 
 Legacy and native mode are mutually exclusive per config entry; there is no automatic downgrade from native to add-on at runtime.
 
@@ -157,14 +158,14 @@ Legacy and native mode are mutually exclusive per config entry; there is no auto
 
 1. Go to **Settings > Devices & Services > Add Integration**
 2. Search for **Microsoft Family Safety**
-3. Set the **update interval** and the **monitored platforms** (Windows, Xbox, Mobile). Tick **Xbox** only if your children use one: without it the sign-in is shorter and Home Assistant never needs the Microsoft web session. Click **Submit**
+3. Set the **update interval** and the **monitored platforms** (Windows, Mobile: the lock switches). For the Xbox, sign in to Xbox Family Settings afterwards under **Configure** (see [below](#sign-in-to-xbox-family-settings)). Click **Submit**
 4. Home Assistant shows an **Open website** button. Click it: a browser window opens on the Microsoft sign-in page, served through Home Assistant's temporary authentication proxy
-5. Sign in with your **Microsoft parent account** (the family organizer, not a child account) and complete MFA if prompted. With Xbox ticked, answer **Yes** when Microsoft asks **"Stay signed in?"**: this is what keeps the web session valid for longer than a few hours
-6. **Keep the window open and be patient.** With Xbox ticked, Home Assistant completes the Family session in the background after the visible sign-in and fetches the mobile token from the same sign-in. The waiting screen can sit for **up to about a minute** without visibly updating, and the tab may briefly redirect again — this is normal. Do not click *Open website* again and do not close the dialog; wait for it to switch to the completion screen on its own. Without Xbox, the window finishes as soon as Microsoft hands back the token
-7. When both steps complete, the window closes itself and Home Assistant shows **Microsoft Family Safety sign-in completed**. Click **Continue**
+5. Sign in with your **Microsoft parent account** (the family organizer, not a child account) and complete MFA if prompted
+6. The window finishes as soon as Microsoft hands back the token. (An older entry that still holds a Family web session, when it reauthenticates, also completes that session in the background; that can take up to about a minute: keep the window open.)
+7. Home Assistant shows **Microsoft Family Safety sign-in completed**. Click **Continue**
 8. The integration discovers all child accounts and devices automatically. Screen-time entities can read `unknown` for up to one update interval (5 minutes by default) while the first data pull completes; that is expected
 
-> The old flow — copy an auth URL, sign in, paste the redirect URL back — is gone in the normal case. It survives as a fallback on HTTP-only instances, for legacy add-on users and for entries without Xbox (which only need the mobile token).
+> The old flow — copy an auth URL, sign in, paste the redirect URL back — is gone in the normal case. It survives as a fallback on HTTP-only instances and for legacy add-on users.
 
 ### Integration Options
 
@@ -173,18 +174,17 @@ Legacy and native mode are mutually exclusive per config entry; there is no auto
 | Option | Range / Format | Default | Notes |
 |--------|----------------|---------|-------|
 | Update interval (seconds) | 30 – 3600 | 300 (5 min) | |
-| Monitored platforms | Windows / Xbox / Mobile | Windows | One lock switch per platform. Xbox also decides whether the web session is used, see [below](#xbox-and-the-web-session) |
+| Monitored platforms | Windows / Mobile | Windows | One lock switch per platform. The Xbox lock switch comes with the Xbox Family Settings sign-in, see [below](#the-xbox-and-the-web-session) |
 | Users allowed to control Microsoft Family Safety | list of Home Assistant users | *(empty: everybody)* | See [Who can control the integration](#who-can-control-the-integration) |
 | Strict mode | on / off | off | Places a `lock_platform` lock again when it is cancelled elsewhere; see [Strict mode](#strict-mode) |
-| Xbox lock without the web session | on / off | off | Locks the Xbox through today's Xbox schedule while the web session is down; see [below](#xbox-lock-without-the-web-session) |
-| Xbox lock and extra time through the Xbox Family Settings API (xapprove) | on / off | off | Locks, unlocks and gives Xbox extra time without the web session; see [below](#xbox-through-the-xbox-family-settings-api-xapprove) |
+| Xbox lock and extra time through the Xbox Family Settings API (xapprove) | on / off | off | With the Xbox Family Settings sign-in: the Xbox lock switch and Override sensor, Xbox lock, unlock and extra time; see [below](#xbox-through-the-xbox-family-settings-api-xapprove) |
 | Xbox user ids | `child=xuid, ...` | *(empty: looked up)* | Only if the automatic lookup fails; see [below](#xbox-through-the-xbox-family-settings-api-xapprove) |
 | Sign in to Xbox Family Settings (next page) / Sign out of Xbox Family Settings | tick and submit | off | Opens the Xbox sign-in page, then checks it and offers the xapprove option; sign out is shown only while signed in. The page's top line says whether you are signed in; see [below](#sign-in-to-xbox-family-settings) |
 | Allow insecure local HTTP authentication (testing only) | on / off | off | See below |
 
 #### Strict mode
 
-When on, a Windows or Xbox lock placed by `microsoft_family_safety.lock_platform` that Microsoft reports as cancelled before its end (released in the Family Safety app, for example) is placed again on the next update, at most every 10 minutes, and `microsoft_family_safety_lock_reasserted` is fired. `unlock_platform` ends it.
+When on, a Windows or Xbox (xapprove) lock placed by `microsoft_family_safety.lock_platform` that Microsoft reports as cancelled before its end (released in the Family Safety app, for example) is placed again on the next update, at most every 10 minutes, and `microsoft_family_safety_lock_reasserted` is fired. `unlock_platform` ends it.
 
 **Keep strict mode off when another integration manages the locks**, such as Hearth: it would lock again right after a parent's own unlock in the Family Safety app and fight the parent's decision. Such an integration should read the `hold` attribute instead (`ours`, `parent` or `none`, on the Allowed Now binary sensors and the platform lock switches) and adopt the parent's change.
 
@@ -200,32 +200,33 @@ The option **Users allowed to control Microsoft Family Safety** closes that gap:
 
 Give the child a **non-administrator** account and tick the parents: an administrator can change this option, so a child with an administrator account bypasses it. The child still sees the entities (Home Assistant cannot hide them per user) but can no longer use them. Changing the option takes effect immediately, without reloading the integration.
 
-#### Xbox and the web session
+#### The Xbox and the web session
 
-Xbox play time and the Xbox lock are the only features that still need the Microsoft **web session**, which some accounts must renew with an interactive sign-in every 24 hours ([#52](https://github.com/noiwid/HAFamilySafety/issues/52)). Everything else, Xbox daily limits included, runs on the mobile token.
+The Xbox **never uses the Microsoft Family web session**. Its lock and extra time go through the Xbox Family Settings API with the separate [Xbox Family Settings sign-in](#sign-in-to-xbox-family-settings) (next sections), with today's Xbox schedule as the lock's fallback; its daily limits (the Xbox Screen Time Limits switch and the `number.{prefix}_xbox_{day}_limit` entities) run on the mobile token. So the web session's daily sign-in on some accounts ([#52](https://github.com/noiwid/HAFamilySafety/issues/52)) no longer matters for the Xbox, and nothing asks for a sign-in on the Xbox's behalf.
 
-- **Xbox ticked** among the monitored platforms: the sign-in captures both the web session and the mobile token, and the Xbox entities are created. Installs made before 2.0.22 keep this behaviour (the options show Xbox ticked) until you untick it.
-- **Xbox unticked** (the default for new installs): the integration runs on the mobile token only. The sign-in is the short one of the Family Safety app, no browser cookies are stored, the connection sensor no longer reports `degraded` for a missing web session, and the Xbox lock and Xbox play time are not created. The Xbox daily limits stay: the Xbox Screen Time Limits switch and the `number.{prefix}_xbox_{day}_limit` entities run on the mobile token, so they work in this mode too.
+- **New entries** never create a web session: the sign-in is the short one of the Family Safety app.
+- **Older entries** that hold one (created with Xbox ticked) keep it, for the schedules' fallback only. Xbox is no longer offered among the monitored platforms; ticking it used to mean "use the web session for the Xbox".
+- **Gone with the web route:** Xbox play time (the web activity report): the Xbox Screen Time and Xbox Time Remaining sensors are no longer created (remove the old ones from the entity list if you like), and the Xbox Allowed Now sensor reports `allowed` only from the schedule and the override in force, with `used_minutes` unknown. The web Xbox lock (blockUntil on `account.microsoft.com`) is replaced by xapprove.
 
-Unticking Xbox later takes effect at once; the web credentials already stored stay unused and are removed at the next reauthentication. Ticking it again starts a reauthentication so the web session can be captured. Xbox entities created earlier stay in the entity list as unavailable; remove them there if you like.
+The **Xbox lock switch** and the **Xbox Override** sensor appear for each child once the Xbox Family Settings sign-in is made, the xapprove option is on, and the child's Xbox has been read once.
 
-#### Xbox lock without the web session
+#### The Xbox lock's fallback: today's Xbox schedule
 
-With **Xbox lock without the web session: use today's Xbox schedule** on (off by default: turn it on once you have checked that your console stops when today's Xbox daily limit is set to no time mid-day), an Xbox lock keeps working while the web session waits for its sign-in. When the web route cannot be used (no Family context, a context that needs a sign-in, or the Xbox lock request answering 401), `lock_platform` on Xbox (and the Xbox lock switch):
+When xapprove cannot be used (no Xbox sign-in, no Xbox user id for the child, the API out of reach, a write it does not confirm, or Microsoft refusing the token), `lock_platform` on Xbox (and the Xbox lock switch):
 
 1. reads **today's** Xbox schedule day exactly as Microsoft holds it (allowance and allowed hours, and whether the Xbox schedule is on) and saves it with the lock, on disk, before writing anything;
 2. sets today's Xbox allowance to **0** through the mobile token (the allowed hours stay as they are; a schedule that was off is turned on for the lock and off again afterwards);
 3. puts the saved day back at `unlock_platform` (or the switch turned off), at the end of the lock, and **at midnight in any case**: such a lock never lasts past midnight and is never carried to the next day. A restart that missed the moment puts it back on the first update.
 
-The day is only put back while it still shows the lock: when a parent changed it in the Family Safety app meanwhile, the parent's day is kept and `unlock_platform` answers `left_parent_override`. A new `lock_platform` on that child then answers `left_parent_override` too, without writing over the parent's day. If the saved day cannot be put back once the lock has ended, it is retried at every update and a Repairs issue ("An Xbox schedule was not put back") stays up until it succeeds. Whenever the web route works, the web lock is used as before. The answers of `lock_platform` and `unlock_platform` and the attributes of the lock switch and Allowed Now sensor carry `lock_path`: `web` or `mobile_schedule`.
+The day is only put back while it still shows the lock: when a parent changed it in the Family Safety app meanwhile, the parent's day is kept and `unlock_platform` answers `left_parent_override`. A new `lock_platform` on that child then answers `left_parent_override` too, without writing over the parent's day. If the saved day cannot be put back once the lock has ended, it is retried at every update and a Repairs issue ("An Xbox schedule was not put back") stays up until it succeeds. The answers of `lock_platform` and `unlock_platform` and the attributes of the lock switch and Allowed Now sensor carry `lock_path`: `xapprove` or `mobile_schedule`.
 
-While such a lock holds, the switch reads locked, `hold` is `ours` with `override: blockUntil` until the lock's end, and `allowance_minutes` shows the saved allowance, not the 0 written; the Xbox daily limit number for today shows 0. It needs a separate Xbox schedule (Family Safety's "per device type" limits); otherwise the lock fails with a clear error and nothing is changed. Extra time on the Xbox (`add_time_bonus`, `cancel_time_bonus`) still needs the web session and fails with a clear error without it, unless the xapprove option is on. Turn the option off to have the Xbox lock refuse instead, as before. With the xapprove option on (next section), the Xbox lock and Xbox extra time go through the Xbox Family Settings API first and need neither the web session nor this fallback.
+While such a lock holds, the switch reads locked, `hold` is `ours` with `override: blockUntil` until the lock's end, and `allowance_minutes` shows the saved allowance, not the 0 written; the Xbox daily limit number for today shows 0. It needs a separate Xbox schedule (Family Safety's "per device type" limits); otherwise the lock fails with a clear error and nothing is changed. Check once that your console stops when today's Xbox daily limit is set to no time mid-day. Xbox extra time (`add_time_bonus`, `cancel_time_bonus`) has no fallback: without xapprove it fails with a clear error.
 
 #### Xbox through the Xbox Family Settings API (xapprove)
 
 The Xbox Family Settings app pauses a child's Xbox and gives extra time through its own API, `https://xapprove.xboxlive.com`, signed with an Xbox Live token instead of the Family web session. With **Xbox lock and extra time through the Xbox Family Settings API (xapprove)** on (off by default), the integration does the same.
 
-xapprove only takes the token the Xbox Family Settings app itself gets: tried live, it answered `401 token_required` to every token the Family Safety sign-in can produce. So it needs the separate [Xbox Family Settings sign-in](#sign-in-to-xbox-family-settings) below. Without that sign-in, the integration still tries the Family Safety sign-in's token (the steps of [`probe_xbox_token`](#xbox-token-probe-diagnostic)), which is refused, so the Xbox lock falls back as described under **Fallback**.
+xapprove only takes the token the Xbox Family Settings app itself gets: tried live, it answered `401 token_required` to every token the Family Safety sign-in can produce. So it needs the separate [Xbox Family Settings sign-in](#sign-in-to-xbox-family-settings) below; the option does nothing without it. It works the same whether or not the entry holds a Family web session.
 
 What it does, for the Xbox only (Windows is unchanged):
 
@@ -241,13 +242,13 @@ Each write goes to `target` 1 (screen time on all of the child's Xbox consoles),
 
 **An allow and a block never stand together.** The Xbox Family Settings app always cancels before it switches between extra time and a pause, so when an override of **ours** is in force the integration sends a cancel first, then the new override. It does so also when the new one has the same type (a longer lock): cancelling first is the order the app itself uses, and the server accepting a create on top of an override is not verified.
 
-**A parent's override is left alone.** An override that is not ours (a pause or extra time given in the Xbox Family Settings or Family Safety app, or one that replaced ours) is never cancelled to put ours in: `lock_platform` answers `applied: "left_parent_override"` with `current` and writes nothing, `unlock_platform` answers `left_parent_override` too (or `not_locked` when we held no lock), `add_time_bonus` fails with a clear error, and the `hold` attribute reads `parent`, as for a parent's change on the web route. Hearth therefore sees it as a parent's decision. "Ours" means a block ending within 2 minutes of the lock this integration recorded (a web lock of ours counts: it is the same override), or an allow ending within 2 minutes of the extra time `add_time_bonus` recorded.
+**A parent's override is left alone.** An override that is not ours (a pause or extra time given in the Xbox Family Settings or Family Safety app, or one that replaced ours) is never cancelled to put ours in: `lock_platform` answers `applied: "left_parent_override"` with `current` and writes nothing, `unlock_platform` answers `left_parent_override` too (or `not_locked` when we held no lock), `add_time_bonus` fails with a clear error, and the `hold` attribute reads `parent`. Hearth therefore sees it as a parent's decision. "Ours" means a block ending within 2 minutes of the lock this integration recorded, or an allow ending within 2 minutes of the extra time `add_time_bonus` recorded.
 
-**The answers** keep their shape. `lock_path` (in `lock_platform` and `unlock_platform` answers, the lock switch and the Allowed Now sensor) can now also be `xapprove`; `add_time_bonus` and `cancel_time_bonus` answers carry `lock_path: xapprove` when they went that way, and `cancel_time_bonus` adds `ours` (whether the extra time cancelled was ours). Each child with an Xbox gets a sensor **Xbox Override** (`sensor.{prefix}_xbox_override`): `block`, `allow` or `none`, with `valid_until` (local time), `ours`, `hold` (`ours`, `bonus_ours`, `parent`, `none`), `lock_path`, `source` (`xapprove` or `web`) and `read_at`. With the option on, every update reads each child's override through xapprove, and that read wins over the web one.
+**The answers** keep their shape. `lock_path` (in `lock_platform` and `unlock_platform` answers, the lock switch and the Allowed Now sensor) is `xapprove` or `mobile_schedule` for the Xbox; `add_time_bonus` and `cancel_time_bonus` answers carry `lock_path: xapprove`, and `cancel_time_bonus` adds `ours` (whether the extra time cancelled was ours). Each child with an Xbox gets a sensor **Xbox Override** (`sensor.{prefix}_xbox_override`): `block`, `allow` or `none`, with `valid_until` (local time), `ours`, `hold` (`ours`, `bonus_ours`, `parent`, `none`), `lock_path`, `source` (`xapprove`) and `read_at`. Every update reads each child's override through xapprove.
 
 **The child's Xbox user id.** It is looked up once in the parent's Xbox family (`accounts.xboxlive.com/family/memberXuid(...)`, with the parent's id from the XSTS token): a member whose Microsoft account id matches the child, else the same first and last name as in Family Safety (unique on both sides), else the last child left on both sides. Adults are never matched: a member is an adult by `isAdult`, else by a role naming one (`Adult`, `Parent`, `Organizer`, `Admin`, `Owner`, `Guardian`; a role naming a child, teen or minor wins), and the signed-in parent is always left out. If that does not work for a child (`probe_xapprove` says so), enter **Xbox user ids** in the options as `child=xuid` pairs separated by commas, the child given by first name or account id. The ids are kept in memory and in the options only, never logged, and redacted from diagnostics.
 
-**Fallback.** When xapprove cannot be used for a call (no Xbox user id for the child, a network error, a reply that does not show the write) the call goes on through the web route and, if turned on, today's Xbox schedule, exactly as before. When Microsoft **refuses the token** (401 or 403 from a token step or from xapprove, after one retry with fresh tokens), xapprove is left alone for 6 hours, a warning is logged once and a Repairs issue "The Xbox Family Settings API refused the Xbox token" says so; it goes away at the first call that works again.
+**Fallback.** When xapprove cannot be used for a lock (no Xbox user id for the child, a network error, a reply that does not show the write), the lock goes through [today's Xbox schedule](#the-xbox-locks-fallback-todays-xbox-schedule); extra time fails with a clear error. A lock of ours placed through xapprove that cannot be reached is kept until its end (a new lock ending no later answers it as in force; unlock says to try again later). When Microsoft **refuses the token** (401 or 403 from a token step or from xapprove, after one retry with fresh tokens), xapprove is left alone for 6 hours, a warning is logged once and a Repairs issue "The Xbox Family Settings API refused the Xbox token" says so; it goes away at the first call that works again.
 
 **The risk.** See the sign-in below. Signing in checks xapprove and offers to turn the option on; [`probe_xapprove`](#xbox-family-settings-api-probe-diagnostic) gives the details when it does not work.
 
@@ -290,9 +291,9 @@ Use it for testing, or on a network you fully trust. Setting up HTTPS is the bet
 
 ### Re-authenticating
 
-Microsoft sessions expire. The account page session lapses about once a day; since 2.0.6 the integration completes Microsoft's silent sign-in on its own (the same "Continue" step a browser performs), so you should not be asked to sign in again as long as the "Stay signed in?" cookies are valid. When the login itself is gone, Home Assistant raises a **repair / reauthentication** prompt and a persistent notification. That also covers the case where Microsoft has dropped the Family session while the account page still answers: after two consecutive updates in that state the connection sensor reports `degraded` with `reauth_recommended: true` and the reauthentication flow is started for you. You can also start it yourself at any time with the `microsoft_family_safety.request_reauth` service (handy from a dashboard button). Re-authenticating runs the same sign-in and renews **both** the Family web session and the mobile refresh token (only the token without Xbox).
+Microsoft sessions expire. The account page session lapses about once a day; since 2.0.6 the integration completes Microsoft's silent sign-in on its own (the same "Continue" step a browser performs), so you should not be asked to sign in again as long as the "Stay signed in?" cookies are valid. When the login itself is gone, Home Assistant raises a **repair / reauthentication** prompt and a persistent notification. That also covers the case where Microsoft has dropped the Family session while the account page still answers: after two consecutive updates in that state the connection sensor reports `degraded` with `reauth_recommended: true` and the reauthentication flow is started for you. You can also start it yourself at any time with the `microsoft_family_safety.request_reauth` service (handy from a dashboard button). Re-authenticating runs the same sign-in and renews the mobile refresh token (and, on an older entry that holds one, the Family web session).
 
-Since 2.0.20 a dead web session no longer triggers a reauthentication on its own as long as the schedules answer through the mobile API: only the Xbox features stop working. Without Xbox, the web session is not used at all and only an expired mobile token can ask you to sign in again.
+A dead web session does not trigger a reauthentication as long as the schedules answer through the mobile API: the Xbox never uses it. So in practice only an expired mobile token asks you to sign in again. The Xbox Family Settings sign-in is separate: when it needs renewing, a Repairs issue says so (see [Sign in to Xbox Family Settings](#sign-in-to-xbox-family-settings)).
 
 Reauthentication must use the **same Microsoft account** — signing in with a different one aborts with *"A different Microsoft account was used"*.
 
@@ -300,9 +301,9 @@ Reauthentication must use the **same Microsoft account** — signing in with a d
 
 Since early October 2026, Microsoft asks some accounts for an interactive Family sign-in every 24 hours, whatever the cookies say (see [#52](https://github.com/noiwid/HAFamilySafety/issues/52)). The connection sensor then reports `signin_required`, and nothing server-side can avoid the sign-in itself.
 
-Since 2.0.20 this only affects the Xbox play time and the Xbox lock: everything else keeps working on the mobile token. With **Xbox** ticked, the integration still asks you to sign in when Microsoft refuses the web session (including a 401 on the Xbox reads), because otherwise the Xbox play time and the Xbox lock would silently stay unknown. If your children have no Xbox, untick **Xbox** among the monitored platforms and the question goes away entirely.
+This no longer affects anything: the Xbox moved to its own [Xbox Family Settings sign-in](#sign-in-to-xbox-family-settings) and never uses the web session, and everything else runs on the mobile token. The integration does not ask for that sign-in on the Xbox's behalf any more.
 
-If you rely on the Xbox play time or the Xbox lock and want the daily sign-in unattended, [BartVPL/HAFamilySafety-Auto-Reauth](https://github.com/BartVPL/HAFamilySafety-Auto-Reauth) is a community project that watches the connection sensor, drives the sign-in through Playwright on a separate Linux host, reads the one-time code Microsoft emails through the Gmail API, and completes the flow. It only uses what the integration already exposes (the connection sensor, the `request_reauth` service and the reauth flow). Read its README before installing: it is **not part of this integration, not reviewed here and experimental**. It needs a long-lived Home Assistant token, read-only OAuth access to the mailbox that receives the Microsoft codes, and runs a browser on a machine you must keep secure. Weigh that against signing in by hand once a day.
+For older setups that still want the web session renewed unattended, [BartVPL/HAFamilySafety-Auto-Reauth](https://github.com/BartVPL/HAFamilySafety-Auto-Reauth) is a community project that watches the connection sensor, drives the sign-in through Playwright on a separate Linux host, reads the one-time code Microsoft emails through the Gmail API, and completes the flow. It only uses what the integration already exposes (the connection sensor, the `request_reauth` service and the reauth flow). Read its README before installing: it is **not part of this integration, not reviewed here and experimental**. It needs a long-lived Home Assistant token, read-only OAuth access to the mailbox that receives the Microsoft codes, and runs a browser on a machine you must keep secure. Weigh that against signing in by hand once a day.
 
 ### Legacy add-on installation
 
@@ -342,7 +343,7 @@ For one child with no per-app switches, an account with Windows monitoring enabl
 | Platform | Count | What |
 |----------|-------|------|
 | `sensor` | 6 – 7 | Screen Time, Account Info, Applications, Pending Requests, Web Filter, Screen Time Policy (+ Balance when the account exposes one) |
-| `switch` | 4 + platforms + apps | Account Lock, Screen Time Limits, Xbox Screen Time Limits, App Limits, one Platform Lock per monitored platform, one per application |
+| `switch` | 4 + platforms + apps | Account Lock, Screen Time Limits, Xbox Screen Time Limits, App Limits, one Platform Lock per monitored platform (+ the Xbox Lock with the Xbox Family Settings sign-in), one per application |
 | `button` | 2 | Approve Request, Deny Request |
 | `number` | 7 (+7 Xbox) | one daily limit per day, plus one Xbox daily limit per day once the Xbox schedule is on |
 | `time` | 14 | 7 start + 7 end |
@@ -362,7 +363,7 @@ A typical single-child setup with a full app list lands around 85-90 entities.
 | Pending Requests | `sensor.{prefix}_pending_requests` | Request count | `requests` |
 | Web Filter | `sensor.{prefix}_web_filter` | enabled / disabled / unknown | `blockedSites`, `allowedSites`, `contentRatingAge`, `content_settings`, `max_age_rating`, `acquisition_policy` |
 | Screen Time Policy | `sensor.{prefix}_screen_time_policy` | enabled / disabled / unknown | `monday_allowance` … `sunday_allowance`, `*_allowed_intervals`, `daily_restrictions` |
-| Xbox Override | `sensor.{prefix}_xbox_override` | block / allow / none (Xbox features on, child with an Xbox) | `valid_until`, `ours`, `hold`, `lock_path`, `source` (`xapprove` or `web`), `read_at`; see [xapprove](#xbox-through-the-xbox-family-settings-api-xapprove) |
+| Xbox Override | `sensor.{prefix}_xbox_override` | block / allow / none (Xbox Family Settings sign-in and xapprove on, child with an Xbox) | `valid_until`, `ours`, `hold`, `lock_path`, `source` (`xapprove`), `read_at`; see [xapprove](#xbox-through-the-xbox-family-settings-api-xapprove) |
 
 ### Sensors — Per Physical Device
 
@@ -377,7 +378,7 @@ A typical single-child setup with a full app list lands around 85-90 entities.
 |--------|-----------|-------|----------------|
 | Connection | `sensor.microsoft_family_safety_connection` | connected / degraded / disconnected | `mobile_api`, `web_session`, `web_api`, `family_context`, `screentime_policy_source`, `native_web_auth`, `reauth_required`, `reauth_recommended`, `last_update_success` |
 
-`degraded` means the mobile API works but the Family web session does not. Since 2.0.20 that only affects the Xbox play time and the Xbox lock; the schedules keep working on the mobile API. Without Xbox the web session is not used and the state is `connected` whenever the mobile API answers (attribute `xbox_features: false`). When that state persists for two consecutive updates, `reauth_recommended` turns `true`, a notification is raised and the reauthentication flow is started automatically. Only a real login redirect, an expired account session or that two-update condition triggers reauthentication; a single rejected request does not, to avoid loops on a merely stale token. This is a **diagnostic** entity; enable it in the entity list if it is hidden.
+`degraded` means the mobile API works but the Family web session of an older entry does not; the schedules keep working on the mobile API and the Xbox does not use it. An entry without the web session is `connected` whenever the mobile API answers (attribute `web_session_enabled: false`). When that state persists for two consecutive updates, `reauth_recommended` turns `true`, a notification is raised and the reauthentication flow is started automatically. Only a real login redirect, an expired account session or that two-update condition triggers reauthentication; a single rejected request does not, to avoid loops on a merely stale token. This is a **diagnostic** entity; enable it in the entity list if it is hidden.
 
 ### Switches — Per Child Account
 
@@ -447,11 +448,13 @@ data:
   duration_hours: 24
 ```
 
-Both actions can answer with what they did (`response_variable`): `{prior, applied, lock_path}`. `applied` is `"left_parent_override"` when a parent changed the lock in the Family Safety app since; the answer then has `current: {type, valid_until, override_until, allow_until}`. `lock_path` is `web`, `xapprove` for an Xbox lock placed through the Xbox Family Settings API (see [Xbox through the Xbox Family Settings API](#xbox-through-the-xbox-family-settings-api-xapprove)), or `mobile_schedule` for an Xbox lock placed through today's schedule while the web session was down (see [Xbox lock without the web session](#xbox-lock-without-the-web-session)); such a lock ends at midnight at the latest, and its `current` describes the schedule day (`allowance_minutes`, `allotted_intervals`, `schedule_enabled`). Strict mode must stay off when another integration manages these locks (see [Strict mode](#strict-mode)).
+Both actions can answer with what they did (`response_variable`): `{prior, applied, lock_path}`. `applied` is `"left_parent_override"` when a parent changed the lock in the Family Safety app since; the answer then has `current: {type, valid_until, override_until, allow_until}`. `lock_path` is `web` (Windows), `xapprove` for an Xbox lock placed through the Xbox Family Settings API (see [Xbox through the Xbox Family Settings API](#xbox-through-the-xbox-family-settings-api-xapprove)), or `mobile_schedule` for an Xbox lock placed through today's schedule when xapprove could not be used (see [The Xbox lock's fallback](#the-xbox-locks-fallback-todays-xbox-schedule)); such a lock ends at midnight at the latest, and its `current` describes the schedule day (`allowance_minutes`, `allotted_intervals`, `schedule_enabled`). Strict mode must stay off when another integration manages these locks (see [Strict mode](#strict-mode)).
 
-#### Extra time (experimental)
+#### Extra time
 
-`add_time_bonus` and `cancel_time_bonus` are **experimental: based on an uncaptured request; verified by reading back.** No capture shows how the Family Safety app writes extra time, so `add_time_bonus` sends the captured lock request with `allowUntil` instead of `blockUntil`, then reads the override back and succeeds only when Microsoft reports extra time ending within 2 minutes of what was asked. Otherwise it fails with what was read back (the request and answer are logged at debug level). Extra time replaces a `lock_platform` lock (Microsoft keeps one override per platform), so the lock's hold is released. `cancel_time_bonus` only ever cancels extra time, never a lock. The `hold` attribute reads `bonus_ours` while extra time given here is in force. With the xapprove option on, Xbox extra time is a captured request instead (an allow override, see [Xbox through the Xbox Family Settings API](#xbox-through-the-xbox-family-settings-api-xapprove)) and works without the web session.
+**Xbox:** `add_time_bonus` and `cancel_time_bonus` go through the Xbox Family Settings API (an allow override, captured from the app; see [Xbox through the Xbox Family Settings API](#xbox-through-the-xbox-family-settings-api-xapprove)). They need the Xbox Family Settings sign-in and the xapprove option, and fail with a clear error otherwise.
+
+**Windows** is **experimental: based on an uncaptured request; verified by reading back.** No capture shows how the Family Safety app writes Windows extra time, so `add_time_bonus` sends the captured lock request with `allowUntil` instead of `blockUntil`, then reads the override back and succeeds only when Microsoft reports extra time ending within 2 minutes of what was asked. Otherwise it fails with what was read back (the request and answer are logged at debug level). Extra time replaces a `lock_platform` lock (Microsoft keeps one override per platform), so the lock's hold is released. `cancel_time_bonus` only ever cancels extra time, never a lock. The `hold` attribute reads `bonus_ours` while extra time given here is in force.
 
 ```yaml
 service: microsoft_family_safety.add_time_bonus
@@ -624,7 +627,7 @@ data:
 
 ### Xbox token probe (diagnostic)
 
-`probe_xbox_token` checks, inside Home Assistant, whether the Microsoft sign-in the integration already holds can also get an Xbox Live token (which would make the Xbox reads possible without the 24-hour web session). It uses the stored mobile refresh token to ask `login.live.com` for scope `service::user.auth.xboxlive.com::MBI_SSL`, then tries Xbox user authentication (RPS ticket `t=`, then `d=`) and XSTS (`http://xboxlive.com`, `RETAIL`). It answers per step with HTTP status, error codes, the granted scope, expiry in seconds and the **names** of the XSTS `xui` claims. No token, gamertag or Xbox user id is returned or logged, and a refresh token in Microsoft's answer is thrown away: the integration keeps its own.
+`probe_xbox_token` checks, inside Home Assistant, whether the Family Safety sign-in the integration holds can also get an Xbox Live token. (Live, xapprove refused every such token, so the Xbox uses the separate Xbox Family Settings sign-in; this probe stays as a diagnostic and is not used by anything else.) It uses the stored mobile refresh token to ask `login.live.com` for scope `service::user.auth.xboxlive.com::MBI_SSL`, then tries Xbox user authentication (RPS ticket `t=`, then `d=`) and XSTS (`http://xboxlive.com`, `RETAIL`). It answers per step with HTTP status, error codes, the granted scope, expiry in seconds and the **names** of the XSTS `xui` claims. No token, gamertag or Xbox user id is returned or logged, and a refresh token in Microsoft's answer is thrown away: the integration keeps its own.
 
 **The risk, and why `confirm_risk: true` is required.** Microsoft documents for its identity platform that a refresh token is not tied to a scope and that using it does not revoke it ([Refresh tokens](https://learn.microsoft.com/en-us/entra/identity-platform/refresh-tokens)), and the integration already rotates this token through the same endpoint without trouble. It does not document this for the older `login.live.com/oauth20_token.srf` endpoint used here. If that endpoint ever revoked the old token on use, the integration would need a new sign-in. The probe holds off the integration's own token refresh while it runs, then runs one normal refresh and reports it as `family_refresh_after` (`ok: false` means: sign in again). Administrators only; `entry_id` is needed only with several entries.
 
@@ -637,17 +640,9 @@ response_variable: probe
 
 ### Xbox Family Settings API probe (diagnostic)
 
-`probe_xapprove` checks, inside Home Assistant and without writing anything, whether the Xbox through xapprove can work: it runs the token steps from the stored sign-in, looks up the children's Xbox user ids, and reads the first resolved child's override (`GET /api/v1/user/{xuid}/settings/screentime/overrides`), trying each way of signing that read in turn until one answers 200:
+`probe_xapprove` checks, inside Home Assistant and without writing anything, whether the Xbox through xapprove works with the [Xbox Family Settings sign-in](#sign-in-to-xbox-family-settings) (without that sign-in it answers `xbox_signed_in: false` and an `error`, and calls nothing). It runs that sign-in's token steps, looks up the children's Xbox user ids, and reads the first resolved child's override (`GET /api/v1/user/{xuid}/settings/screentime/overrides`), trying each way of signing that read in turn until one answers 200: the sign-in's XSTS signed with the device key (`sisu`), unsigned (`sisu_unsigned`), with contract version 1 (`sisu_contract_1`), and an MSA token of that client for the xapprove scope as `WLID1.0 t=` (`sisu_xapprove_scope_wlid`). The first way that answers 200 is **saved and used by the integration from then on**, also after a restart (`working_method`, `method_saved`); until one has, the integration uses `sisu`. The Family Safety sign-in is never used.
 
-0. with the [Xbox Family Settings sign-in](#sign-in-to-xbox-family-settings): its XSTS, signed with the device key (`sisu`), unsigned (`sisu_unsigned`), with contract version 1 (`sisu_contract_1`), and an MSA token of that client for the xapprove scope as `WLID1.0 t=` (`sisu_xapprove_scope_wlid`); skipped without that sign-in;
-1. the XSTS for `http://xboxlive.com` (`XBL3.0 x=<uhs>;<token>`), without and with `x-xbl-contract-version` 1, 2 and 3 (`xbl3`, `xbl3_contract_1` ...);
-2. an XSTS for the relying parties `http://xapprove.xboxlive.com` and `https://xapprove.xboxlive.com/`, each without and with a contract version (`xbl3_rp_http_xapprove...`, `xbl3_rp_https_xapprove...`);
-3. an MSA token for scope `service::xapprove.xboxlive.com::MBI_SSL` from the stored sign-in (its refresh token thrown away as always): sent directly as `WLID1.0 t=`, `WLID1.0 d=`, `Bearer` and `MSAuth1.0` (`wlid_t_xapprove_scope` ...), then as the ticket for Xbox user authentication and XSTS (`xbl3_xapprove_scope_ticket`, `..._rp_http_xapprove`);
-4. the relying party `rp://xapprove.xboxlive.com/`, the Xbox user-auth MSA token sent directly, and the integration's own Family token (the one the Family Safety mobile API takes, so no extra use of the sign-in) as `MSAuth1.0`, as `WLID1.0 t=` and as the user-authentication ticket.
-
-Ways 1 to 4 use the Family Safety sign-in only (no device or title token, no SISU). A token step that fails is not asked again for the next way that needs it. The first way that answers 200 is **saved and used by the integration from then on**, also after a restart (`working_method`, `method_saved`); until one has, the integration uses the first.
-
-It answers with non-secret facts only: `identity` (`xbox_family_settings` when the Xbox sign-in was used, else `family_safety_signin`), `xbox_signed_in`, `xbox_signin_error` (the failing step, status and XErr when the Xbox sign-in itself failed; the family is then looked up with the Family Safety sign-in), `steps` (per token step, including `sisu_msa_refresh`, `device_authenticate` and `sisu_authorize` for the Xbox sign-in, the HTTP status, XErr and granted scope; steps for another scope or relying party carry it in brackets), whether the XSTS token carries the parent's id (`parent_xuid_claim_present`), the family lookup (`members`, `members_with_xuid`, `adults`, `signed_in_parent_listed`, the distinct `roles` and the member field **names**), per child `resolved` and `via` (`option`, `family_id`, `family_name`, `elimination`), `overrides_attempts` (per way tried: `name`, `stage` `token` or `xapprove`, `status`, `xerr`, `step`/`error` for a token failure, and `www_authenticate` `{name, value}` when xapprove sends that header), `working_method`, and `overrides_read` (`ok`, `method`, `override_active`, `type`, `raw_type`, `valid_until`, `actions`; or `status`/`xerr` of the first way when none worked). Like `probe_xbox_token` it needs `confirm_risk: true`, is for administrators, throws away the refresh token Microsoft returns, and ends with one normal refresh reported as `family_refresh_after`. No token, gamertag or Xbox user id is returned or logged.
+It answers with non-secret facts only: `identity` (`xbox_family_settings`), `xbox_signed_in`, `xbox_signin_error` (the failing step, status and XErr when the sign-in itself failed), `steps` (`sisu_msa_refresh`, `device_authenticate`, `sisu_authorize`: HTTP status, XErr, which tokens came back and the XSTS `xui` claim **names**), `parent_xuid_claim_present`, the family lookup (`members`, `members_with_xuid`, `adults`, `signed_in_parent_listed`, the distinct `roles` and the member field **names**), per child `resolved` and `via` (`option`, `family_id`, `family_name`, `elimination`), `overrides_attempts` (per way tried: `name`, `stage` `token` or `xapprove`, `status`, `xerr`, `step`/`error` for a token failure, and `www_authenticate` `{name, value}` when xapprove sends that header), `working_method`, and `overrides_read` (`ok`, `method`, `override_active`, `type`, `raw_type`, `valid_until`, `actions`; or `status`/`xerr` of the first way when none worked). It needs `confirm_risk: true` (the unofficial client id, see the sign-in's risk note) and is for administrators. No token, gamertag or Xbox user id is returned or logged.
 
 ```yaml
 service: microsoft_family_safety.probe_xapprove
@@ -881,7 +876,8 @@ Native authentication trades some of the add-on's isolation for simplicity. Be a
 - **Unofficial API** — Microsoft provides no public API for Family Safety. This integration relies on reverse-engineered endpoints that may change or break at any time.
 - **Renewal depends on the Microsoft-account cookies.** The integration captures Microsoft's cookie rotations, re-fetches the antiforgery token when it goes stale and, since 2.0.6, completes the daily silent sign-in of the account page by itself. It cannot recover from a revoked or expired Microsoft login (password change, security review, cookies past their date); Home Assistant will prompt you then. With "Stay signed in?" answered Yes, the captured cookies are valid for about a year.
 - **Akamai bot-manager cookies are deliberately discarded.** Microsoft fronts `account.microsoft.com` with Akamai, whose `bm_sv` / `ak_bmsc` cookies are tied to the browser that obtained them. Replaying them from Home Assistant made Microsoft stop answering entirely (the request hung until the timeout, then the connection was reset), which hid an expired session behind timeouts and backoffs. They are dropped wherever cookies are captured, loaded or saved.
-- **A browser is still required to sign in.** The Family web session can only be established interactively, because Microsoft gates the Family dashboard behind an interactive OAuth hop. The mobile token is then fetched server-side, and only falls back to the browser if Microsoft demands another interactive step. There is no fully headless sign-in.
+- **A browser is still required to sign in.** The Family Safety sign-in and the Xbox Family Settings sign-in are both interactive. There is no fully headless sign-in.
+- **No Xbox play time.** It came from the Family web session's activity report, which the integration no longer uses for the Xbox. The Xbox Allowed Now sensor knows the schedule and the override in force, not the minutes played.
 - **Entity IDs changed** — see [Breaking changes](#breaking-changes).
 - **Per-platform lock is unreliable** — Microsoft removed the `override_device` endpoint. Account Lock is the recommended replacement, but it locks all platforms at once.
 - **Legacy add-on mode is serialized** — the add-on uses a single browser instance with a lock, so concurrent requests are queued.
@@ -926,7 +922,6 @@ Used for read operations and app management. Token-based, no browser session req
 | `/family/windows/home/direct`, `/family/home` | — | Family dashboard pages, scraped for `__RequestVerificationToken` | Session bootstrap |
 | `/account` | — | Session health probe | `sensor.*_connection` |
 | `/family/api/screen-time-global` | `childId` | Global screen time toggle | — |
-| `/family/api/screen-time-xbox` | `childId` | Xbox screen time policy | — |
 | `/family/api/device-limits/get-devices` | `childId` | Connected devices list | — |
 | `/family/api/app-limits/get-all-app-policies-v3` | `childId` | All app policies | `switch.app_*` |
 | `/family/api/app-limits/get-app-time-extension-requests` | `memberIdList` | Pending extension requests | `sensor.pending_requests`, `button.approve/deny` |
@@ -1018,6 +1013,7 @@ The addon exposes a local HTTP API that proxies requests through the authenticat
 | Set ask-to-buy policy | POST | — | Working |
 | **Lock device (instant)** | **N/A** | ~~POST~~ | **Broken** (Microsoft removed) |
 | Lock account (workaround) | POST x14 | — | Working (sets all quotas to 0) |
+| Lock the Xbox, Xbox extra time | — | — | Working through the Xbox Family Settings API (`xapprove.xboxlive.com`, its own sign-in); the lock falls back to today's Xbox schedule (mobile API) |
 
 ---
 

@@ -24,7 +24,9 @@ DEFAULT_TIMEOUT: Final = 30
 
 # Platform selection
 CONF_PLATFORMS: Final = "platforms"
-AVAILABLE_PLATFORMS: Final = ["Windows", "Xbox", "Mobile"]
+#: Platform lock switches chosen in the options. The Xbox lock switch is not
+#: among them: it comes with the Xbox Family Settings sign-in and xapprove.
+AVAILABLE_PLATFORMS: Final = ["Windows", "Mobile"]
 DEFAULT_PLATFORMS: Final = ["Windows"]
 # Xbox usage and the Xbox lock still need the Family web session, which some
 # accounts must renew with an interactive sign-in every 24 h (#52). Off = the
@@ -40,10 +42,8 @@ DEFAULT_XBOX_FEATURES: Final = True
 CONF_STRICT_MODE: Final = "strict_mode"
 DEFAULT_STRICT_MODE: Final = False
 EVENT_LOCK_REASSERTED: Final = f"{DOMAIN}_lock_reasserted"
-# Xbox lock without the Family web session: today's Xbox schedule day is set
-# to no time (mobile API) and put back at unlock, at its end or at midnight.
-CONF_XBOX_LOCK_MOBILE_FALLBACK: Final = "xbox_lock_mobile_fallback"
-DEFAULT_XBOX_LOCK_MOBILE_FALLBACK: Final = False
+# The Xbox lock's fallback (xbox_mobile_lock.py): today's Xbox schedule day
+# set to no time (mobile API), put back at unlock, at its end or at midnight.
 XBOX_SCHEDULE_NOT_RESTORED_ISSUE: Final = "xbox_schedule_not_restored"
 #: How an Xbox lock was placed (``lock_path`` attribute and service answers).
 LOCK_PATH_WEB: Final = "web"

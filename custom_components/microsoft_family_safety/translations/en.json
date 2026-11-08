@@ -10,7 +10,7 @@
           "allow_insecure_http_auth": "Allow insecure local HTTP authentication (testing only)"
         },
         "data_description": {
-          "platforms": "Windows, Xbox, Mobile: one lock switch per ticked platform. Ticking Xbox also turns on Xbox play time and the Xbox lock, which need the Microsoft web session (some accounts must renew it with a sign-in every 24 hours). Xbox daily limits work either way. Leave Xbox unticked if you do not need the Xbox lock or Xbox play time: the integration then runs on the mobile token only, with a shorter sign-in."
+          "platforms": "Windows, Mobile: one lock switch per ticked platform. The Xbox lock is not chosen here: it comes with Sign in to Xbox Family Settings and the xapprove option below, and the Xbox daily limits are always there. Nothing here needs the Microsoft web session."
         }
       },
       "auth": {
@@ -85,7 +85,6 @@
           "allow_insecure_http_auth": "Allow insecure local HTTP authentication (testing only)",
           "allowed_users": "Users allowed to control Microsoft Family Safety",
           "strict_mode": "Strict mode: put back a platform lock cancelled elsewhere",
-          "xbox_lock_mobile_fallback": "Xbox lock without the web session: use today's Xbox schedule",
           "app_usage_sensors": "App usage sensors per child",
           "xbox_xapprove": "Xbox lock and extra time through the Xbox Family Settings API (xapprove)",
           "xbox_xuids": "Xbox user ids (optional, child=xuid)",
@@ -93,14 +92,13 @@
           "xbox_sign_out": "Sign out of Xbox Family Settings"
         },
         "data_description": {
-          "platforms": "Windows, Xbox, Mobile: one lock switch per ticked platform. Ticking Xbox also turns on Xbox play time and the Xbox lock, which need the Microsoft web session (some accounts must renew it with a sign-in every 24 hours). Xbox daily limits work either way. Leave Xbox unticked if you do not need the Xbox lock or Xbox play time: the integration then runs on the mobile token only, with a shorter sign-in.",
+          "platforms": "Windows, Mobile: one lock switch per ticked platform. The Xbox lock is not chosen here: it comes with Sign in to Xbox Family Settings and the xapprove option below, and the Xbox daily limits are always there. Nothing here needs the Microsoft web session.",
           "allowed_users": "Leave empty to let every user use the buttons and settings (default). As soon as users are ticked, only they and the administrators can: a child's non-administrator account is refused on every button, switch, limit and time window, and on the microsoft_family_safety actions. Automations and scripts run by Home Assistant are not affected. Give the child a non-administrator account: an administrator can change this option.",
           "strict_mode": "Off by default. When on, a Windows or Xbox lock placed by microsoft_family_safety.lock_platform that Microsoft reports as cancelled (for example from the Family Safety app) while it should still hold is placed again on the next update, at most every 10 minutes, and the event microsoft_family_safety_lock_reasserted is fired. unlock_platform ends it. Keep strict mode off when another integration (Hearth, for example) manages these locks: strict mode would place a lock again after a parent released it in the Family Safety app, fighting the parent's decision.",
-          "xbox_lock_mobile_fallback": "Off by default: turn it on once you have checked that your console stops when today's Xbox daily limit is set to no time in the middle of the day. The Xbox lock is normally sent through the Microsoft web session, which some accounts must renew with a sign-in every 24 hours. While that session is down, an Xbox lock sets today's Xbox daily limit to no time (through the mobile token) and puts the saved day back at unlock, at the end of the lock, and at midnight in any case: such a lock never lasts past midnight. A change a parent makes to that day in the Family Safety app meanwhile is kept. Needs a separate Xbox schedule. The lock switch shows lock_path: web or mobile_schedule.",
           "app_usage_sensors": "0 (default) = off. Otherwise each child's most used apps today, up to this number, get a sensor with their minutes used today, and the event microsoft_family_safety_app_usage fires when an app's usage grows between two updates. An app keeps its sensor once it has one.",
-          "xbox_xapprove": "Off by default. Easiest: tick Sign in to Xbox Family Settings below; after the sign-in, Home Assistant checks it and offers to turn this on. When on, the Xbox lock, unlock, the Xbox lock switch and Xbox extra time go through the Xbox Family Settings API first, without the Microsoft web session; the web route and today's Xbox schedule stay as fallbacks. A parent's own pause or extra time is never replaced. Without the Xbox Family Settings sign-in it tries a token from the Family Safety sign-in, which Microsoft has refused so far (and does not document whether that use can revoke the sign-in). The lock switch shows lock_path: xapprove.",
+          "xbox_xapprove": "Off by default. Easiest: tick Sign in to Xbox Family Settings below; after the sign-in, Home Assistant checks it and offers to turn this on. When on (with that sign-in), the Xbox lock, unlock, the Xbox lock switch and Xbox extra time go through the Xbox Family Settings API; when that cannot be used, an Xbox lock falls back to today's Xbox schedule. A parent's own pause or extra time is never replaced. The Xbox never uses the Microsoft web session. The lock switch shows lock_path: xapprove or mobile_schedule.",
           "xbox_xuids": "Leave empty: each child's Xbox user id is looked up in your Xbox family. Only when that lookup fails (probe_xapprove says so), enter child=xuid pairs separated by commas, the child given by first name or account id, for example Alex=2533274800000000.",
-          "xbox_sign_in": "Tick and submit to go to the sign-in page. The Xbox lock and extra time through the Xbox Family Settings API need it: that API refuses the Family Safety sign-in. Use the same parent Microsoft account as for Family Safety. Tick it again to replace an earlier or expired sign-in. Unofficial use of the Xbox Family Settings app's sign-in: Microsoft can break or block it, and the Xbox lock then falls back to the web session. See the README.",
+          "xbox_sign_in": "Tick and submit to go to the sign-in page. The Xbox lock switch, the Xbox Override sensor and Xbox extra time need it. Use the same parent Microsoft account as for Family Safety. Tick it again to replace an earlier or expired sign-in. Unofficial use of the Xbox Family Settings app's sign-in: Microsoft can break or block it, and the Xbox lock then falls back to today's Xbox schedule. See the README.",
           "xbox_sign_out": "Tick and submit to forget the Xbox Family Settings sign-in (its refresh token and key). The Xbox lock then works the way it did before the sign-in."
         }
       },
@@ -116,14 +114,14 @@
       },
       "xbox_signin_works": {
         "title": "Xbox control works",
-        "description": "Signed in. Home Assistant read a child's Xbox settings with this sign-in, so it can pause the Xbox and give extra time through the Xbox Family Settings API.\n\nLeave the box ticked and submit to use it. If it stops working later, the Xbox lock falls back to the way it works today and a Repairs issue says so.",
+        "description": "Signed in. Home Assistant read a child's Xbox settings with this sign-in, so it can pause the Xbox and give extra time through the Xbox Family Settings API.\n\nLeave the box ticked and submit to use it. If it stops working later, the Xbox lock falls back to today's Xbox schedule and a Repairs issue says so.",
         "data": {
           "xbox_xapprove": "Use the Xbox Family Settings API for the Xbox lock and extra time"
         }
       },
       "xbox_signin_refused": {
         "title": "Xbox refused this sign-in",
-        "description": "The sign-in was saved, but Xbox refused to show a child's Xbox settings with it ({reason}). The Xbox lock keeps working the way it does today: the Microsoft web session and, if turned on, today's Xbox schedule.\n\nLeave the box unticked and submit. Check that you signed in with the **parent** account; if not, open Configure and tick Sign in to Xbox Family Settings again. For details, run the action microsoft_family_safety.probe_xapprove.",
+        "description": "The sign-in was saved, but Xbox refused to show a child's Xbox settings with it ({reason}). Meanwhile an Xbox lock goes through today's Xbox schedule.\n\nLeave the box unticked and submit. Check that you signed in with the **parent** account; if not, open Configure and tick Sign in to Xbox Family Settings again. For details, run the action microsoft_family_safety.probe_xapprove.",
         "data": {
           "xbox_xapprove": "Use the Xbox Family Settings API for the Xbox lock and extra time"
         }
@@ -198,7 +196,7 @@
     },
     "lock_platform": {
       "name": "Lock Platform",
-      "description": "Lock a platform (Windows/Xbox/Mobile) for a child account until a time. The first lock saves the override Microsoft had in force (a parent's own lock, or none) so unlock_platform can put it back; a lock already in force that ends later is kept. Answers with the saved prior state, the lock applied and lock_path (web, or mobile_schedule: an Xbox lock placed through today's Xbox schedule while the web session is down, which ends at midnight at the latest). Keep strict mode off when another integration (Hearth, for example) manages these locks: strict mode would place a lock again after a parent released it in the Family Safety app, fighting the parent's decision.",
+      "description": "Lock a platform (Windows/Xbox/Mobile) for a child account until a time. The first lock saves the override Microsoft had in force (a parent's own lock, or none) so unlock_platform can put it back; a lock already in force that ends later is kept. Answers with the saved prior state, the lock applied and lock_path: web (Windows), xapprove (the Xbox through the Xbox Family Settings API; a parent's own pause or extra time is left alone: left_parent_override), or mobile_schedule (an Xbox lock placed through today's Xbox schedule when xapprove cannot be used, which ends at midnight at the latest). Keep strict mode off when another integration (Hearth, for example) manages these locks: strict mode would place a lock again after a parent released it in the Family Safety app, fighting the parent's decision.",
       "fields": {
         "account_id": {
           "name": "Account ID",
@@ -224,7 +222,7 @@
     },
     "unlock_platform": {
       "name": "Unlock Platform",
-      "description": "Unlock a platform (Windows/Xbox/Mobile) for a child account. Puts back the lock that was in force before lock_platform if it has not run out yet, otherwise cancels the lock. An Xbox lock placed through today's Xbox schedule (lock_path mobile_schedule) puts the saved day back, unless a parent changed it in the app since (left_parent_override). Answers with the prior state, what was applied and lock_path. Keep strict mode off when another integration (Hearth, for example) manages these locks: strict mode would place a lock again after a parent released it in the Family Safety app, fighting the parent's decision.",
+      "description": "Unlock a platform (Windows/Xbox/Mobile) for a child account. Windows: puts back the lock that was in force before lock_platform if it has not run out yet, otherwise cancels the lock. Xbox: cancels only our own lock (lock_path xapprove), or puts the saved day back for a lock placed through today's Xbox schedule (lock_path mobile_schedule); a parent's change since is left alone (left_parent_override). Answers with the prior state, what was applied and lock_path. Keep strict mode off when another integration (Hearth, for example) manages these locks: strict mode would place a lock again after a parent released it in the Family Safety app, fighting the parent's decision.",
       "fields": {
         "account_id": {
           "name": "Account ID",
@@ -609,8 +607,8 @@
       }
     },
     "add_time_bonus": {
-      "name": "Add Time Bonus (experimental)",
-      "description": "EXPERIMENTAL: based on an uncaptured request; verified by reading back. Give a child extra time on Windows or the Xbox, for some minutes or until a time. Microsoft keeps one override per platform, so this replaces a lock placed by lock_platform (released_hold in the answer). Succeeds only when Microsoft reads back extra time ending when asked; otherwise it fails and says what was read back. Answers with platform, applied_until, read_back and released_hold.",
+      "name": "Add Time Bonus",
+      "description": "Give a child extra time on Windows or the Xbox, for some minutes or until a time. Xbox: through the Xbox Family Settings API (needs Sign in to Xbox Family Settings and the xapprove option), refused while a parent's own pause or extra time is in force. Windows: EXPERIMENTAL, based on an uncaptured request and verified by reading back. Microsoft keeps one override per platform, so this replaces a lock placed by lock_platform (released_hold in the answer). Answers with platform, applied_until, read_back, released_hold and, for the Xbox, lock_path.",
       "fields": {
         "account_id": {
           "name": "Account ID",
@@ -635,8 +633,8 @@
       }
     },
     "cancel_time_bonus": {
-      "name": "Cancel Time Bonus (experimental)",
-      "description": "EXPERIMENTAL: based on an uncaptured request; verified by reading back. Cancel extra time on Windows or the Xbox. Only extra time is cancelled: when a lock (ours or a parent's) or nothing is in force, nothing is sent and the answer says so.",
+      "name": "Cancel Time Bonus",
+      "description": "Cancel extra time on Windows or the Xbox (the Xbox through the Xbox Family Settings API). Only extra time is cancelled: when a lock (ours or a parent's) or nothing is in force, nothing is sent and the answer says so.",
       "fields": {
         "account_id": {
           "name": "Account ID",
@@ -654,7 +652,7 @@
     },
     "probe_xapprove": {
       "name": "Probe Xbox Family Settings API (diagnostic)",
-      "description": "Administrators only. Gets Xbox Live tokens from the stored Microsoft sign-in, looks up the children's Xbox user ids and reads the first child's Xbox override from the Xbox Family Settings API (xapprove), trying several ways of signing that read until one works; that way is saved and used by the integration. Writes nothing to the Xbox. Answers with HTTP status codes, error codes and the override's type and end only; no token, gamertag or Xbox user id is returned or logged. Refuses unless confirm_risk is true: see the README.",
+      "description": "Administrators only. With the Xbox Family Settings sign-in: runs its token steps, looks up the children's Xbox user ids and reads the first child's Xbox override from the Xbox Family Settings API (xapprove), trying a few ways of signing that read until one works; that way is saved and used by the integration. Writes nothing to the Xbox and never uses the Family Safety sign-in. Answers with HTTP status codes, error codes and the override's type and end only; no token, gamertag or Xbox user id is returned or logged. Refuses unless confirm_risk is true: see the README.",
       "fields": {
         "entry_id": {
           "name": "Config entry",
@@ -672,17 +670,13 @@
       "title": "An Xbox schedule was not put back",
       "description": "An Xbox lock placed through today's Xbox schedule (on {title}) has ended, but its saved day could not be written back yet ({error}). Until it is, that weekday's Xbox daily limit stays at no time. It is retried at every update and this issue goes away once it succeeds. If it persists, check the Xbox schedule in the Family Safety app and set that day back by hand."
     },
-    "xbox_lock_needs_xbox_features": {
-      "title": "The Xbox lock needs the Xbox features",
-      "description": "Something asked {title} to lock or unlock an Xbox, but this entry runs on the mobile token only, and the Xbox lock goes through the Microsoft Family web session.\n\nTo turn the Xbox features on, open Settings > Devices & services > Microsoft Family Safety > Configure, tick **Xbox** under Monitored platforms and submit. Home Assistant then asks you to sign in to Microsoft again; answer **Yes** to \"Stay signed in?\". Some accounts must repeat that sign-in every 24 hours.\n\nIf you do not need the Xbox lock, remove the call that asked for it and ignore this issue."
-    },
     "xapprove_refused": {
       "title": "The Xbox Family Settings API refused the Xbox token",
-      "description": "{title} tried the Xbox Family Settings API (xapprove) and Microsoft refused the Xbox token ({error}). The Xbox lock and extra time use the Microsoft web session and, if turned on, today's Xbox schedule instead. xapprove is tried again every 6 hours and this issue goes away once it works.\n\nTo fix it, open Settings > Devices & services > Microsoft Family Safety > Configure and tick **Sign in to Xbox Family Settings (next page)**: the API refuses the Family Safety sign-in, so it needs that one. Already signed in? Sign in again there with the parent account, or untick **Xbox lock and extra time through the Xbox Family Settings API (xapprove)**. The action microsoft_family_safety.probe_xapprove gives the details."
+      "description": "{title} tried the Xbox Family Settings API (xapprove) and Microsoft refused the Xbox token ({error}). Meanwhile an Xbox lock goes through today's Xbox schedule, and Xbox extra time is not available. xapprove is tried again every 6 hours and this issue goes away once it works.\n\nTo fix it, open Settings > Devices & services > Microsoft Family Safety > Configure and tick **Sign in to Xbox Family Settings (next page)** to sign in again with the parent account, or untick **Xbox lock and extra time through the Xbox Family Settings API (xapprove)**. The action microsoft_family_safety.probe_xapprove gives the details."
     },
     "xbox_signin_expired": {
       "title": "Sign in to Xbox Family Settings again",
-      "description": "{title} can no longer renew its Xbox Family Settings sign-in: Microsoft refused it (after a password change, a removed app permission, or a long time unused). Meanwhile the Xbox lock and Xbox extra time fall back to the Microsoft web session and, if turned on, today's Xbox schedule.\n\nTo fix it, open Settings > Devices & services > Microsoft Family Safety > Configure, tick **Sign in to Xbox Family Settings (next page)**, submit, and follow that page with the parent account. This issue goes away as soon as the new sign-in is saved."
+      "description": "{title} can no longer renew its Xbox Family Settings sign-in: Microsoft refused it (after a password change, a removed app permission, or a long time unused). Meanwhile an Xbox lock goes through today's Xbox schedule, and Xbox extra time is not available.\n\nTo fix it, open Settings > Devices & services > Microsoft Family Safety > Configure, tick **Sign in to Xbox Family Settings (next page)**, submit, and follow that page with the parent account. This issue goes away as soon as the new sign-in is saved."
     }
   }
 }

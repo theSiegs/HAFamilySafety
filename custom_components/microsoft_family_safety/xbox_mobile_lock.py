@@ -1,12 +1,10 @@
-"""Xbox lock without the Family web session: the mobile-schedule fallback.
+"""The Xbox lock's fallback: today's Xbox schedule (mobile token).
 
-The Xbox lock is a blockUntil override on the Family web API, which needs the
-Family web session. Microsoft caps that session at 24 hours on some accounts,
-after which every Xbox web route answers 401 until someone signs in again. The
-mobile schedule API (``/v4/devicelimits/schedules``) runs on the long-lived
-mobile token and still writes the Xbox schedule the console enforces.
-
-So when the web route cannot be used, an Xbox lock instead:
+The Xbox lock goes through the Xbox Family Settings API (xbox_xapprove.py).
+When that cannot be used (no Xbox sign-in, the API out of reach or refusing
+the token), the mobile schedule API (``/v4/devicelimits/schedules``), which
+runs on the long-lived mobile token, writes the Xbox schedule the console
+enforces. An Xbox lock then:
 
 1. reads today's Xbox day exactly as Microsoft holds it (allowance in ms,
    allowed intervals, whether the Xbox schedule is on) and saves it in the
@@ -39,9 +37,7 @@ from homeassistant.util import dt as dt_util
 
 from .api_client import FamilySafetyWebAPI
 from .const import (
-    CONF_XBOX_LOCK_MOBILE_FALLBACK,
     DAY_KEYS,
-    DEFAULT_XBOX_LOCK_MOBILE_FALLBACK,
     DOMAIN,
     LOCK_PATH_MOBILE_SCHEDULE,
     XBOX_SCHEDULE_NOT_RESTORED_ISSUE,
@@ -103,9 +99,6 @@ class XboxMobileLockMixin:
     """Coordinator part: the Xbox lock through today's mobile schedule day."""
 
     def _init_xbox_mobile_lock(self, entry) -> None:
-        self._xbox_mobile_fallback = bool(
-            entry.options.get(CONF_XBOX_LOCK_MOBILE_FALLBACK, DEFAULT_XBOX_LOCK_MOBILE_FALLBACK)
-        )
         #: hold key -> cancel callback of the timer that puts the day back.
         self._mobile_restore_timers: dict[str, Callable[[], None]] = {}
 
@@ -116,21 +109,6 @@ class XboxMobileLockMixin:
     @staticmethod
     def _is_mobile_hold(hold: Any) -> bool:
         return isinstance(hold, dict) and hold.get("path") == LOCK_PATH_MOBILE_SCHEDULE
-
-    def _xbox_web_unavailable(self) -> bool:
-        """True when the Xbox web override cannot be sent at all right now."""
-        if not self._web_override_available("Xbox"):
-            return True
-        return getattr(self.web_api, "family_context_state", None) in _WEB_DOWN_STATES
-
-    def _xbox_web_failed_for_session(self) -> bool:
-        """After a failed Xbox web write: was it the session (401, context not ready)?"""
-        web = self.web_api
-        if web is None:
-            return True
-        if getattr(web, "last_isolated_error_code", None) == "HTTP_401":
-            return True
-        return getattr(web, "family_context_state", "ready") != "ready"
 
     # ------------------------------------------------------------------
     # Ownership
@@ -317,7 +295,7 @@ class XboxMobileLockMixin:
             current = await self.web_api.get_mobile_xbox_day(account_id, day_index)
         except Exception as err:
             raise HomeAssistantError(
-                "Cannot lock Xbox: the Family web session is not available and "
+                "Cannot lock Xbox: the Xbox Family Settings API is not available and "
                 f"today's Xbox schedule could not be read ({err}). Nothing was changed."
             ) from err
         target = min(dt_util.as_utc(requested), dt_util.as_utc(next_local_midnight(now)))
@@ -389,7 +367,7 @@ class XboxMobileLockMixin:
                     await self.web_api.set_mobile_schedule_enabled(account_id, True, platform="Xbox")
             except Exception as err:
                 raise HomeAssistantError(
-                    "Cannot lock Xbox: the Family web session is not available and "
+                    "Cannot lock Xbox: the Xbox Family Settings API is not available and "
                     f"Microsoft refused the Xbox schedule change ({err})."
                 ) from err
         hold["confirmed"] = True
@@ -475,7 +453,7 @@ class XboxMobileLockMixin:
         return result
 
     async def _async_xbox_not_locked(self, account_id: str) -> dict[str, Any]:
-        """unlock_platform with no lock of ours and no web session: nothing to undo."""
+        """unlock_platform with no lock of ours: nothing to undo."""
         current = None
         if self.web_api is not None:
             try:

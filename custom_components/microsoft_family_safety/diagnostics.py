@@ -136,7 +136,7 @@ async def async_get_config_entry_diagnostics(
     result["options_in_effect"] = {
         "strict_mode": getattr(coordinator, "_strict_mode", None),
         "app_usage_sensors": getattr(coordinator, "app_usage_sensors", None),
-        "xbox_features": coordinator.xbox_features,
+        "web_session_enabled": coordinator.web_session_enabled,
     }
     # Non-secret state of the Xbox Family Settings sign-in and xapprove.
     store = getattr(coordinator, "_xbox_signin_store", None)

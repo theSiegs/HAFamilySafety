@@ -48,7 +48,7 @@ unblock_app:
 
 lock_platform:
   name: Lock Platform
-  description: "Lock a platform (Windows/Xbox/Mobile) for a child account until a time. The first lock saves the override Microsoft had in force (a parent's own lock, or none) so unlock_platform can put it back; a lock already in force that ends later is kept. Answers with the saved prior state, the lock applied and lock_path (web, or mobile_schedule: an Xbox lock placed through today's Xbox schedule while the web session is down, which ends at midnight at the latest). Keep strict mode off when another integration (Hearth, for example) manages these locks: strict mode would place a lock again after a parent released it in the Family Safety app, fighting the parent's decision."
+  description: "Lock a platform (Windows/Xbox/Mobile) for a child account until a time. The first lock saves the override Microsoft had in force (a parent's own lock, or none) so unlock_platform can put it back; a lock already in force that ends later is kept. Answers with the saved prior state, the lock applied and lock_path: web (Windows), xapprove (the Xbox through the Xbox Family Settings API; a parent's own pause or extra time is left alone: left_parent_override), or mobile_schedule (an Xbox lock placed through today's Xbox schedule when xapprove cannot be used, which ends at midnight at the latest). Keep strict mode off when another integration (Hearth, for example) manages these locks: strict mode would place a lock again after a parent released it in the Family Safety app, fighting the parent's decision."
   fields:
     account_id:
       name: Account ID
@@ -90,7 +90,7 @@ lock_platform:
 
 unlock_platform:
   name: Unlock Platform
-  description: "Unlock a platform (Windows/Xbox/Mobile) for a child account. Puts back the lock that was in force before lock_platform if it has not run out yet, otherwise cancels the lock. An Xbox lock placed through today's Xbox schedule (lock_path mobile_schedule) puts the saved day back, unless a parent changed it in the app since (left_parent_override). Answers with the prior state, what was applied and lock_path. Keep strict mode off when another integration (Hearth, for example) manages these locks: strict mode would place a lock again after a parent released it in the Family Safety app, fighting the parent's decision."
+  description: "Unlock a platform (Windows/Xbox/Mobile) for a child account. Windows: puts back the lock that was in force before lock_platform if it has not run out yet, otherwise cancels the lock. Xbox: cancels only our own lock (lock_path xapprove), or puts the saved day back for a lock placed through today's Xbox schedule (lock_path mobile_schedule); a parent's change since is left alone (left_parent_override). Answers with the prior state, what was applied and lock_path. Keep strict mode off when another integration (Hearth, for example) manages these locks: strict mode would place a lock again after a parent released it in the Family Safety app, fighting the parent's decision."
   fields:
     account_id:
       name: Account ID
@@ -684,8 +684,8 @@ get_sites:
           integration: microsoft_family_safety
 
 add_time_bonus:
-  name: Add Time Bonus (experimental)
-  description: "EXPERIMENTAL: based on an uncaptured request; verified by reading back. Give a child extra time on Windows or the Xbox, for some minutes or until a time. Microsoft keeps one override per platform, so this replaces a lock placed by lock_platform (released_hold in the answer). Succeeds only when Microsoft reads back extra time ending when asked; otherwise it fails and says what was read back. Answers with platform, applied_until, read_back and released_hold."
+  name: Add Time Bonus
+  description: "Give a child extra time on Windows or the Xbox, for some minutes or until a time. Xbox: through the Xbox Family Settings API (needs Sign in to Xbox Family Settings and the xapprove option), refused while a parent's own pause or extra time is in force. Windows: EXPERIMENTAL, based on an uncaptured request and verified by reading back. Microsoft keeps one override per platform, so this replaces a lock placed by lock_platform (released_hold in the answer). Answers with platform, applied_until, read_back, released_hold and, for the Xbox, lock_path."
   fields:
     account_id:
       name: Account ID
@@ -724,8 +724,8 @@ add_time_bonus:
         datetime:
 
 cancel_time_bonus:
-  name: Cancel Time Bonus (experimental)
-  description: "EXPERIMENTAL: based on an uncaptured request; verified by reading back. Cancel extra time on Windows or the Xbox. Only extra time is cancelled: when a lock (ours or a parent's) or nothing is in force, nothing is sent and the answer says so."
+  name: Cancel Time Bonus
+  description: "Cancel extra time on Windows or the Xbox (the Xbox through the Xbox Family Settings API). Only extra time is cancelled: when a lock (ours or a parent's) or nothing is in force, nothing is sent and the answer says so."
   fields:
     account_id:
       name: Account ID
@@ -771,7 +771,7 @@ probe_xbox_token:
 
 probe_xapprove:
   name: Probe Xbox Family Settings API (diagnostic)
-  description: "Administrators only. Gets Xbox Live tokens from the stored Microsoft sign-in, looks up the children's Xbox user ids and reads the first child's Xbox override from the Xbox Family Settings API (xapprove), trying several ways of signing that read until one works; that way is saved and used by the integration. Writes nothing to the Xbox. Answers with HTTP status codes, error codes and the override's type and end only; no token, gamertag or Xbox user id is returned or logged. Refuses unless confirm_risk is true: see the README."
+  description: "Administrators only. With the Xbox Family Settings sign-in: runs its token steps, looks up the children's Xbox user ids and reads the first child's Xbox override from the Xbox Family Settings API (xapprove), trying a few ways of signing that read until one works; that way is saved and used by the integration. Writes nothing to the Xbox and never uses the Family Safety sign-in. Answers with HTTP status codes, error codes and the override's type and end only; no token, gamertag or Xbox user id is returned or logged. Refuses unless confirm_risk is true: see the README."
   fields:
     entry_id:
       name: Config entry

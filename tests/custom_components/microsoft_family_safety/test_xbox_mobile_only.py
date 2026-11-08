@@ -1,9 +1,9 @@
-"""Xbox daily limits run on the mobile API, with or without the Xbox features.
+"""Xbox daily limits run on the mobile API, with or without the web session.
 
-With Xbox unticked the entry runs on the mobile token only (no Family web
-session). The Xbox schedule, its on/off switch and its daily limits all go
-through the mobile /v4 schedules endpoint, so they stay available then; only
-the Xbox lock and Xbox play time, which need the web session, go away.
+An entry without the Family web session runs on the mobile token only. The
+Xbox schedule, its on/off switch and its daily limits all go through the
+mobile /v4 schedules endpoint. The Xbox lock comes with the Xbox Family
+Settings sign-in (test_xbox_xapprove.py); Xbox play time (web only) is gone.
 """
 
 from __future__ import annotations
@@ -110,7 +110,7 @@ async def test_xbox_schedule_is_read_from_the_mobile_api_in_both_modes(
     hass, xbox_features: bool
 ) -> None:
     coord = _coordinator(hass, _entry(hass, xbox_features=xbox_features), {})
-    assert coord.xbox_features is xbox_features
+    assert coord.web_session_enabled is xbox_features
 
     result = await coord._fetch_web_api_data(CHILD)
 
@@ -146,20 +146,16 @@ async def test_mobile_only_creates_the_xbox_limits_once_the_schedule_is_on(hass)
     assert all(e.native_value == 120 for e in xbox)
 
 
-async def test_mobile_only_has_no_xbox_play_time_sensors(hass) -> None:
-    entry = _entry(hass, xbox_features=False)
+async def test_without_the_xbox_sign_in_there_is_no_xbox_lock_or_override(hass) -> None:
+    entry = _entry(hass, xbox_features=True)
     _coordinator(hass, entry, {"xbox_screentime_policy": _xbox_policy()})
 
-    entities = await _entities(hass, entry, sensor)
+    sensors = await _entities(hass, entry, sensor)
+    switches = await _entities(hass, entry, switch)
 
-    assert not [
-        e
-        for e in entities
-        if isinstance(
-            e,
-            (sensor.FamilySafetyXboxScreenTimeSensor, sensor.FamilySafetyXboxTimeRemainingSensor),
-        )
-    ]
+    assert not [e for e in sensors if isinstance(e, sensor.FamilySafetyXboxOverrideSensor)]
+    locks = [e for e in switches if isinstance(e, switch.FamilySafetyPlatformLockSwitch)]
+    assert [e._platform.lower() for e in locks] == ["windows"]
 
 
 async def test_mobile_only_writes_the_xbox_schedule_through_the_mobile_api(hass) -> None:

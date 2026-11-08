@@ -142,23 +142,18 @@ async def async_setup_entry(
                 entities.extend(
                     _create_account_sensors(coordinator, entry, account_id, account_data)
                 )
-            # Xbox sensors only for children Microsoft has Xbox data for. Xbox
-            # play comes from the web activity report, so they need the Xbox
-            # features (the Family web session).
+            # The Xbox Override sensor for each child xapprove has read an
+            # Xbox for (the Xbox Family Settings sign-in and the option on; any
+            # mode, the Family web session is never needed).
             if (
-                coordinator.xbox_features
+                coordinator.xapprove_enabled
                 and account_id not in known_xbox_accounts
-                and (
-                    (account_data or {}).get("xbox_today_usage") is not None
-                    or _xbox_schedule(account_data)
-                )
+                and isinstance((account_data or {}).get("xbox_xapprove"), dict)
             ):
                 known_xbox_accounts.add(account_id)
-                entities.extend([
-                    FamilySafetyXboxScreenTimeSensor(coordinator, entry, account_id),
-                    FamilySafetyXboxTimeRemainingSensor(coordinator, entry, account_id),
-                    FamilySafetyXboxOverrideSensor(coordinator, entry, account_id),
-                ])
+                entities.append(
+                    FamilySafetyXboxOverrideSensor(coordinator, entry, account_id)
+                )
             if account_id not in known_windows_accounts and isinstance(
                 (account_data or {}).get("screentime_policy"), dict
             ):
@@ -370,43 +365,6 @@ def website_lists(web_data: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _xbox_schedule(account_data: dict[str, Any] | None) -> dict[str, Any] | None:
-    """The child's Xbox schedule as the coordinator keeps it, if read."""
-    policy = (account_data or {}).get("xbox_screentime_policy")
-    return policy if isinstance(policy, dict) else None
-
-
-class FamilySafetyXboxScreenTimeSensor(FamilySafetyAccountSensor):
-    """Xbox play today, from the Xbox activity report.
-
-    The account Screen Time sensor covers every platform; this one is the
-    Xbox alone. Unknown until the report has been read today.
-    """
-
-    _attr_device_class = SensorDeviceClass.DURATION
-    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
-    _attr_state_class = SensorStateClass.TOTAL_INCREASING
-    _attr_icon = "mdi:microsoft-xbox"
-
-    def __init__(
-        self,
-        coordinator: FamilySafetyDataUpdateCoordinator,
-        entry: ConfigEntry,
-        account_id: str,
-    ) -> None:
-        """Initialize the sensor."""
-        super().__init__(coordinator, entry, account_id)
-        self._attr_unique_id = f"{entry.entry_id}_{account_id}_xbox_screentime"
-        self._attr_name = f"{self._get_account_name()} Xbox Screen Time"
-
-    @property
-    def native_value(self) -> int | None:
-        """Return today's Xbox play in minutes."""
-        account_data = self._get_account_data()
-        value = (account_data or {}).get("xbox_today_usage")
-        return value if isinstance(value, int) else None
-
-
 #: Xbox override types as the Xbox Override sensor names them.
 _OVERRIDE_STATES = {"blockUntil": "block", "allowUntil": "allow", "none": "none"}
 
@@ -522,15 +480,6 @@ class FamilySafetyTimeRemainingSensor(MinuteUpdateMixin, FamilySafetyAccountSens
     def _schedule(self) -> dict[str, Any] | None:
         policy = (self._get_account_data() or {}).get("screentime_policy")
         return policy if isinstance(policy, dict) else None
-
-
-class FamilySafetyXboxTimeRemainingSensor(FamilySafetyTimeRemainingSensor):
-    """Xbox time left today (Xbox schedule, Xbox play time, Xbox lock)."""
-
-    _platform = "Xbox"
-
-    def _schedule(self) -> dict[str, Any] | None:
-        return _xbox_schedule(self._get_account_data())
 
 
 class FamilySafetyAccountInfoSensor(FamilySafetyAccountSensor):

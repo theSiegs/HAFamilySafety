@@ -121,16 +121,15 @@ async def test_coordinator_feeds_each_platform_its_own_usage(coordinator):
     windows = coord.platform_status(CHILD, "Windows", NOW)
     xbox = coord.platform_status(CHILD, "Xbox", NOW)
     assert (windows["used_minutes"], windows["remaining_minutes"]) == (25, 95)
-    assert (xbox["used_minutes"], xbox["remaining_minutes"]) == (20, 40)
+    # Xbox play time came from the Family web session only: no longer read.
+    assert xbox["used_minutes"] is None and xbox["allowance_minutes"] == 60
 
 
-async def test_xbox_lock_in_the_policy_makes_it_zero(coordinator):
+async def test_an_xbox_block_read_through_xapprove_makes_it_zero(coordinator):
     coord, _ = coordinator
-    coord.data["accounts"][CHILD]["xbox_policy"] = {
-        "data": {"screenTimeOverride": {
-            "screenTimeOverrideType": "blockUntil",
-            "validUntil": iso_utc(dt_util.utcnow() + timedelta(hours=1)),
-        }}
+    coord.data["accounts"][CHILD]["xbox_xapprove"] = {
+        "type": "blockUntil",
+        "valid_until": iso_utc(dt_util.utcnow() + timedelta(hours=1)),
     }
     status = coord.platform_status(CHILD, "Xbox")
     assert (status["allowed"], status["remaining_minutes"]) == (False, 0)
@@ -153,15 +152,10 @@ async def test_entities_for_both_platforms(hass, coordinator):
         "windows_allowed_now", "windows_downtime", "xbox_allowed_now", "xbox_downtime"
     ]
     remaining = [e for e in sensors if isinstance(e, sensor.FamilySafetyTimeRemainingSensor)]
+    # No Xbox Time Remaining: Xbox play time came from the web session only.
     assert sorted(e.unique_id.split("_", 2)[-1] for e in remaining) == [
-        "windows_time_remaining", "xbox_time_remaining"
+        "windows_time_remaining"
     ]
-    xbox = next(e for e in remaining if e._platform == "Xbox")
-    # Unique id unchanged from before, so the existing entity keeps its id.
-    assert xbox.unique_id == f"{entry.entry_id}_{CHILD}_xbox_time_remaining"
-    assert xbox.extra_state_attributes["reason"] in {
-        "within_limits", "outside_allowed_hours", "allowance_used"
-    }
 
 
 async def test_minute_tick_writes_only_when_something_changed(hass, coordinator):
@@ -190,7 +184,7 @@ async def test_minute_tick_writes_only_when_something_changed(hass, coordinator)
 async def test_volatile_attributes_are_not_recorded_and_user_id_is_there(hass, coordinator):
     coord, entry = coordinator
     allowed = binary_sensor.FamilySafetyAllowedNowSensor(coord, entry, CHILD, "Xbox")
-    remaining = sensor.FamilySafetyXboxTimeRemainingSensor(coord, entry, CHILD)
+    remaining = sensor.FamilySafetyTimeRemainingSensor(coord, entry, CHILD)
     assert {"remaining_minutes", "used_minutes"} <= allowed._unrecorded_attributes
     assert "used_minutes" in remaining._unrecorded_attributes
     assert allowed.extra_state_attributes["user_id"] == CHILD

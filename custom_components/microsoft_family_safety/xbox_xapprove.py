@@ -1,14 +1,14 @@
-"""The Xbox lock and extra time through the Xbox Family Settings API (xapprove).
+"""The Xbox: lock and extra time through the Xbox Family Settings API (xapprove).
 
-With the option ``xbox_xapprove`` on, an Xbox ``lock_platform``,
-``unlock_platform``, the Xbox lock switch, ``add_time_bonus`` and
-``cancel_time_bonus`` go through xapprove first (xapprove.py), on an Xbox Live
-token taken from the integration's own stored sign-in. That needs no Family
-web session, so it keeps working while the web session waits for its daily
-sign-in. Whenever xapprove cannot be used (no Xbox user id for the child, a
+The Xbox never uses the Family web session. With the Xbox Family Settings
+sign-in (xbox_sisu.py, options flow) and the option ``xbox_xapprove`` on, an
+Xbox ``lock_platform``, ``unlock_platform``, the Xbox lock switch,
+``add_time_bonus`` and ``cancel_time_bonus`` go through xapprove (xapprove.py).
+Whenever xapprove cannot be used (no sign-in, no Xbox user id for the child, a
 network error, an answer that does not confirm the write, or Microsoft
-refusing the token), the call falls through to the web override and the
-mobile-schedule fallback exactly as before.
+refusing the token), a lock falls back to today's Xbox schedule
+(xbox_mobile_lock.py, mobile token); extra time has no fallback and fails
+with a clear error.
 
 The write rules follow the Xbox Family Settings app:
 
@@ -25,19 +25,17 @@ The write rules follow the Xbox Family Settings app:
   error.
 
 "Ours" means: a block whose ``validUntil`` is within 2 minutes of the end of
-the hold this integration recorded (any non-mobile hold: the web lock writes
-the same override), or an allow within 2 minutes of the extra time
-add_time_bonus recorded.
+the hold this integration recorded, or an allow within 2 minutes of the extra
+time add_time_bonus recorded.
 
 When Microsoft refuses our token (401/403 on a token step or on xapprove,
 after one retry with fresh tokens) xapprove is left alone for 6 hours, a
-Repairs issue says so, and the other paths are used meanwhile.
+Repairs issue says so, and the schedule fallback is used meanwhile.
 
 This module is a mixin of the coordinator.
 """
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 import copy
 from datetime import datetime
 import logging
@@ -52,6 +50,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_XBOX_SIGNED_IN_AT,
     CONF_XBOX_XAPPROVE,
     CONF_XBOX_XUIDS,
     DEFAULT_XBOX_XAPPROVE,
@@ -72,13 +71,11 @@ from .screen_time import (
     parse_utc,
 )
 from .xapprove import (
-    DEFAULT_METHOD,
     METHODS_BY_NAME,
     OVERRIDE_ALLOW,
     OVERRIDE_BLOCK,
     PROBE_METHODS,
     SISU_METHOD,
-    SISU_SCHEMES,
     AuthMethod,
     XapproveClient,
     XapproveError,
@@ -130,6 +127,9 @@ class XboxXapproveMixin:
         self._xapprove_enabled = bool(
             entry.options.get(CONF_XBOX_XAPPROVE, DEFAULT_XBOX_XAPPROVE)
         )
+        #: The options flow records when the Xbox sign-in was made; the
+        #: credential itself is in its own Store (loaded on first use).
+        self._xbox_signed_in_option = bool(entry.options.get(CONF_XBOX_SIGNED_IN_AT))
         self._xuid_option = parse_xuid_option(entry.options.get(CONF_XBOX_XUIDS))
         #: account id -> (xuid, how it was found). Memory only, never logged.
         self._xuids: dict[str, tuple[str, str]] = {}
@@ -145,7 +145,7 @@ class XboxXapproveMixin:
         self._xapprove_method_store: Store = Store(
             self.hass, 1, f"{DOMAIN}.xapprove.{entry.entry_id}"
         )
-        self._xapprove_method: AuthMethod = DEFAULT_METHOD
+        self._xapprove_method: AuthMethod = SISU_METHOD
         self._xapprove_method_loaded = False
         #: The Xbox Family Settings sign-in (options flow), if there is one.
         self._xbox_signin_store: Store = Store(
@@ -157,30 +157,11 @@ class XboxXapproveMixin:
     # Client, token source, refusal
     # ------------------------------------------------------------------
 
-    @asynccontextmanager
-    async def _xapprove_refresh_token(self):
-        """The stored refresh token, with the Family token refresh held off."""
-        if self.api is None:
-            raise XapproveUnavailable("The Microsoft API is not ready yet.")
-        authenticator = self.api.api.authenticator
-        async with authenticator._login_lock:
-            token = authenticator.refresh_token
-            if not token:
-                raise XapproveUnavailable("No mobile refresh token is stored.")
-            yield token
-
-    def _family_access_token(self) -> str | None:
-        if self.api is None:
-            return None
-        return getattr(self.api.api.authenticator, "access_token", None)
-
     def _xapprove_client(self) -> XapproveClient:
         if self._xapprove is None:
             self._xapprove = XapproveClient(
                 lambda: async_get_clientsession(self.hass),
-                self._xapprove_refresh_token,
                 method=self._xapprove_method,
-                family_token_getter=self._family_access_token,
                 sisu=self._sisu,
             )
         return self._xapprove
@@ -211,9 +192,7 @@ class XboxXapproveMixin:
         data = await self._xapprove_method_store.async_load()
         name = data.get("method") if isinstance(data, dict) else None
         method = METHODS_BY_NAME.get(name) if name else None
-        if method is not None and method.scheme in SISU_SCHEMES and self._sisu is None:
-            method = None  # signed out since
-        self._xapprove_method = method or (SISU_METHOD if self._sisu is not None else DEFAULT_METHOD)
+        self._xapprove_method = method or SISU_METHOD
         if self._xapprove is not None:
             self._xapprove.method = self._xapprove_method
             self._xapprove.sisu = self._sisu
@@ -229,7 +208,9 @@ class XboxXapproveMixin:
 
     @property
     def xapprove_enabled(self) -> bool:
-        return self._xapprove_enabled and not self._mobile_only
+        """The option on and an Xbox Family Settings sign-in made (any mode:
+        the Xbox never needs the Family web session)."""
+        return self._xapprove_enabled and self._xbox_signed_in_option
 
     def _xapprove_usable(self) -> bool:
         return self.xapprove_enabled and time.monotonic() >= self._xapprove_refused_until
@@ -241,8 +222,8 @@ class XboxXapproveMixin:
         if self._xapprove_refusal is None:
             _LOGGER.warning(
                 "The Xbox Family Settings API (xapprove) refused the integration's Xbox "
-                "token (%s). The Xbox lock uses the Family web session and today's Xbox "
-                "schedule instead; xapprove is tried again in 6 hours.", err,
+                "token (%s). The Xbox lock uses today's Xbox schedule instead; xapprove "
+                "is tried again in 6 hours.", err,
             )
         self._xapprove_refusal = err.facts()
         self._xapprove_refused_until = time.monotonic() + _REFUSED_BACKOFF
@@ -327,6 +308,8 @@ class XboxXapproveMixin:
 
     async def _async_xapprove_xuid(self, account_id: Any) -> str:
         await self._async_load_xapprove_method()
+        if self._sisu is None:
+            raise XapproveUnavailable("No Xbox Family Settings sign-in is stored.")
         account_id = str(account_id)
         option = self._option_xuid(account_id)
         if option is not None:
@@ -639,6 +622,112 @@ class XboxXapproveMixin:
         return True
 
     # ------------------------------------------------------------------
+    # The coordinator's Xbox entry points: xapprove, else today's schedule
+    # ------------------------------------------------------------------
+
+    async def _async_lock_xbox(
+        self, account_id: str, requested: datetime, key: str
+    ) -> dict[str, Any]:
+        """lock_platform on Xbox: xapprove, else today's Xbox schedule."""
+        if self._xapprove_usable():
+            async with self._hold_lock(key):
+                await self._async_load_platform_holds()
+                result = await self._async_xapprove_lock(account_id, requested, key)
+            if result is not None:
+                return result
+        async with self._hold_lock(key):
+            await self._async_load_platform_holds()
+            hold = self._platform_holds.get(key)
+            now = dt_util.utcnow()
+            if hold is not None and not self._is_mobile_hold(hold):
+                until = parse_utc(hold.get("until"))
+                if hold.get("confirmed") and until is not None and until > now:
+                    # A lock of ours placed through xapprove still holds; it
+                    # cannot be changed while xapprove is out of reach.
+                    if until >= dt_util.as_utc(requested) - self._OWN_LOCK_TOLERANCE:
+                        return {
+                            "prior": dict(hold.get("prior") or make_override(UNKNOWN)),
+                            "applied": make_override(BLOCK_UNTIL, until),
+                            "lock_path": LOCK_PATH_XAPPROVE,
+                        }
+                    raise HomeAssistantError(
+                        "An Xbox lock placed through the Xbox Family Settings API holds until "
+                        f"{dt_util.as_local(until).isoformat()}; that API cannot be reached now, "
+                        "so it cannot be extended. Nothing was changed."
+                    )
+                self._platform_holds.pop(key, None)
+            return await self._async_lock_xbox_mobile(account_id, requested, key)
+
+    async def _async_unlock_xbox(self, account_id: str, key: str) -> dict[str, Any]:
+        """unlock_platform on Xbox."""
+        async with self._hold_lock(key):
+            await self._async_load_platform_holds()
+            hold = self._platform_holds.get(key)
+            if self._is_mobile_hold(hold):
+                return await self._async_unlock_xbox_mobile(account_id, key, hold)
+            if self._xapprove_usable():
+                result = await self._async_xapprove_unlock(account_id, key, hold)
+                if result is not None:
+                    return result
+            if hold is None:
+                return await self._async_xbox_not_locked(account_id)
+            if hold.get("until") and not self._hold_in_force(hold, dt_util.utcnow()):
+                self._platform_holds.pop(key, None)
+                await self._async_save_platform_holds()
+                self._platform_override_until.pop((str(account_id), "xbox"), None)
+                return {
+                    "prior": dict(hold.get("prior") or make_override(UNKNOWN)),
+                    "applied": "hold_expired",
+                    "lock_path": LOCK_PATH_XAPPROVE,
+                }
+            raise HomeAssistantError(
+                "The Xbox lock was placed through the Xbox Family Settings API, which "
+                "cannot be reached now; it ends at its time. Try again later."
+            )
+
+    async def _async_release_xbox(self, account_id: str, key: str) -> None:
+        """The Xbox lock switch turned off: cancel what is in force."""
+        async with self._hold_lock(key):
+            await self._async_load_platform_holds()
+            hold = self._platform_holds.get(key)
+            if self._is_mobile_hold(hold):
+                await self._async_unlock_xbox_mobile(account_id, key, hold)
+                return
+            if self._xapprove_usable() and await self._async_xapprove_release(account_id, key):
+                return
+            if hold is not None and self._hold_in_force(hold, dt_util.utcnow()):
+                raise HomeAssistantError(
+                    "The Xbox lock was placed through the Xbox Family Settings API, which "
+                    "cannot be reached now; it ends at its time. Try again later."
+                )
+
+    def _xbox_extra_time_unavailable(self, action: str) -> HomeAssistantError:
+        return HomeAssistantError(
+            f"Cannot {action} Xbox extra time: it needs the Xbox Family Settings sign-in "
+            "and the xapprove option (Configure), and the Xbox Family Settings API must "
+            "answer. Nothing was changed."
+        )
+
+    async def _async_bonus_xbox(self, account_id: str, until: datetime, key: str) -> dict[str, Any]:
+        if self._xapprove_usable():
+            async with self._hold_lock(key):
+                await self._async_load_platform_holds()
+                await self._async_load_bonuses()
+                result = await self._async_xapprove_bonus(account_id, until, key)
+            if result is not None:
+                return result
+        raise self._xbox_extra_time_unavailable("give")
+
+    async def _async_cancel_bonus_xbox(self, account_id: str, key: str) -> dict[str, Any]:
+        if self._xapprove_usable():
+            async with self._hold_lock(key):
+                await self._async_load_bonuses()
+                result = await self._async_xapprove_cancel_bonus(account_id, key)
+            if result is not None:
+                return result
+        raise self._xbox_extra_time_unavailable("cancel")
+
+    # ------------------------------------------------------------------
     # Extra time
     # ------------------------------------------------------------------
 
@@ -806,15 +895,8 @@ class XboxXapproveMixin:
         try:
             auth = XboxSisuAuth(lambda: async_get_clientsession(self.hass), sign_in.credential, _no_save)
             auth.seed(sign_in)
-
-            @asynccontextmanager
-            async def _no_refresh_token():
-                raise XapproveUnavailable("not used")
-                yield  # pragma: no cover
-
             client = XapproveClient(
-                lambda: async_get_clientsession(self.hass), _no_refresh_token,
-                method=SISU_METHOD, sisu=auth,
+                lambda: async_get_clientsession(self.hass), method=SISU_METHOD, sisu=auth,
             )
             children = self._children()
             if not children:
@@ -851,93 +933,50 @@ class XboxXapproveMixin:
         }
 
     async def async_probe_xapprove(self, confirm_risk: bool = False) -> dict[str, Any]:
-        """probe_xapprove: token steps, the child lookup, and read-only overrides GETs.
+        """probe_xapprove: the Xbox sign-in's token steps, the child lookup,
+        and read-only overrides GETs.
 
         The GET is tried with each way of signing it in xapprove.PROBE_METHODS
-        until one answers 2xx; that one is saved and used by the integration
-        from then on (behind the same option). Answers with non-secret facts
-        only: no token, xuid or gamertag.
+        until one answers 2xx; that one is saved and used from then on. Uses
+        the Xbox Family Settings sign-in only (never the Family Safety one).
+        Answers with non-secret facts only: no token, xuid or gamertag.
         """
         if not confirm_risk:
             raise ServiceValidationError(
-                "probe_xapprove uses the stored Microsoft sign-in for the Xbox Live scope "
-                "(and for the xapprove scope). Microsoft does not document whether that "
-                "endpoint revokes the old refresh token on use; if it did, the integration "
-                "would need a new sign-in. Call it again with confirm_risk: true to accept that."
+                "probe_xapprove signs in to Xbox Live as the Xbox Family Settings app "
+                "(unofficial use of Microsoft's client id; see the README). Call it again "
+                "with confirm_risk: true to accept that."
             )
-        if self.api is None:
-            raise HomeAssistantError("The Microsoft API is not ready yet.")
         await self._async_load_xapprove_method()
-        authenticator = self.api.api.authenticator
-        session = async_get_clientsession(self.hass)
         steps: dict[str, Any] = {}
         result: dict[str, Any] = {
             "entry_id": self.entry.entry_id,
             "option_enabled": self._xapprove_enabled,
+            "xbox_signed_in": self._sisu is not None,
+            "identity": "xbox_family_settings" if self._sisu is not None else None,
             "method_before": self._xapprove_method.name,
             "refused_earlier": dict(self._xapprove_refusal) if self._xapprove_refusal else None,
             "steps": steps,
         }
-        # The whole probe runs with the Family token refresh held off, so the
-        # stored token cannot rotate under it.
-        async with authenticator._login_lock:
-            stored = authenticator.refresh_token
-            if not stored:
-                raise HomeAssistantError("No mobile refresh token is stored.")
-
-            @asynccontextmanager
-            async def _stored():
-                yield stored
-
-            client = XapproveClient(
-                lambda: session, _stored, family_token_getter=self._family_access_token,
-                sisu=self._sisu,
+        if self._sisu is None:
+            result["error"] = (
+                "No Xbox Family Settings sign-in: sign in under Configure first."
             )
-            client.token_facts = steps
-            if self._sisu is not None:
-                self._sisu.token_facts = steps
-            result["xbox_signed_in"] = self._sisu is not None
-            result["identity"] = (
-                "xbox_family_settings" if self._sisu is not None else "family_safety_signin"
-            )
-            tokens = None
-            try:
-                tokens = await client.async_tokens()
-            except XapproveError as err:
-                if self._sisu is None:
-                    result["token_error"] = str(err)
-                else:
-                    # The Xbox sign-in failed: say how, and look the family up
-                    # with the Family Safety sign-in instead.
-                    result["xbox_signin_error"] = (
-                        err.facts() if isinstance(err, XapproveRefused) else {"error": str(err)}
-                    )
-                    if isinstance(err, XapproveRefused):
-                        self._xapprove_mark_refused(err)
-                    client.sisu = None
-                    result["identity"] = "family_safety_signin"
-                    try:
-                        tokens = await client.async_tokens()
-                    except XapproveError as err2:
-                        result["token_error"] = str(err2)
-            if tokens is not None:
-                await self._async_probe_family_and_read(client, tokens, result)
-            client.forget_tokens()
-            if self._sisu is not None:
-                self._sisu.token_facts = {}
-            result["stored_refresh_token_unchanged"] = authenticator.refresh_token == stored
-            stored = None
+            return result
+        session = async_get_clientsession(self.hass)
+        client = XapproveClient(lambda: session, sisu=self._sisu)
+        self._sisu.token_facts = steps
         try:
-            await authenticator.perform_refresh()
-        except Exception as err:  # noqa: BLE001 - reported, not raised
-            result["family_refresh_after"] = {"ok": False, "error": type(err).__name__}
-            _LOGGER.warning(
-                "The Family token refresh after probe_xapprove failed (%s): the "
-                "integration may need a new sign-in", type(err).__name__,
+            tokens = await client.async_tokens()
+        except XapproveError as err:
+            result["xbox_signin_error"] = (
+                err.facts() if isinstance(err, XapproveRefused) else {"error": str(err)}
             )
+            if isinstance(err, XapproveRefused):
+                self._xapprove_mark_refused(err)
         else:
-            result["family_refresh_after"] = {"ok": True}
-            await self._async_persist_current_auth()
+            await self._async_probe_family_and_read(client, tokens, result)
+        self._sisu.token_facts = {}
         return result
 
     async def _async_probe_family_and_read(
@@ -988,15 +1027,10 @@ class XboxXapproveMixin:
         if first is None:
             return
         url = overrides_url(first[1])
-        # The family was read with the Family Safety sign-in if the Xbox one
-        # failed; the xapprove attempts still try the Xbox one first.
-        client.sisu = self._sisu
         attempts: list[dict[str, Any]] = []
         working: AuthMethod | None = None
         state: dict[str, Any] | None = None
         for method in PROBE_METHODS:
-            if method.scheme in SISU_SCHEMES and self._sisu is None:
-                continue  # no Xbox Family Settings sign-in: nothing to try
             facts = await client.async_try(method, url)
             state = facts.pop("state", None)
             attempts.append(facts)

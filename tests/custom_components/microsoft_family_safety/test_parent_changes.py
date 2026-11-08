@@ -9,16 +9,13 @@ import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry, async_capture_events
 import yaml
 
-from homeassistant.util import dt as dt_util
-
-from custom_components.microsoft_family_safety import binary_sensor, sensor, switch
+from custom_components.microsoft_family_safety import sensor
 from custom_components.microsoft_family_safety.const import DOMAIN, EVENT_REQUEST_RESOLVED
 from custom_components.microsoft_family_safety.coordinator import (
     FamilySafetyDataUpdateCoordinator,
 )
-from custom_components.microsoft_family_safety.screen_time import iso_utc, parse_utc
 
-from .test_platform_lock import CHILD, FakeWebAPI, _hours, _make, _xbox_policy
+from .test_platform_lock import CHILD, FakeWebAPI, _hours, _make
 
 
 @pytest.fixture
@@ -31,61 +28,8 @@ def rig(hass):
     return coord, entry
 
 
-def _poll(coord):
-    """What a poll keeps: the Xbox policy Microsoft returned."""
-    coord.data["accounts"][CHILD]["xbox_policy"] = coord.web_api.xbox_policy
-
-
 # 1. hold: ours / parent / none ------------------------------------------------
-
-
-async def test_no_lock_is_none(rig):
-    coord, _ = rig
-    _poll(coord)
-    state = coord.platform_hold_state(CHILD, "Xbox")
-    assert state == {
-        "hold": "none", "override": "none", "override_until": None, "allow_until": None,
-        "lock_path": None,
-    }
-
-
-async def test_our_lock_is_ours(rig):
-    coord, _ = rig
-    await coord.async_lock_platform(CHILD, "Xbox", _hours(2))
-    _poll(coord)
-    state = coord.platform_hold_state(CHILD, "Xbox")
-    assert state["hold"] == "ours"
-    assert state["override"] == "blockUntil"
-    until = parse_utc(coord.platform_hold(CHILD, "Xbox")["until"])
-    assert state["override_until"] == dt_util.as_local(until).isoformat()
-    assert state["allow_until"] is None
-
-
-@pytest.mark.parametrize(
-    ("policy", "override"),
-    [
-        (lambda: _xbox_policy("cancel"), "none"),  # released in the app
-        (lambda: _xbox_policy("blockUntil", _hours(9)), "blockUntil"),  # another end
-        (lambda: _xbox_policy("allowUntil", _hours(1)), "allowUntil"),  # extra time
-    ],
-)
-async def test_a_parent_change_to_our_lock_is_parent(rig, policy, override):
-    coord, _ = rig
-    await coord.async_lock_platform(CHILD, "Xbox", _hours(2))
-    coord.web_api.xbox_policy = policy()
-    _poll(coord)
-    state = coord.platform_hold_state(CHILD, "Xbox")
-    assert (state["hold"], state["override"]) == ("parent", override)
-    if override == "allowUntil":
-        assert state["allow_until"] == state["override_until"]
-        assert dt_util.parse_datetime(state["allow_until"]).tzinfo is not None
-
-
-async def test_a_parent_lock_without_ours_is_parent(rig):
-    coord, _ = rig
-    coord.web_api.xbox_policy = _xbox_policy("blockUntil", _hours(1))
-    _poll(coord)
-    assert coord.platform_hold_state(CHILD, "Xbox")["hold"] == "parent"
+# (The Xbox's hold state comes from xapprove: test_xbox_xapprove.py.)
 
 
 async def test_windows_uses_the_polled_lock_flag(rig):
@@ -97,37 +41,6 @@ async def test_windows_uses_the_polled_lock_flag(rig):
     assert coord.platform_hold_state(CHILD, "Windows")["hold"] == "ours"
     account["blocked_platforms"] = []  # cancelled in the app
     assert coord.platform_hold_state(CHILD, "Windows")["hold"] == "parent"
-
-
-async def test_hold_is_on_the_allowed_now_sensor_and_the_lock_switch(rig):
-    coord, entry = rig
-    coord.data["accounts"][CHILD]["xbox_screentime_policy"] = {"isEnabled": False}
-    await coord.async_lock_platform(CHILD, "Xbox", _hours(2))
-    _poll(coord)
-    allowed = binary_sensor.FamilySafetyAllowedNowSensor(coord, entry, CHILD, "Xbox")
-    lock = switch.FamilySafetyPlatformLockSwitch(coord, entry, CHILD, "Alex", "Xbox")
-    for attrs in (allowed.extra_state_attributes, lock.extra_state_attributes):
-        assert attrs["hold"] == "ours"
-        assert attrs["override"] == "blockUntil"
-        assert {"override_until", "allow_until"} <= set(attrs)
-
-
-# 5. unlock tells what the parent has in force -----------------------------------
-
-
-async def test_unlock_left_parent_override_says_what_is_in_force(rig):
-    coord, _ = rig
-    await coord.async_lock_platform(CHILD, "Xbox", _hours(2))
-    extra_until = _hours(1)
-    coord.web_api.xbox_policy = _xbox_policy("allowUntil", extra_until)
-
-    result = await coord.async_unlock_platform(CHILD, "Xbox")
-
-    assert result["applied"] == "left_parent_override"
-    current = result["current"]
-    assert current["type"] == "allowUntil"
-    assert parse_utc(current["valid_until"]) == parse_utc(iso_utc(extra_until))
-    assert current["allow_until"] == current["override_until"]
 
 
 # 2. paused apps -----------------------------------------------------------------

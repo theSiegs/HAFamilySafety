@@ -30,7 +30,7 @@ from custom_components.microsoft_family_safety.screen_time import (
     platform_allowance,
 )
 
-from .test_platform_lock import CHILD, FakeWebAPI, _hours, _make, _xbox_policy
+from .test_platform_lock import CHILD, FakeWebAPI, _hours, _make, _windows
 
 
 # 1. "1.00:00:00" is a whole day, not 0.
@@ -80,20 +80,20 @@ async def test_lock_switch_off_cancels_without_restoring(hass):
     coord = _make(hass, entry)
     web = FakeWebAPI()
     coord.web_api = web
-    web.xbox_policy = _xbox_policy("blockUntil", _hours(1))  # a parent lock
-    await coord.async_lock_platform(CHILD, "Xbox", _hours(3))
+    web.windows = _windows("blockUntil", _hours(1))  # a parent lock
+    await coord.async_lock_platform(CHILD, "Windows", _hours(3))
     web.writes.clear()
 
-    entity = switch.FamilySafetyPlatformLockSwitch(coord, entry, CHILD, "Alex", "Xbox")
+    entity = switch.FamilySafetyPlatformLockSwitch(coord, entry, CHILD, "Alex", "Windows")
     entity.hass = hass
-    entity.entity_id = "switch.alex_xbox_lock"
+    entity.entity_id = "switch.alex_windows_lock"
     await entity.async_turn_off()
 
-    assert [(p, k) for p, k, _ in web.writes] == [("xbox", "cancel")]
-    assert coord.platform_hold(CHILD, "Xbox") is None
+    assert [(p, k) for p, k, _ in web.writes] == [("windows", "cancel")]
+    assert coord.platform_hold(CHILD, "Windows") is None
     # A later unlock_platform has nothing stale to put back.
     web.writes.clear()
-    result = await coord.async_unlock_platform(CHILD, "Xbox")
+    result = await coord.async_unlock_platform(CHILD, "Windows")
     assert result["prior"] is None and web.writes[-1][1] == "cancel"
 
 
