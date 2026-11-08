@@ -37,6 +37,7 @@ from custom_components.microsoft_family_safety.screen_time import iso_utc
 
 from .test_platform_lock import CHILD
 from .test_xbox_xapprove import (
+    CHILD_XUID,
     PARENT_XUID,
     PATCH_SESSION,
     SECRETS,
@@ -89,6 +90,7 @@ class SisuServer(XboxServer):
         self.family_auth = {SISU_AUTH}
         self.accepts = self._signed_sisu
         self.sisu_authorize_status = 200
+        self.code_dead = False
 
     def _rotate(self) -> str:
         token = f"sisu-refresh-{self.next_refresh}"
@@ -108,8 +110,9 @@ class SisuServer(XboxServer):
             form = kwargs["data"]
             self.sisu_calls.append(f"token:{form['grant_type']}:{form['scope']}")
             if form["grant_type"] == "authorization_code":
-                assert form["code"] == CODE and form["redirect_uri"] == sisu.REDIRECT_URI
-                assert form["code_verifier"]
+                assert form["redirect_uri"] == sisu.REDIRECT_URI and form["code_verifier"]
+                if form["code"] != CODE or self.code_dead:
+                    return FakeResponse(400, {"error": "invalid_grant"})
             else:
                 if self.dead or form["refresh_token"] not in self.refresh_tokens:
                     return FakeResponse(400, {"error": "invalid_grant"})
@@ -212,6 +215,28 @@ def test_the_redirect_is_checked():
         sisu.code_from_redirect(
             "https://login.live.com/oauth20_desktop.srf?error=access_denied&state=s1", "s1"
         )
+
+
+def test_the_redirect_may_be_copied_loosely():
+    good = f"https://login.live.com/oauth20_desktop.srf?code={CODE}&state=s1&lc=1033"
+    # Quotes, angle brackets, spaces and a line break from a phone's copy.
+    assert sisu.code_from_redirect(f'  "{good}"\n', "s1") == CODE
+    assert sisu.code_from_redirect(f"<{good[:40]} {good[40:]}>", "s1") == CODE
+    # Without https://.
+    assert sisu.code_from_redirect(good.removeprefix("https://"), "s1") == CODE
+    # Without the state (the PKCE verifier still binds the code).
+    assert sisu.code_from_redirect(
+        f"https://login.live.com/oauth20_desktop.srf?code={CODE}", "s1"
+    ) == CODE
+    # Only the code.
+    bare = "M.C507_BAY.2.U.0a1b2c3d-1111-2222-3333-444455556666"
+    assert sisu.code_from_redirect(f" {bare} ", "s1") == bare
+    # The sign-in link itself, pasted back by mistake.
+    link = sisu.authorize_url("challenge", "s1")
+    with pytest.raises(ValueError, match="pasted_link"):
+        sisu.code_from_redirect(link, "s1")
+    with pytest.raises(ValueError, match="invalid_redirect"):
+        sisu.code_from_redirect("hello", "s1")
 
 
 # Signing --------------------------------------------------------------------
@@ -360,39 +385,170 @@ async def test_the_probe_when_the_xbox_sign_in_is_refused(hass, server, hass_sto
 # The options flow ------------------------------------------------------------------
 
 
+SETUP = "custom_components.microsoft_family_safety.async_setup_entry"
+INIT_FORM = {"update_interval": 300, "platforms": ["Windows", "Xbox"]}
+
+
+async def _to_the_sign_in_page(hass, entry) -> tuple[dict, str]:
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["step_id"] == "init"
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {**INIT_FORM, "xbox_sign_in": True},
+    )
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == "xbox_signin"
+    url = result["description_placeholders"]["url"]
+    return result, parse_qs(urlsplit(url).query)["state"][0]
+
+
+def _landed(state: str, code: str = CODE) -> dict:
+    return {"redirect_url": f"https://login.live.com/oauth20_desktop.srf?code={code}&state={state}"}
+
+
+def _expired_issue(hass, entry) -> None:
+    ir.async_create_issue(
+        hass, DOMAIN, f"xbox_signin_expired_{entry.entry_id}", is_fixable=False,
+        severity=ir.IssueSeverity.WARNING, translation_key="xbox_signin_expired",
+    )
+
+
 async def test_the_options_flow_signs_in(hass, server, hass_storage):
+    """Without a running integration the sign-in is saved, not checked."""
     entry = MockConfigEntry(
         domain=DOMAIN, data={"refresh_token": "x"}, options={CONF_XBOX_XAPPROVE: True},
     )
     entry.add_to_hass(hass)
-    with patch(
-        "custom_components.microsoft_family_safety.async_setup_entry", return_value=True
-    ):
-        result = await hass.config_entries.options.async_init(entry.entry_id)
-        assert result["step_id"] == "init"
-        result = await hass.config_entries.options.async_configure(
-            result["flow_id"],
-            {"update_interval": 300, "platforms": ["Windows", "Xbox"], "xbox_sign_in": True},
-        )
-        assert result["type"] == data_entry_flow.FlowResultType.FORM
-        assert result["step_id"] == "xbox_signin"
-        url = result["description_placeholders"]["url"]
-        state = parse_qs(urlsplit(url).query)["state"][0]
+    with patch(SETUP, return_value=True):
+        result, state = await _to_the_sign_in_page(hass, entry)
 
         bad = await hass.config_entries.options.async_configure(
             result["flow_id"], {"redirect_url": "https://login.live.com/oauth20_desktop.srf?code=x&state=nope"},
         )
         assert bad["errors"] == {"base": "state_mismatch"}
 
+        checked = await hass.config_entries.options.async_configure(result["flow_id"], _landed(state))
+        assert checked["step_id"] == "xbox_signin_unchecked"
+        assert checked["description_placeholders"]["reason"] == "the integration is not running"
+        # Saved already, before the last page.
+        stored = hass_storage[f"{DOMAIN}.xbox_signin.{entry.entry_id}"]["data"]
+        assert stored["refresh_token"] == "sisu-refresh-2"
+        assert "BEGIN PRIVATE KEY" in stored["proof_key"]
         done = await hass.config_entries.options.async_configure(
-            result["flow_id"],
-            {"redirect_url": f"https://login.live.com/oauth20_desktop.srf?code={CODE}&state={state}"},
+            result["flow_id"], {CONF_XBOX_XAPPROVE: False},
         )
     assert done["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
     assert entry.options[CONF_XBOX_SIGNED_IN_AT]
+    assert entry.options[CONF_XBOX_XAPPROVE] is False
     assert "xbox_sign_in" not in entry.options
-    stored = hass_storage[f"{DOMAIN}.xbox_signin.{entry.entry_id}"]["data"]
-    assert stored["refresh_token"] == "sisu-refresh-2"
-    assert "BEGIN PRIVATE KEY" in stored["proof_key"]
     # Nothing secret in the options.
     assert "sisu-refresh" not in json.dumps(dict(entry.options))
+
+
+async def test_the_flow_checks_the_sign_in_and_offers_xapprove(hass, server, hass_storage):
+    coord, entry = _make_rig(hass, options={CONF_XBOX_XAPPROVE: False})
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coord
+    _expired_issue(hass, entry)
+    with patch(SETUP, return_value=True):
+        result, state = await _to_the_sign_in_page(hass, entry)
+        checked = await hass.config_entries.options.async_configure(result["flow_id"], _landed(state))
+        assert checked["step_id"] == "xbox_signin_works"
+        # The box is ticked for the user.
+        field = next(iter(checked["data_schema"].schema))
+        assert str(field) == CONF_XBOX_XAPPROVE and field.default() is True
+        done = await hass.config_entries.options.async_configure(
+            result["flow_id"], {CONF_XBOX_XAPPROVE: True},
+        )
+    assert done["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert entry.options[CONF_XBOX_XAPPROVE] is True
+    # Reads only: nothing written, the Family Safety sign-in not used, no refresh.
+    assert server.creates == [] and server.scopes == []
+    assert [c for c in server.sisu_calls if c.startswith("token:refresh")] == []
+    # The way that worked is saved, as probe_xapprove would have.
+    assert hass_storage[f"{DOMAIN}.xapprove.{entry.entry_id}"]["data"]["method"] == "sisu"
+    # The old "sign in again" issue is gone.
+    assert ir.async_get(hass).async_get_issue(DOMAIN, f"xbox_signin_expired_{entry.entry_id}") is None
+
+
+async def test_the_flow_says_when_xbox_refuses(hass, server, hass_storage):
+    coord, entry = _make_rig(hass, options={CONF_XBOX_XAPPROVE: True})
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coord
+    coord._xuids[CHILD] = (CHILD_XUID, "family_name")  # no family read needed
+    server.accepts = lambda headers: False
+    with patch(SETUP, return_value=True):
+        result, state = await _to_the_sign_in_page(hass, entry)
+        checked = await hass.config_entries.options.async_configure(result["flow_id"], _landed(state))
+        assert checked["step_id"] == "xbox_signin_refused"
+        assert checked["description_placeholders"]["reason"] == "HTTP 401"
+        field = next(iter(checked["data_schema"].schema))
+        assert field.default() is False
+        await hass.config_entries.options.async_configure(result["flow_id"], {CONF_XBOX_XAPPROVE: False})
+    assert entry.options[CONF_XBOX_XAPPROVE] is False
+    assert f"{DOMAIN}.xapprove.{entry.entry_id}" not in hass_storage
+    # The sign-in itself is kept: signing out is a separate choice.
+    assert hass_storage[f"{DOMAIN}.xbox_signin.{entry.entry_id}"]["data"]["refresh_token"]
+
+
+async def test_an_expired_code_and_a_pasted_link_say_what_to_do(hass, server, hass_storage):
+    entry = MockConfigEntry(domain=DOMAIN, data={"refresh_token": "x"})
+    entry.add_to_hass(hass)
+    with patch(SETUP, return_value=True):
+        result, state = await _to_the_sign_in_page(hass, entry)
+        server.code_dead = True
+        expired = await hass.config_entries.options.async_configure(result["flow_id"], _landed(state))
+        assert expired["errors"] == {"base": "code_expired"}
+        link = await hass.config_entries.options.async_configure(
+            result["flow_id"], {"redirect_url": expired["description_placeholders"]["url"]},
+        )
+        assert link["errors"] == {"base": "pasted_link"}
+        # The same link stays on the page; a new code from it works.
+        assert link["description_placeholders"]["url"] == result["description_placeholders"]["url"]
+        server.code_dead = False
+        checked = await hass.config_entries.options.async_configure(result["flow_id"], _landed(state))
+    assert checked["step_id"] == "xbox_signin_unchecked"
+    assert f"{DOMAIN}.xbox_signin.{entry.entry_id}" in hass_storage
+
+
+async def test_a_closed_dialog_keeps_the_link(hass, server, hass_storage):
+    entry = MockConfigEntry(domain=DOMAIN, data={"refresh_token": "x"})
+    entry.add_to_hass(hass)
+    with patch(SETUP, return_value=True):
+        first, state = await _to_the_sign_in_page(hass, entry)
+        hass.config_entries.options.async_abort(first["flow_id"])
+        # Opened again: the same link, so the address copied from it works.
+        second, again = await _to_the_sign_in_page(hass, entry)
+        assert again == state
+        checked = await hass.config_entries.options.async_configure(second["flow_id"], _landed(state))
+        assert checked["step_id"] == "xbox_signin_unchecked"
+        hass.config_entries.options.async_abort(second["flow_id"])
+        # After a sign-in the next link is a new one.
+        third, fresh = await _to_the_sign_in_page(hass, entry)
+        assert fresh != state
+        hass.config_entries.options.async_abort(third["flow_id"])
+
+
+async def test_the_options_page_shows_the_sign_in(hass, server, hass_storage):
+    entry = MockConfigEntry(domain=DOMAIN, data={"refresh_token": "x"})
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["description_placeholders"]["xbox_signin_status"] == "not signed in"
+    assert "xbox_sign_out" not in {str(k) for k in result["data_schema"].schema}
+    hass.config_entries.options.async_abort(result["flow_id"])
+
+    hass.config_entries.async_update_entry(
+        entry, options={CONF_XBOX_SIGNED_IN_AT: "2026-11-08T12:00:00+00:00"}
+    )
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["description_placeholders"]["xbox_signin_status"].startswith("signed in on 2026-11-08")
+    assert "xbox_sign_out" in {str(k) for k in result["data_schema"].schema}
+    hass.config_entries.options.async_abort(result["flow_id"])
+
+    _expired_issue(hass, entry)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["description_placeholders"]["xbox_signin_status"] == "expired, sign in again"
+    # Signing out forgets it and drops the issue.
+    with patch(SETUP, return_value=True):
+        await hass.config_entries.options.async_configure(
+            result["flow_id"], {**INIT_FORM, "xbox_sign_out": True},
+        )
+    assert CONF_XBOX_SIGNED_IN_AT not in entry.options
+    assert ir.async_get(hass).async_get_issue(DOMAIN, f"xbox_signin_expired_{entry.entry_id}") is None

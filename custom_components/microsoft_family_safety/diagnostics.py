@@ -25,6 +25,7 @@ from .const import (
     CONF_WEB_COOKIES,
     CONF_WEB_FAMILY_REFERER,
     CONF_WEB_FAMILY_TOKEN,
+    CONF_XBOX_SIGNED_IN_AT,
     CONF_XBOX_XUIDS,
     DOMAIN,
 )
@@ -137,4 +138,16 @@ async def async_get_config_entry_diagnostics(
         "app_usage_sensors": getattr(coordinator, "app_usage_sensors", None),
         "xbox_features": coordinator.xbox_features,
     }
+    # Non-secret state of the Xbox Family Settings sign-in and xapprove.
+    store = getattr(coordinator, "_xbox_signin_store", None)
+    if store is not None:
+        credential = await store.async_load()
+        refusal = getattr(coordinator, "_xapprove_refusal", None)
+        result["xbox_xapprove"] = {
+            "option_enabled": getattr(coordinator, "_xapprove_enabled", None),
+            "xbox_signed_in": bool(isinstance(credential, dict) and credential.get("refresh_token")),
+            "xbox_signed_in_at": entry.options.get(CONF_XBOX_SIGNED_IN_AT),
+            "method": getattr(getattr(coordinator, "_xapprove_method", None), "name", None),
+            "refused": dict(refusal) if isinstance(refusal, dict) else None,
+        }
     return _anonymise(result, aliases)

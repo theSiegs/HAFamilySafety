@@ -44,6 +44,7 @@ from datetime import datetime, timedelta
 import hashlib
 import json
 import logging
+import re
 import secrets
 import struct
 import time
@@ -119,16 +120,34 @@ def authorize_url(challenge: str, state: str) -> str:
     })
 
 
+#: A bare authorization code from login.live.com ("M.C5xx_BAY.2.U.1234-...").
+_BARE_CODE = re.compile(r"M\.[A-Za-z0-9._!*$-]{8,}")
+
+
 def code_from_redirect(url: str, state: str) -> str:
-    """The code in the pasted redirect URL. ValueError names what is wrong."""
-    parts = urlsplit((url or "").strip())
+    """The code in the pasted redirect URL. ValueError names what is wrong.
+
+    Forgiving about how it was copied: spaces and line breaks, quotes or angle
+    brackets around it, a missing ``https://``, or only the code itself (the
+    PKCE verifier still binds the code to this sign-in, so the state is only
+    compared when it was pasted).
+    """
+    text = re.sub(r"\s+", "", url or "").strip("\"'<>`")
+    if _BARE_CODE.fullmatch(text):
+        return text
+    if text.lower().startswith("login.live.com/"):
+        text = f"https://{text}"
+    parts = urlsplit(text)
     query = parse_qs(parts.query)
     query.update({k: v for k, v in parse_qs(parts.fragment).items() if k not in query})
     if query.get("error"):
         raise ValueError(f"signin_error:{query['error'][0]}")
-    if parts.scheme != "https" or parts.netloc != "login.live.com" or not query.get("code"):
+    if parts.netloc.lower() == "login.live.com" and parts.path.endswith("oauth20_authorize.srf"):
+        raise ValueError("pasted_link")
+    if parts.scheme != "https" or parts.netloc.lower() != "login.live.com" or not query.get("code"):
         raise ValueError("invalid_redirect")
-    if query.get("state", [None])[0] != state:
+    pasted_state = query.get("state", [None])[0]
+    if pasted_state is not None and pasted_state != state:
         raise ValueError("state_mismatch")
     return query["code"][0]
 
@@ -412,6 +431,11 @@ class XboxSisuAuth:
         self._tokens = None
         self._access.clear()
 
+    def seed(self, sign_in: SignIn) -> None:
+        """Start from the tokens a fresh sign-in already got (no refresh needed)."""
+        self._device = (sign_in.device_token, sign_in.device_not_after)
+        self._tokens = sign_in.tokens
+
     async def _async_msa(self, scope: str = SCOPE) -> MsaTokens:
         cached = self._access.get(scope)
         if cached is not None and _valid(cached.expires_at):
@@ -462,13 +486,23 @@ class XboxSisuAuth:
         return self.key.sign(method, url, authorization, body)
 
 
-async def async_complete_sign_in(
+@dataclass
+class SignIn:
+    """A completed sign-in: what to store, and the tokens it already got."""
+
+    credential: dict[str, Any]
+    tokens: XboxTokens
+    device_token: str
+    device_not_after: datetime | None
+
+
+async def async_sign_in(
     session: aiohttp.ClientSession, redirect: str, state: str, verifier: str
-) -> dict[str, Any]:
+) -> SignIn:
     """Options flow: code -> MSA tokens -> device token -> SISU authorize.
 
-    Returns the credential to store. Raises ValueError (bad redirect) or
-    XapproveError (Microsoft refused a step).
+    Raises ValueError (bad redirect) or XapproveError (Microsoft refused a
+    step; XboxSignInExpired when the code was expired or already used).
     """
     code = code_from_redirect(redirect, state)
     msa = await async_exchange_code(session, code, verifier)
@@ -476,6 +510,13 @@ async def async_complete_sign_in(
         raise XapproveError("sisu_msa_code: no refresh token in the answer")
     key = ProofKey.generate()
     credential = new_credential(msa.refresh_token, key)
-    device, _until = await async_device_token(session, key, credential["device_id"])
-    await async_sisu_authorize(session, key, msa.access_token, device)
-    return credential
+    device, until = await async_device_token(session, key, credential["device_id"])
+    tokens = await async_sisu_authorize(session, key, msa.access_token, device)
+    return SignIn(credential, tokens, device, until)
+
+
+async def async_complete_sign_in(
+    session: aiohttp.ClientSession, redirect: str, state: str, verifier: str
+) -> dict[str, Any]:
+    """The credential to store (see async_sign_in)."""
+    return (await async_sign_in(session, redirect, state, verifier)).credential

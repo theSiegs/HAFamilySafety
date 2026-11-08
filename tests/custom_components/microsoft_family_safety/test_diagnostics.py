@@ -62,3 +62,27 @@ async def test_diagnostics_are_redacted(hass):
     assert result["data"]["accounts"]["account_1"]["application_count"] == 1
     assert "account_1|xbox" in result["platform_holds"]
     assert result["entry"]["options"]["update_interval"] == 300
+
+
+async def test_diagnostics_show_the_xbox_sign_in_without_secrets(hass, hass_storage):
+    entry = MockConfigEntry(
+        domain=DOMAIN, data={"refresh_token": "refresh-secret"},
+        options={"xbox_xapprove": True, "xbox_signed_in_at": "2026-11-08T12:00:00+00:00"},
+    )
+    entry.add_to_hass(hass)
+    coord = FamilySafetyDataUpdateCoordinator(hass, entry)
+    coord.data = {"accounts": {}, "devices": {}}
+    await coord._xbox_signin_store.async_save({
+        "refresh_token": "xbox-refresh-secret", "proof_key": "PRIVATE-KEY-SECRET",
+        "device_id": "device-id-secret",
+    })
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coord
+
+    result = await async_get_config_entry_diagnostics(hass, entry)
+
+    assert result["xbox_xapprove"]["option_enabled"] is True
+    assert result["xbox_xapprove"]["xbox_signed_in"] is True
+    assert result["xbox_xapprove"]["xbox_signed_in_at"] == "2026-11-08T12:00:00+00:00"
+    text = json.dumps(result)
+    for secret in ("xbox-refresh-secret", "PRIVATE-KEY-SECRET", "device-id-secret", "refresh-secret"):
+        assert secret not in text

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+import time
 from ipaddress import ip_address
 from typing import Any
 from urllib.parse import unquote
@@ -16,6 +17,7 @@ import homeassistant.helpers.config_validation as cv
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.network import NoURLAvailableError, get_url
 from homeassistant.helpers.storage import Store
@@ -29,7 +31,7 @@ from homeassistant.helpers.selector import (
 
 from . import xbox_sisu
 from ._httpx_web_adapter import apply_httpx_web_transport_patch
-from .xapprove import XapproveError
+from .xapprove import XapproveError, XapproveRefused
 from ._httpx_web_tuning import apply_httpx_web_tuning_patch
 from .const import (
     CONF_ALLOWED_USERS,
@@ -44,6 +46,7 @@ from .const import (
     CONF_XBOX_SIGN_OUT,
     CONF_XBOX_SIGNED_IN_AT,
     XBOX_SIGNIN_STORAGE_KEY,
+    XBOX_SIGNIN_EXPIRED_ISSUE,
     CONF_APP_USAGE_SENSORS,
     DEFAULT_APP_USAGE_SENSORS,
     CONF_XBOX_FEATURES,
@@ -1476,9 +1479,44 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
         self._pending_data: dict[str, Any] = {}
         #: (code_verifier, state, authorize URL) of the Xbox sign-in in progress.
         self._xbox_pkce: tuple[str, str, str] | None = None
+        #: The in-flow check of a new Xbox sign-in: {"outcome", "reason"}.
+        self._xbox_check: dict[str, str] = {}
 
     def _xbox_signin_store(self) -> Store:
         return Store(self.hass, 1, f"{XBOX_SIGNIN_STORAGE_KEY}.{self._config_entry.entry_id}")
+
+    def _xbox_signin_status(self) -> str:
+        """The status line of the Xbox Family Settings sign-in on the init page."""
+        signed_in_at = self._config_entry.options.get(CONF_XBOX_SIGNED_IN_AT)
+        if not signed_in_at:
+            return "not signed in"
+        expired = ir.async_get(self.hass).async_get_issue(
+            DOMAIN, f"{XBOX_SIGNIN_EXPIRED_ISSUE}_{self._config_entry.entry_id}"
+        )
+        if expired is not None:
+            return "expired, sign in again"
+        moment = dt_util.parse_datetime(str(signed_in_at))
+        when = dt_util.as_local(moment).strftime("%Y-%m-%d %H:%M") if moment else str(signed_in_at)
+        return f"signed in on {when}"
+
+    def _xbox_pending_pkce(self) -> tuple[str, str, str]:
+        """This entry's sign-in link, the same one for 10 minutes.
+
+        Kept in memory across options flows, so the address of a link opened
+        earlier still works when the dialog was closed meanwhile (a phone
+        switching apps) and Configure is opened again.
+        """
+        pending: dict[str, tuple[str, str, str, float]] = self.hass.data.setdefault(
+            _XBOX_PKCE_KEY, {}
+        )
+        entry_id = self._config_entry.entry_id
+        held = pending.get(entry_id)
+        if held is None or time.monotonic() - held[3] > _XBOX_PKCE_SECONDS:
+            verifier, challenge = xbox_sisu.new_pkce()
+            state = secrets.token_urlsafe(16)
+            held = (verifier, state, xbox_sisu.authorize_url(challenge, state), time.monotonic())
+            pending[entry_id] = held
+        return held[0], held[1], held[2]
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -1499,6 +1537,10 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
                 # Forget the Xbox Family Settings sign-in (the option change reloads).
                 await self._xbox_signin_store().async_remove()
                 data.pop(CONF_XBOX_SIGNED_IN_AT, None)
+                ir.async_delete_issue(
+                    self.hass, DOMAIN,
+                    f"{XBOX_SIGNIN_EXPIRED_ISSUE}_{self._config_entry.entry_id}",
+                )
             elif sign_in:
                 self._pending_data = data
                 return await self.async_step_xbox_signin()
@@ -1571,13 +1613,19 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
                         },
                     ): cv.string,
                     vol.Optional(CONF_XBOX_SIGN_IN, default=False): cv.boolean,
-                    vol.Optional(CONF_XBOX_SIGN_OUT, default=False): cv.boolean,
+                    # Signing out is offered only when there is a sign-in.
+                    **(
+                        {vol.Optional(CONF_XBOX_SIGN_OUT, default=False): cv.boolean}
+                        if self._config_entry.options.get(CONF_XBOX_SIGNED_IN_AT)
+                        else {}
+                    ),
                     vol.Optional(
                         CONF_ALLOW_INSECURE_HTTP_AUTH,
                         default=current_allow_insecure_http_auth,
                     ): cv.boolean,
                 }
             ),
+            description_placeholders={"xbox_signin_status": self._xbox_signin_status()},
         )
 
 
@@ -1586,15 +1634,13 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
     ) -> FlowResult:
         """Sign in to Xbox Family Settings: open the link, paste the address back."""
         if self._xbox_pkce is None:
-            verifier, challenge = xbox_sisu.new_pkce()
-            state = secrets.token_urlsafe(16)
-            self._xbox_pkce = (verifier, state, xbox_sisu.authorize_url(challenge, state))
+            self._xbox_pkce = self._xbox_pending_pkce()
         verifier, state, url = self._xbox_pkce
         errors: dict[str, str] = {}
         detail = ""
         if user_input is not None:
             try:
-                credential = await xbox_sisu.async_complete_sign_in(
+                sign_in = await xbox_sisu.async_sign_in(
                     async_get_clientsession(self.hass),
                     user_input.get("redirect_url", ""),
                     state,
@@ -1603,23 +1649,84 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
             except ValueError as err:
                 code, _, detail = str(err).partition(":")
                 errors["base"] = (
-                    code if code in ("invalid_redirect", "state_mismatch", "signin_error")
+                    code
+                    if code in ("invalid_redirect", "state_mismatch", "signin_error", "pasted_link")
                     else "invalid_redirect"
                 )
             except XapproveError as err:
-                errors["base"] = "xbox_signin_failed"
+                if isinstance(err, XapproveRefused) and err.step == "sisu_msa_code":
+                    # An expired, already used or mistyped code.
+                    errors["base"] = "code_expired"
+                else:
+                    errors["base"] = "xbox_signin_failed"
                 detail = str(err)[:200]
             else:
-                await self._xbox_signin_store().async_save(credential)
-                data = dict(self._pending_data)
-                data[CONF_XBOX_SIGNED_IN_AT] = dt_util.utcnow().isoformat()
-                return self.async_create_entry(title="", data=data)
+                entry_id = self._config_entry.entry_id
+                await self._xbox_signin_store().async_save(sign_in.credential)
+                (self.hass.data.get(_XBOX_PKCE_KEY) or {}).pop(entry_id, None)
+                ir.async_delete_issue(self.hass, DOMAIN, f"{XBOX_SIGNIN_EXPIRED_ISSUE}_{entry_id}")
+                self._pending_data[CONF_XBOX_SIGNED_IN_AT] = dt_util.utcnow().isoformat()
+                coordinator = (self.hass.data.get(DOMAIN) or {}).get(entry_id)
+                if coordinator is None or not hasattr(coordinator, "async_check_xbox_signin"):
+                    self._xbox_check = {
+                        "outcome": "unchecked", "reason": "the integration is not running",
+                    }
+                else:
+                    self._xbox_check = await coordinator.async_check_xbox_signin(sign_in)
+                if self._xbox_check.get("outcome") == "works":
+                    # The way probe_xapprove would have saved.
+                    await Store(self.hass, 1, f"{DOMAIN}.xapprove.{entry_id}").async_save(
+                        {"method": "sisu", "found": dt_util.utcnow().isoformat()}
+                    )
+                return await self._async_step_xbox_signin_result()
         return self.async_show_form(
             step_id="xbox_signin",
             data_schema=vol.Schema({vol.Required("redirect_url"): cv.string}),
             errors=errors,
             description_placeholders={"url": url, "detail": detail},
         )
+
+    async def _async_step_xbox_signin_result(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Signed in: say what the check found and offer the xapprove option."""
+        outcome = self._xbox_check.get("outcome", "unchecked")
+        if user_input is not None:
+            data = dict(self._pending_data)
+            data[CONF_XBOX_XAPPROVE] = bool(user_input.get(CONF_XBOX_XAPPROVE))
+            return self.async_create_entry(title="", data=data)
+        current = bool(self._pending_data.get(CONF_XBOX_XAPPROVE, DEFAULT_XBOX_XAPPROVE))
+        default = {"works": True, "refused": False}.get(outcome, current)
+        return self.async_show_form(
+            step_id=f"xbox_signin_{outcome}",
+            data_schema=vol.Schema(
+                {vol.Optional(CONF_XBOX_XAPPROVE, default=default): cv.boolean}
+            ),
+            description_placeholders={"reason": self._xbox_check.get("reason") or "-"},
+        )
+
+    async def async_step_xbox_signin_works(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        return await self._async_step_xbox_signin_result(user_input)
+
+    async def async_step_xbox_signin_refused(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        return await self._async_step_xbox_signin_result(user_input)
+
+    async def async_step_xbox_signin_unchecked(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        return await self._async_step_xbox_signin_result(user_input)
+
+
+#: hass.data key: entry id -> (verifier, state, URL, monotonic time) of the
+#: Xbox sign-in link in progress (memory only).
+_XBOX_PKCE_KEY = f"{DOMAIN}_xbox_signin_pkce"
+#: How long one sign-in link is offered again (Microsoft's code itself lasts
+#: only minutes after the sign-in; this is the link, not the code).
+_XBOX_PKCE_SECONDS = 600
 
 
 class InvalidAuth(HomeAssistantError):

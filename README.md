@@ -179,7 +179,7 @@ Legacy and native mode are mutually exclusive per config entry; there is no auto
 | Xbox lock without the web session | on / off | off | Locks the Xbox through today's Xbox schedule while the web session is down; see [below](#xbox-lock-without-the-web-session) |
 | Xbox lock and extra time through the Xbox Family Settings API (xapprove) | on / off | off | Locks, unlocks and gives Xbox extra time without the web session; see [below](#xbox-through-the-xbox-family-settings-api-xapprove) |
 | Xbox user ids | `child=xuid, ...` | *(empty: looked up)* | Only if the automatic lookup fails; see [below](#xbox-through-the-xbox-family-settings-api-xapprove) |
-| Sign in to Xbox Family Settings / Sign out | tick and submit | off | Opens the Xbox sign-in page; see [below](#sign-in-to-xbox-family-settings) |
+| Sign in to Xbox Family Settings (next page) / Sign out of Xbox Family Settings | tick and submit | off | Opens the Xbox sign-in page, then checks it and offers the xapprove option; sign out is shown only while signed in. The page's top line says whether you are signed in; see [below](#sign-in-to-xbox-family-settings) |
 | Allow insecure local HTTP authentication (testing only) | on / off | off | See below |
 
 #### Strict mode
@@ -249,23 +249,31 @@ Each write goes to `target` 1 (screen time on all of the child's Xbox consoles),
 
 **Fallback.** When xapprove cannot be used for a call (no Xbox user id for the child, a network error, a reply that does not show the write) the call goes on through the web route and, if turned on, today's Xbox schedule, exactly as before. When Microsoft **refuses the token** (401 or 403 from a token step or from xapprove, after one retry with fresh tokens), xapprove is left alone for 6 hours, a warning is logged once and a Repairs issue "The Xbox Family Settings API refused the Xbox token" says so; it goes away at the first call that works again.
 
-**The risk.** See the sign-in below. Run [`probe_xapprove`](#xbox-family-settings-api-probe-diagnostic) after signing in and turn the option on when it reads the overrides (`working_method: sisu`).
+**The risk.** See the sign-in below. Signing in checks xapprove and offers to turn the option on; [`probe_xapprove`](#xbox-family-settings-api-probe-diagnostic) gives the details when it does not work.
 
 #### Sign in to Xbox Family Settings
 
-This is a second Microsoft sign-in, separate from the Family Safety one, made **as the Xbox Family Settings app**: the integration uses that app's public client id (`00000000482C8F49`) and the Xbox Authentication Library's "SISU" flow, the way the open-source XAL implementations do.
+This is a second Microsoft sign-in, separate from the Family Safety one, made **as the Xbox Family Settings app**: the integration uses that app's public client id (`00000000482C8F49`) and the Xbox Authentication Library's "SISU" flow, the way the open-source XAL implementations do. Use the **parent** Microsoft account, the same one you sign in to Family Safety with, not a child's. It works from a computer or a phone (the Home Assistant app included).
 
-1. **Settings > Devices & services > Microsoft Family Safety > Configure**, tick **Sign in to Xbox Family Settings (next page)** and submit.
-2. The next page shows a link, **Sign in to Xbox Family Settings**. Open it, ideally in a private browser window so you can pick the account.
-3. Sign in with the Microsoft account of a **parent** of your Microsoft family (the one the integration already uses) and accept.
-4. You end on a blank page whose address starts with `https://login.live.com/oauth20_desktop.srf?code=`. Copy that **whole address** from the address bar.
-5. Paste it into the field on the Home Assistant page and submit, within a few minutes (the code expires).
+1. **Settings > Devices & services > Microsoft Family Safety > Configure**. The top of that page says **Xbox Family Settings sign-in: not signed in** (or when you signed in, or that it expired). Tick **Sign in to Xbox Family Settings (next page)** and submit.
+2. The page **Sign in to Xbox Family Settings** shows a link, **this sign-in link**. Open it; it opens in a new tab or in your phone's browser. If that browser is already signed in to another Microsoft account, choose **Use another account**, or copy the link (long-press it on a phone) into a private or incognito window.
+3. Sign in with the parent account and accept if Microsoft asks for permission.
+4. You end on a **blank page**: that is expected. Copy its whole address from the address bar; it starts with `https://login.live.com/oauth20_desktop.srf?code=`. On a phone, tap the address bar, select all and copy, or use the browser's Share > Copy link.
+5. Back in Home Assistant, paste it into **Address of the blank page** and submit within a few minutes (the code in it expires soon). Spaces or quotes around it, a missing `https://`, or only the code itself are accepted.
+6. Home Assistant exchanges the code, makes the device key, checks the whole chain (device token, SISU authorize, XSTS) and saves the sign-in. It then checks it with reads only (the Xbox family, if a child's Xbox user id is not known yet, and one read of that child's Xbox overrides, as `probe_xapprove` does first) and shows one of three pages:
+   - **Xbox control works**: the box **Use the Xbox Family Settings API for the Xbox lock and extra time** is ticked; submit to turn the xapprove option on.
+   - **Xbox refused this sign-in**: the box is unticked; submit. The Xbox lock keeps working as before. Check that you used the parent account; `probe_xapprove` gives the details.
+   - **Signed in, not checked yet** (no child found in the Xbox family, the integration not running, a network error; the reason is shown): set the box as you want it; to be sure, leave it unticked and run `probe_xapprove` first.
 
-Home Assistant exchanges the code, makes the device key, and checks the whole chain (device token, SISU authorize, XSTS) before it saves anything; an error says which step failed and nothing is stored. The integration reloads, and from then on xapprove is signed with this sign-in (`working_method` `sisu`), and the Xbox family lookup uses it too, so the Family Safety sign-in is no longer used for Xbox Live at all. To remove it, tick **Sign out of Xbox Family Settings** and submit.
+The integration then reloads, and from then on xapprove is signed with this sign-in (`working_method` `sisu`), and the Xbox family lookup uses it too, so the Family Safety sign-in is no longer used for Xbox Live at all.
+
+**When something goes wrong**, the sign-in page says what to do: an address that is not the blank page's, the sign-in link itself pasted back, an address from an older link, a declined permission, or a code that expired or was already used (open the link again and paste the new address right away). If Xbox Live itself refuses, nothing is saved. Closed the page by mistake (a phone switching apps)? Open Configure and tick the sign-in again within 10 minutes: the link stays the same, so an address you already copied still works. After 10 minutes, or after a sign-in, the link is a new one.
+
+**Signing out.** While signed in, Configure also shows **Sign out of Xbox Family Settings**: tick it and submit to forget the sign-in (refresh token and key). To replace a sign-in (another account, or an expired one), just sign in again. Diagnostics show `xbox_xapprove` (option, signed in or not, when, the way of signing in use, the last refusal), nothing secret.
 
 **What is stored**, in Home Assistant's storage (`.storage/microsoft_family_safety.xbox_signin.<entry id>`), never in the options, the logs or the diagnostics: the Microsoft **refresh token** of this sign-in (renewed by Microsoft at each use, and the new one saved), an **EC P-256 private key** made for this entry (its public half, the "ProofKey", is registered with Xbox Live; it signs every Xbox request with the `Signature` header), and a random **device id**. Access, device, user, title and XSTS tokens are kept in memory only. The options only get the time of the sign-in. Anyone with that storage file can act as this Xbox sign-in, as with the integration's other stored sign-in.
 
-**How it keeps working.** The XSTS token lasts about 16 hours; then the refresh token gets a new access token and SISU authorize runs again (the device token, about two weeks, is renewed when it runs out). If Microsoft refuses the refresh token (a password change, a revoked consent, a long pause), a Repairs issue **Sign in to Xbox Family Settings again** appears and the Xbox lock falls back; sign in again as above.
+**How it keeps working.** The XSTS token lasts about 16 hours; then the refresh token gets a new access token and SISU authorize runs again (the device token, about two weeks, is renewed when it runs out). If Microsoft refuses the refresh token (a password change, a revoked consent, a long pause), a Repairs issue **Sign in to Xbox Family Settings again** appears, the Configure page says the sign-in expired, and the Xbox lock falls back; sign in again as above (the issue goes away once the new sign-in is saved).
 
 **The risk.** This is **unofficial use of a Microsoft first-party client id**. Microsoft does not offer it to third parties, can change the flow or block it at any time, and could object to its use. Nothing breaks when it stops working: the Xbox lock and extra time fall back to the Microsoft web session and, if turned on, today's Xbox schedule, a Repairs issue says so, and you can sign out of Xbox Family Settings in the options.
 

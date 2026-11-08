@@ -90,7 +90,7 @@ from .xapprove import (
     member_xuid,
     overrides_url,
 )
-from .xbox_sisu import XboxSignInExpired, XboxSisuAuth
+from .xbox_sisu import SignIn, XboxSignInExpired, XboxSisuAuth
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -117,6 +117,10 @@ def _plain(state: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(state, dict):
         return None
     return {"type": state.get("type"), "valid_until": state.get("valid_until")}
+
+
+async def _no_save(_credential: dict[str, Any]) -> None:
+    """The in-flow check never refreshes, so never has a rotated token to save."""
 
 
 class XboxXapproveMixin:
@@ -788,6 +792,63 @@ class XboxXapproveMixin:
     # ------------------------------------------------------------------
     # Diagnostic
     # ------------------------------------------------------------------
+
+    async def async_check_xbox_signin(self, sign_in: SignIn) -> dict[str, str]:
+        """Options flow, right after an Xbox sign-in: can it read a child's Xbox?
+
+        Read-only, on the new sign-in's tokens only (no Family token, no
+        refresh): the Xbox family read when a child's Xbox user id is not
+        known yet, then one GET of that child's overrides signed the ``sisu``
+        way, as probe_xapprove's first attempt. ``outcome`` is ``works``,
+        ``refused`` (xapprove answered 401/403) or ``unchecked`` with a short
+        ``reason``. Never raises; nothing secret in the answer.
+        """
+        try:
+            auth = XboxSisuAuth(lambda: async_get_clientsession(self.hass), sign_in.credential, _no_save)
+            auth.seed(sign_in)
+
+            @asynccontextmanager
+            async def _no_refresh_token():
+                raise XapproveUnavailable("not used")
+                yield  # pragma: no cover
+
+            client = XapproveClient(
+                lambda: async_get_clientsession(self.hass), _no_refresh_token,
+                method=SISU_METHOD, sisu=auth,
+            )
+            children = self._children()
+            if not children:
+                return {"outcome": "unchecked", "reason": "no child list yet"}
+            xuid: str | None = None
+            for account_id in children:
+                xuid = self._option_xuid(account_id) or (self._xuids.get(account_id) or (None,))[0]
+                if xuid:
+                    break
+            if xuid is None:
+                try:
+                    members = await client.async_family_members()
+                except XapproveRefused as err:
+                    return {"outcome": "unchecked", "reason": f"Xbox family read refused ({err.status})"}
+                if members is None:
+                    return {"outcome": "unchecked", "reason": "no Xbox family"}
+                parent = sign_in.tokens.parent_xuid
+                matched = match_children(members, children, {parent} if parent else set())
+                if not matched:
+                    return {"outcome": "unchecked", "reason": "no child found in the Xbox family"}
+                xuid = next(iter(matched.values()))[0]
+            facts = await client.async_try(SISU_METHOD, overrides_url(xuid))
+        except Exception as err:  # noqa: BLE001 - the sign-in is kept either way
+            _LOGGER.debug("Checking the new Xbox sign-in failed: %s", type(err).__name__)
+            return {"outcome": "unchecked", "reason": type(err).__name__}
+        status = facts.get("status")
+        if isinstance(status, int) and 200 <= status < 300:
+            return {"outcome": "works", "reason": ""}
+        if status in (401, 403):
+            return {"outcome": "refused", "reason": f"HTTP {status}"}
+        return {
+            "outcome": "unchecked",
+            "reason": f"HTTP {status}" if status else str(facts.get("error") or "no answer")[:80],
+        }
 
     async def async_probe_xapprove(self, confirm_risk: bool = False) -> dict[str, Any]:
         """probe_xapprove: token steps, the child lookup, and read-only overrides GETs.
