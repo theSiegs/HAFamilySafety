@@ -771,7 +771,7 @@ probe_xbox_token:
 
 probe_xapprove:
   name: Probe Xbox Family Settings API (diagnostic)
-  description: "Administrators only. Gets an Xbox Live token from the stored Microsoft sign-in, looks up the children's Xbox user ids and reads the first child's Xbox override from the Xbox Family Settings API (xapprove). Changes nothing. Answers with HTTP status codes, error codes and the override's type and end only; no token, gamertag or Xbox user id is returned or logged. Refuses unless confirm_risk is true: see the README."
+  description: "Administrators only. Gets Xbox Live tokens from the stored Microsoft sign-in, looks up the children's Xbox user ids and reads the first child's Xbox override from the Xbox Family Settings API (xapprove), trying several ways of signing that read until one works; that way is saved and used by the integration. Writes nothing to the Xbox. Answers with HTTP status codes, error codes and the override's type and end only; no token, gamertag or Xbox user id is returned or logged. Refuses unless confirm_risk is true: see the README."
   fields:
     entry_id:
       name: Config entry

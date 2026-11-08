@@ -31,6 +31,7 @@ from custom_components.microsoft_family_safety.const import (
     CONF_XBOX_XUIDS,
     DOMAIN,
 )
+from custom_components.microsoft_family_safety.coordinator import FamilySafetyDataUpdateCoordinator
 from custom_components.microsoft_family_safety.screen_time import iso_utc, parse_utc
 from custom_components.microsoft_family_safety.sensor import FamilySafetyXboxOverrideSensor
 from custom_components.microsoft_family_safety.xbox_xapprove import parse_xuid_option
@@ -45,7 +46,15 @@ XSTS_TOKEN = "xsts-token-SECRET"
 PARENT_XUID = "2535400000000001"
 CHILD_XUID = "2535400000000002"
 GAMERTAG = "AlexPlaysGames"
-SECRETS = (STORED, NEW_RT, ACCESS, USER_TOKEN, XSTS_TOKEN, PARENT_XUID, CHILD_XUID, GAMERTAG)
+XA_ACCESS = "xapprove-access-SECRET"
+XA_USER_TOKEN = "xapprove-user-SECRET"
+OTHER_XSTS = "other-xsts-SECRET"
+FAMILY_ACCESS = "family-access-SECRET"
+SECRETS = (
+    STORED, NEW_RT, ACCESS, USER_TOKEN, XSTS_TOKEN, PARENT_XUID, CHILD_XUID, GAMERTAG,
+    XA_ACCESS, XA_USER_TOKEN, OTHER_XSTS, FAMILY_ACCESS,
+)
+BASE_AUTH = f"XBL3.0 x=4242;{XSTS_TOKEN}"
 
 PATCH_SESSION = "custom_components.microsoft_family_safety.xbox_xapprove.async_get_clientsession"
 
@@ -80,6 +89,13 @@ class XboxServer:
         self.xsts_status = 200
         self.family_status = 200
         self.create_ignored = False
+        #: Which request headers xapprove accepts (the live 401 says: maybe not ours).
+        self.accepts = lambda headers: headers["Authorization"] == BASE_AUTH
+        #: login.live.com for the xapprove scope: 200 or an error status.
+        self.xapprove_scope_status = 400
+        #: XSTS relying party -> status, for the ones other than http://xboxlive.com.
+        self.rp_status: dict[str, int] = {}
+        self.scopes: list[str] = []
 
     def state(self) -> dict:
         overrides = []
@@ -96,17 +112,41 @@ class XboxServer:
     def request(self, method, url, **kwargs):
         self.calls.append((method, url, kwargs.get("json")))
         if url == probe.TOKEN_URL:
+            assert kwargs["data"]["refresh_token"] == STORED
+            scope = kwargs["data"]["scope"]
+            self.scopes.append(scope)
+            if scope == xapprove.XAPPROVE_SCOPE:
+                if self.xapprove_scope_status != 200:
+                    return FakeResponse(self.xapprove_scope_status, {"error": "invalid_scope"})
+                return FakeResponse(200, {
+                    "expires_in": 86400, "scope": scope, "access_token": XA_ACCESS,
+                    "refresh_token": NEW_RT,
+                })
+            assert scope == probe.XBOX_SCOPE
             return FakeResponse(200, {
                 "token_type": "bearer", "expires_in": 86400, "scope": probe.XBOX_SCOPE,
                 "access_token": ACCESS, "refresh_token": NEW_RT,
             })
         if url == probe.USER_AUTH_URL:
+            ticket = kwargs["json"]["Properties"]["RpsTicket"].split("=", 1)[1]
+            if ticket not in (ACCESS, XA_ACCESS):
+                return FakeResponse(400, None, {"x-err": "2148916238"})
             return FakeResponse(200, {
-                "Token": USER_TOKEN,
+                "Token": USER_TOKEN if ticket == ACCESS else XA_USER_TOKEN,
                 "NotAfter": iso_utc(dt_util.utcnow() + timedelta(days=14)),
                 "DisplayClaims": {"xui": [{"uhs": "4242"}]},
             })
         if url == probe.XSTS_URL:
+            rp = kwargs["json"]["RelyingParty"]
+            if rp != "http://xboxlive.com":
+                status = self.rp_status.get(rp, 400)
+                if status != 200:
+                    return FakeResponse(status, {"XErr": 2148916236}, {})
+                return FakeResponse(200, {
+                    "Token": OTHER_XSTS,
+                    "NotAfter": iso_utc(dt_util.utcnow() + timedelta(hours=16)),
+                    "DisplayClaims": {"xui": [{"uhs": "4242"}]},
+                })
             if self.xsts_status != 200:
                 return FakeResponse(self.xsts_status, {"XErr": 2148916233}, {})
             return FakeResponse(200, {
@@ -118,17 +158,21 @@ class XboxServer:
             assert kwargs["headers"]["Authorization"] == f"XBL3.0 x=4242;{XSTS_TOKEN}"
             if self.family_status != 200:
                 return FakeResponse(self.family_status, None)
+            # As seen live: no isAdult, a role per member.
             return FakeResponse(200, {"familyUsers": [
-                {"xuid": PARENT_XUID, "isAdult": True, "firstName": "Sam", "lastName": "Rivera",
+                {"xuid": PARENT_XUID, "role": "Adult", "firstName": "Sam", "lastName": "Rivera",
                  "gamertag": "SamParent"},
-                {"xuid": CHILD_XUID, "isAdult": False, "firstName": "Alex", "lastName": "Rivera",
+                {"xuid": CHILD_XUID, "role": "Child", "firstName": "Alex", "lastName": "Rivera",
                  "gamertag": GAMERTAG},
             ]})
         if url.startswith(xapprove.XAPPROVE_HOST):
-            assert kwargs["headers"]["Authorization"] == f"XBL3.0 x=4242;{XSTS_TOKEN}"
             assert f"/user/{CHILD_XUID}/" in url
             if self.xapprove_status != 200:
                 return FakeResponse(self.xapprove_status, None, {"x-err": "2148916238"})
+            if not self.accepts(kwargs["headers"]):
+                return FakeResponse(
+                    401, None, {"WWW-Authenticate": 'XBL3.0 realm="xapprove.xboxlive.com"'}
+                )
             if url.endswith("/settings/screentime/overrides/create"):
                 assert method == "POST"
                 body = kwargs["json"]
@@ -170,7 +214,8 @@ def _make_rig(hass, options: dict | None = None, web_up: bool = True):
     web.last_isolated_error_code = None
     coord.web_api = web
     authenticator = SimpleNamespace(
-        refresh_token=STORED, _login_lock=asyncio.Lock(), perform_refresh=AsyncMock(),
+        refresh_token=STORED, access_token=FAMILY_ACCESS, _login_lock=asyncio.Lock(),
+        perform_refresh=AsyncMock(),
     )
     coord.api = SimpleNamespace(api=SimpleNamespace(authenticator=authenticator))
     coord._async_persist_current_auth = AsyncMock()
@@ -475,7 +520,14 @@ async def test_probe_answers_without_secrets(rig, server, caplog):
     assert result["steps"]["xsts_authorize"]["display_claims_xui_keys"] == ["gtg", "uhs", "xid"]
     assert result["stored_refresh_token_unchanged"] is True
     assert result["parent_xuid_claim_present"] is True
-    assert result["family"]["ok"] is True and result["family"]["members"] == 2
+    family = result["family"]
+    assert family["ok"] is True and family["members"] == 2
+    assert family["adults"] == 1 and family["roles"] == ["Adult", "Child"]
+    assert family["signed_in_parent_listed"] is True
+    assert result["working_method"] == "xbl3" and result["method_saved"] is True
+    assert result["overrides_attempts"] == [
+        {"name": "xbl3", "stage": "xapprove", "status": 200, "xerr": None}
+    ]
     assert result["children"] == {CHILD: {"resolved": True, "via": "family_name"}}
     read = result["overrides_read"]
     assert read["ok"] is True and read["override_active"] is True
@@ -493,6 +545,7 @@ async def test_probe_reports_a_refusal(rig, server):
     result = await rig.async_probe_xapprove(True)
     read = result["overrides_read"]
     assert read["ok"] is False and read["status"] == 401 and read["xerr"] == "2148916238"
+    assert result["working_method"] is None and result["method_saved"] is False
     _no_secrets(result)
 
 
@@ -519,3 +572,100 @@ async def test_the_first_poll_finds_the_child_before_data_is_set(rig, server):
     server.override = (1, iso_utc(_hours(1)))
     await rig._async_poll_xapprove(accounts, {}, {})
     assert accounts[CHILD]["xbox_xapprove"]["type"] == "allowUntil"
+
+
+
+# probe_xapprove: other ways of signing the request -------------------------------
+
+
+async def test_probe_tries_each_way_until_one_works_and_the_integration_uses_it(
+    hass, rig, server, hass_storage
+):
+    server.accepts = lambda h: (
+        h["Authorization"] == BASE_AUTH and h.get("x-xbl-contract-version") == "2"
+    )
+    result = await rig.async_probe_xapprove(True)
+
+    names = [a["name"] for a in result["overrides_attempts"]]
+    assert names == ["xbl3", "xbl3_contract_1", "xbl3_contract_2"]
+    first = result["overrides_attempts"][0]
+    assert first["status"] == 401
+    assert first["www_authenticate"] == {
+        "name": "WWW-Authenticate", "value": 'XBL3.0 realm="xapprove.xboxlive.com"',
+    }
+    assert result["working_method"] == "xbl3_contract_2"
+    assert result["overrides_read"]["ok"] is True
+    assert result["overrides_read"]["method"] == "xbl3_contract_2"
+    _no_secrets(result)
+
+    # The integration now signs xapprove that way, also after a restart.
+    await rig.async_lock_platform(CHILD, "Xbox", _hours(3))
+    assert server.create_types() == [2]
+    restarted = FamilySafetyDataUpdateCoordinator(hass, rig.entry)
+    await restarted._async_load_xapprove_method()
+    assert restarted._xapprove_method.name == "xbl3_contract_2"
+    assert restarted._xapprove_client().method.contract == "2"
+
+
+async def test_probe_reaches_the_xapprove_scope_token(rig, server):
+    server.xapprove_status = 200
+    server.xapprove_scope_status = 200
+    server.accepts = lambda h: h["Authorization"] == f"WLID1.0 t={XA_ACCESS}"
+    result = await rig.async_probe_xapprove(True)
+
+    assert result["working_method"] == "wlid_t_xapprove_scope"
+    msa = result["steps"]["msa_refresh[service::xapprove.xboxlive.com::MBI_SSL]"]
+    assert msa["status"] == 200 and msa["refresh_token_discarded"] is True
+    assert result["stored_refresh_token_unchanged"] is True
+    tried = {a["name"]: a for a in result["overrides_attempts"]}
+    assert tried["xbl3_rp_http_xapprove"]["stage"] == "token"
+    assert tried["xbl3_rp_http_xapprove"]["step"] == "xsts_authorize"
+    _no_secrets(result)
+
+
+async def test_probe_tries_everything_when_nothing_works(rig, server, caplog):
+    caplog.set_level("DEBUG")
+    server.accepts = lambda h: False
+    result = await rig.async_probe_xapprove(True)
+
+    assert [a["name"] for a in result["overrides_attempts"]] == [
+        m.name for m in xapprove.PROBE_METHODS
+    ]
+    tried = {a["name"]: a for a in result["overrides_attempts"]}
+    assert tried["wlid_t_xapprove_scope"] == {
+        "name": "wlid_t_xapprove_scope", "stage": "token", "step": "msa_refresh",
+        "status": 400, "xerr": None, "error": "invalid_scope",
+    }
+    assert tried["msauth_family_token"]["status"] == 401
+    assert tried["xbl3_family_token_ticket"]["step"] == "user_authenticate"
+    assert result["working_method"] is None and result["method_saved"] is False
+    # Each scope is asked of login.live.com once, however many ways use it.
+    assert server.scopes == [probe.XBOX_SCOPE, xapprove.XAPPROVE_SCOPE]
+    assert len([u for u in server.urls(probe.XSTS_URL)]) == 1 + 2 + 1  # base, 2 RPs, rp://
+    assert rig._xapprove_method.name == "xbl3"
+    assert result["stored_refresh_token_unchanged"] is True
+    assert result["family_refresh_after"] == {"ok": True}
+    assert server.creates == []
+    _no_secrets(result)
+    for secret in SECRETS:
+        assert secret not in caplog.text
+
+
+def test_adults_by_role():
+    assert xapprove.is_adult({"role": "Adult"}) is True
+    assert xapprove.is_adult({"role": "FamilyOrganizer"}) is True
+    assert xapprove.is_adult({"role": "Child"}) is False
+    assert xapprove.is_adult({"memberRole": "Teen"}) is False
+    assert xapprove.is_adult({"isAdult": False, "role": "Adult"}) is False
+    assert xapprove.is_adult({}) is False
+    members = [
+        {"xuid": "1", "role": "Adult", "firstName": "Sam", "lastName": "Rivera"},
+        {"xuid": "5", "firstName": "Sam", "lastName": "Rivera"},  # the signed-in parent, no role
+        {"xuid": "2", "role": "Child", "firstName": "Alex", "lastName": "Rivera"},
+    ]
+    children = {
+        "20": {"first_name": "Alex", "surname": "Rivera"},
+        "30": {"first_name": "Robin", "surname": "Rivera"},
+    }
+    found = xapprove.match_children(members, children, {"5"})
+    assert found == {"20": ("2", "family_name")}  # Robin is not paired with an adult

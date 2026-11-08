@@ -221,6 +221,35 @@ def _actions(actions: Any) -> dict[str, Any] | None:
 _LIST_KEYS = ("familyUsers", "familyMembers", "members", "users")
 _XUID_KEYS = ("xuid", "xid", "memberXuid")
 _MSA_KEYS = ("msaUserId", "puid", "msaId", "userId", "cid", "id")
+#: Fields that may say whether a member is an adult (seen live: none of them
+#: was isAdult; probe_xapprove reports the role values it finds).
+_ROLE_KEYS = ("role", "memberRole", "familyRole", "userRole", "ageGroup", "accountType")
+_ADULT_WORDS = ("adult", "parent", "organizer", "organiser", "admin", "owner", "guardian")
+_CHILD_WORDS = ("child", "teen", "kid", "minor")
+
+
+def member_roles(member: dict) -> list[str]:
+    """The role-like values of a member (short categorical text, not personal)."""
+    found = []
+    for key in _ROLE_KEYS:
+        value = member.get(key)
+        if isinstance(value, (str, int)) and not isinstance(value, bool):
+            found.append(str(value)[:40])
+    return found
+
+
+def is_adult(member: dict) -> bool:
+    """A member who is an adult: ``isAdult``, else a role naming one.
+
+    A role naming a child wins over one naming an adult; unknown is not adult.
+    """
+    flag = member.get("isAdult")
+    if isinstance(flag, bool):
+        return flag
+    roles = [r.casefold() for r in member_roles(member)]
+    if any(word in r for r in roles for word in _CHILD_WORDS):
+        return False
+    return any(word in r for r in roles for word in _ADULT_WORDS)
 
 
 def family_members(payload: Any) -> list[dict[str, Any]] | None:
@@ -267,7 +296,9 @@ def _norm(value: Any) -> str:
 
 
 def match_children(
-    members: list[dict[str, Any]], children: dict[str, dict[str, Any]]
+    members: list[dict[str, Any]],
+    children: dict[str, dict[str, Any]],
+    exclude: set[str] | frozenset[str] = frozenset(),
 ) -> dict[str, tuple[str, str]]:
     """Family Safety child -> (xuid, how), from the Xbox family's members.
 
@@ -275,11 +306,12 @@ def match_children(
     ``family_id`` (a member field equal to the Microsoft account id),
     ``family_name`` (first and last name, both unique on each side), then
     ``elimination`` (exactly one child left on each side: the Xbox family is
-    the Microsoft family). Adults are never matched.
+    the Microsoft family). Adults (``is_adult``) and the xuids in
+    ``exclude`` (the signed-in parent) are never matched.
     """
     candidates = [
         m for m in members
-        if member_xuid(m) is not None and m.get("isAdult") is not True
+        if member_xuid(m) is not None and member_xuid(m) not in exclude and not is_adult(m)
     ]
     found: dict[str, tuple[str, str]] = {}
     used: set[str] = set()
@@ -321,6 +353,13 @@ def match_children(
 # Tokens
 # ----------------------------------------------------------------------
 
+XBOXLIVE_RP = "http://xboxlive.com"
+#: An MSA scope for xapprove itself (tried by probe_xapprove).
+XAPPROVE_SCOPE = "service::xapprove.xboxlive.com::MBI_SSL"
+#: Not an MSA scope: the integration's own Family access token (scope
+#: service::familymobile.microsoft.com::MBI_SSL), which it refreshes anyway.
+FAMILY_TOKEN = "family_token"
+
 
 @dataclass
 class XboxTokens:
@@ -337,43 +376,119 @@ class XboxTokens:
         return f"XBL3.0 x={self.uhs};{self.xsts}"
 
 
+@dataclass(frozen=True)
+class AuthMethod:
+    """How the Authorization header for xapprove is made.
+
+    ``scheme``:
+
+    * ``xbl3``: ``XBL3.0 x=<uhs>;<xsts>``, the XSTS token for
+      ``relying_party`` from an Xbox user token whose RPS ticket is an MSA
+      access token for ``msa_scope``;
+    * ``wlid_t`` / ``wlid_d``: ``WLID1.0 t=<token>`` / ``d=<token>``;
+    * ``bearer``: ``Bearer <token>``;
+    * ``msauth``: ``MSAuth1.0 usertoken="<token>", type="MSACT"`` (what the
+      Family Safety mobile API takes);
+
+    the last four with the MSA access token for ``msa_scope`` itself.
+    ``contract``: an ``x-xbl-contract-version`` header, or none.
+    """
+
+    name: str
+    scheme: str = "xbl3"
+    msa_scope: str = XBOX_SCOPE
+    relying_party: str = XBOXLIVE_RP
+    contract: str | None = None
+
+
+def _contracts(name: str, **kwargs: Any) -> list[AuthMethod]:
+    return [AuthMethod(name, **kwargs)] + [
+        AuthMethod(f"{name}_contract_{n}", contract=str(n), **kwargs) for n in (1, 2, 3)
+    ]
+
+
+#: Every way probe_xapprove tries, in order. None needs a device or title
+#: token, SISU, or the Xbox app's client id.
+PROBE_METHODS: list[AuthMethod] = [
+    # a. The XSTS for http://xboxlive.com, with and without a contract version.
+    *_contracts("xbl3"),
+    # b. An XSTS for xapprove's own relying party.
+    *_contracts("xbl3_rp_http_xapprove", relying_party="http://xapprove.xboxlive.com"),
+    *_contracts("xbl3_rp_https_xapprove", relying_party="https://xapprove.xboxlive.com/"),
+    # c. An MSA token for xapprove's scope: directly, then as the user ticket.
+    AuthMethod("wlid_t_xapprove_scope", scheme="wlid_t", msa_scope=XAPPROVE_SCOPE),
+    AuthMethod("wlid_d_xapprove_scope", scheme="wlid_d", msa_scope=XAPPROVE_SCOPE),
+    AuthMethod("bearer_xapprove_scope", scheme="bearer", msa_scope=XAPPROVE_SCOPE),
+    AuthMethod("msauth_xapprove_scope", scheme="msauth", msa_scope=XAPPROVE_SCOPE),
+    AuthMethod("xbl3_xapprove_scope_ticket", msa_scope=XAPPROVE_SCOPE),
+    AuthMethod(
+        "xbl3_xapprove_scope_ticket_rp_http_xapprove",
+        msa_scope=XAPPROVE_SCOPE, relying_party="http://xapprove.xboxlive.com",
+    ),
+    # d. Other relying-party spelling; the Xbox user-auth token itself; the
+    # integration's own Family token, which costs no extra use of the sign-in.
+    AuthMethod("xbl3_rp_rp_xapprove", relying_party="rp://xapprove.xboxlive.com/"),
+    AuthMethod("wlid_t_userauth_scope", scheme="wlid_t"),
+    AuthMethod("msauth_family_token", scheme="msauth", msa_scope=FAMILY_TOKEN),
+    AuthMethod("wlid_t_family_token", scheme="wlid_t", msa_scope=FAMILY_TOKEN),
+    AuthMethod("xbl3_family_token_ticket", msa_scope=FAMILY_TOKEN),
+]
+METHODS_BY_NAME: dict[str, AuthMethod] = {m.name: m for m in PROBE_METHODS}
+DEFAULT_METHOD = PROBE_METHODS[0]
+
+
 def _record(steps: dict | None, name: str, value: Any) -> None:
     if steps is not None:
         steps[name] = value
 
 
+def _suffix(scope: str, rp: str | None = None) -> str:
+    """Step-name suffix for anything but the base chain (keeps the old names)."""
+    parts = []
+    if scope != XBOX_SCOPE:
+        parts.append(scope)
+    if rp is not None and rp != XBOXLIVE_RP:
+        parts.append(rp)
+    return f"[{' '.join(parts)}]" if parts else ""
+
+
 async def async_msa_access_token(
-    session: aiohttp.ClientSession, refresh_token: str, steps: dict | None = None
-) -> str:
-    """Step 1. The refresh token Microsoft may send back is dropped unread."""
+    session: aiohttp.ClientSession,
+    refresh_token: str,
+    steps: dict | None = None,
+    scope: str = XBOX_SCOPE,
+) -> tuple[str, int | None]:
+    """Step 1: (access token, expires_in). A refresh token in the answer is dropped unread."""
     status, payload, _headers = await _call(
         session, "POST", TOKEN_URL,
         data={
             "grant_type": "refresh_token",
             "client_id": CLIENT_ID,
-            "scope": XBOX_SCOPE,
+            "scope": scope,
             "refresh_token": refresh_token,
         },
     )
     access = payload.get("access_token") if isinstance(payload, dict) else None
     error = payload.get("error") if isinstance(payload, dict) and isinstance(payload.get("error"), str) else None
-    _record(steps, "msa_refresh", {
+    expires_in = payload.get("expires_in") if isinstance(payload, dict) else None
+    _record(steps, f"msa_refresh{_suffix(scope)}", {
         "status": status,
         "error": error,
+        "scope": payload.get("scope") if isinstance(payload, dict) and isinstance(payload.get("scope"), str) else None,
         "access_token_received": isinstance(access, str),
         "refresh_token_returned": bool(isinstance(payload, dict) and payload.get("refresh_token")),
         "refresh_token_discarded": True,
     })
     payload = None
     if status == 200 and isinstance(access, str):
-        return access
+        return access, expires_in if isinstance(expires_in, int) else None
     if status is not None and 400 <= status < 500:
         raise XapproveRefused("msa_refresh", status, error=error)
     raise XapproveError(f"msa_refresh: HTTP {status}")
 
 
 async def async_user_token(
-    session: aiohttp.ClientSession, access: str, steps: dict | None = None
+    session: aiohttp.ClientSession, access: str, steps: dict | None = None, label: str = ""
 ) -> tuple[str, datetime | None]:
     """Step 2: RPS ticket ``t=``, then ``d=``."""
     attempts = []
@@ -394,23 +509,27 @@ async def async_user_token(
         )
         attempts.append({"ticket_prefix": prefix, "status": status, "xerr": _xerr(body, headers)})
         if status == 200 and isinstance(body, dict) and isinstance(body.get("Token"), str):
-            _record(steps, "user_authenticate", attempts)
+            _record(steps, f"user_authenticate{label}", attempts)
             return body["Token"], _not_after(body)
         last = (status, _xerr(body, headers))
-    _record(steps, "user_authenticate", attempts)
+    _record(steps, f"user_authenticate{label}", attempts)
     if last[0] and 400 <= last[0] < 500:
         raise XapproveRefused("user_authenticate", last[0], last[1])
     raise XapproveError(f"user_authenticate: HTTP {last[0]}")
 
 
 async def async_xsts(
-    session: aiohttp.ClientSession, user_token: str, steps: dict | None = None
+    session: aiohttp.ClientSession,
+    user_token: str,
+    steps: dict | None = None,
+    relying_party: str = XBOXLIVE_RP,
+    label: str = "",
 ) -> tuple[str, str, datetime | None, str | None]:
     """Step 3: (uhs, token, NotAfter, parent xuid or None)."""
     status, body, headers = await _call(
         session, "POST", XSTS_URL,
         json={
-            "RelyingParty": "http://xboxlive.com",
+            "RelyingParty": relying_party,
             "TokenType": "JWT",
             "Properties": {"UserTokens": [user_token], "SandboxId": "RETAIL"},
         },
@@ -422,7 +541,7 @@ async def async_xsts(
         items = claims.get("xui") if isinstance(claims, dict) else None
         if isinstance(items, list) and items and isinstance(items[0], dict):
             xui = items[0]
-    _record(steps, "xsts_authorize", {
+    _record(steps, f"xsts_authorize{label}", {
         "status": status,
         "xerr": _xerr(body, headers),
         "token_received": bool(isinstance(body, dict) and body.get("Token")),
@@ -439,11 +558,18 @@ async def async_xsts(
 async def async_token_chain(
     session: aiohttp.ClientSession, refresh_token: str, steps: dict | None = None
 ) -> XboxTokens:
-    access = await async_msa_access_token(session, refresh_token, steps)
+    access, _expires = await async_msa_access_token(session, refresh_token, steps)
     user_token, user_until = await async_user_token(session, access, steps)
     access = None
     uhs, xsts, xsts_until, xid = await async_xsts(session, user_token, steps)
     return XboxTokens(uhs, xsts, xsts_until, user_token, user_until, xid)
+
+
+def _www_authenticate(headers: dict[str, str]) -> dict[str, str] | None:
+    for name, value in headers.items():
+        if str(name).lower() == "www-authenticate":
+            return {"name": str(name), "value": str(value)[:300]}
+    return None
 
 
 # ----------------------------------------------------------------------
@@ -456,55 +582,169 @@ class XapproveClient:
 
     ``refresh_token_source`` is an async context manager factory yielding the
     stored mobile refresh token while the integration's own token refresh is
-    held off (the authenticator's login lock).
+    held off (the authenticator's login lock). ``family_token_getter`` gives
+    the integration's current Family access token (for the methods that use
+    it). ``method`` says how xapprove's Authorization header is made; the
+    Xbox family read always uses the XSTS for http://xboxlive.com.
+
+    Tokens are cached in memory per MSA scope (access token, Xbox user token)
+    and per scope and relying party (XSTS) until shortly before they expire.
+    ``token_facts`` keeps the non-secret facts of each token step.
     """
 
     def __init__(
         self,
         session_getter: Callable[[], aiohttp.ClientSession],
         refresh_token_source: Callable[[], Any],
+        *,
+        method: AuthMethod = DEFAULT_METHOD,
+        family_token_getter: Callable[[], str | None] | None = None,
     ) -> None:
         self._session_getter = session_getter
         self._refresh_token_source = refresh_token_source
-        self._tokens: XboxTokens | None = None
+        self._family_token_getter = family_token_getter
+        self.method = method
+        self._access: dict[str, tuple[str, datetime | None]] = {}
+        self._user: dict[str, tuple[str, datetime | None]] = {}
+        self._xsts: dict[tuple[str, str], XboxTokens] = {}
+        #: Token steps that failed, so another method needing the same one does
+        #: not ask again (each MSA ask is a use of the stored sign-in). Cleared
+        #: with the tokens.
+        self._failed: dict[Any, XapproveError] = {}
         self._token_lock = asyncio.Lock()
+        self.token_facts: dict[str, Any] = {}
         #: xuid -> lock: one write at a time per child.
         self._write_locks: dict[str, asyncio.Lock] = {}
 
     def forget_tokens(self) -> None:
-        self._tokens = None
+        self._access.clear()
+        self._user.clear()
+        self._xsts.clear()
+        self._failed.clear()
+
+    def seed(self, tokens: XboxTokens) -> None:
+        """Start from a base chain already run (scope MBI_SSL, http://xboxlive.com)."""
+        self._user[XBOX_SCOPE] = (tokens.user_token, tokens.user_not_after)
+        self._xsts[(XBOX_SCOPE, XBOXLIVE_RP)] = tokens
 
     @property
     def parent_xuid(self) -> str | None:
-        return self._tokens.parent_xuid if self._tokens else None
+        tokens = self._xsts.get((XBOX_SCOPE, XBOXLIVE_RP))
+        return tokens.parent_xuid if tokens else None
+
+    # Token steps (callers hold _token_lock) -----------------------------------
+
+    async def _msa_access(self, scope: str) -> str:
+        if scope == FAMILY_TOKEN:
+            token = self._family_token_getter() if self._family_token_getter else None
+            if not token:
+                raise XapproveUnavailable("No Family access token at hand.")
+            return token
+        cached = self._access.get(scope)
+        if cached is not None and _valid(cached[1]):
+            return cached[0]
+        if ("msa", scope) in self._failed:
+            raise self._failed[("msa", scope)]
+        try:
+            async with self._refresh_token_source() as refresh_token:
+                access, expires_in = await async_msa_access_token(
+                    self._session_getter(), refresh_token, self.token_facts, scope
+                )
+        except XapproveRefused as err:
+            self._failed[("msa", scope)] = err
+            raise
+        until = dt_util.utcnow() + timedelta(seconds=expires_in) if expires_in else None
+        self._access[scope] = (access, until)
+        return access
+
+    async def _user_token(self, scope: str, *, fresh: bool = False) -> tuple[str, datetime | None]:
+        cached = self._user.get(scope)
+        if cached is not None and not fresh and _valid(cached[1]):
+            return cached
+        if fresh:
+            self._access.pop(scope, None)
+        elif ("user", scope) in self._failed:
+            raise self._failed[("user", scope)]
+        access = await self._msa_access(scope)
+        try:
+            token, until = await async_user_token(
+                self._session_getter(), access, self.token_facts, _suffix(scope)
+            )
+        except XapproveRefused as err:
+            self._failed[("user", scope)] = err
+            raise
+        self._user[scope] = (token, until)
+        return token, until
+
+    async def _xsts_tokens(self, scope: str, rp: str, force: bool = False) -> XboxTokens:
+        cached = self._xsts.get((scope, rp))
+        if cached is not None and not force and _valid(cached.xsts_not_after):
+            return cached
+        if not force and ("xsts", scope, rp) in self._failed:
+            raise self._failed[("xsts", scope, rp)]
+        had_user = scope in self._user and _valid(self._user[scope][1])
+        user, user_until = await self._user_token(scope)
+        session = self._session_getter()
+        label = _suffix(scope, rp)
+        try:
+            uhs, xsts, until, xid = await async_xsts(session, user, self.token_facts, rp, label)
+        except XapproveRefused as err:
+            if not had_user or rp != XBOXLIVE_RP:
+                # Another relying party refusing says nothing about the user token.
+                self._failed[("xsts", scope, rp)] = err
+                raise
+            # The cached user token may have gone stale: once more, from fresh.
+            user, user_until = await self._user_token(scope, fresh=True)
+            uhs, xsts, until, xid = await async_xsts(session, user, self.token_facts, rp, label)
+        tokens = XboxTokens(uhs, xsts, until, user, user_until, xid)
+        self._xsts[(scope, rp)] = tokens
+        return tokens
+
+    # Public token entry points ------------------------------------------------
 
     async def async_tokens(self, *, force: bool = False) -> XboxTokens:
+        """The base XSTS (MBI_SSL, http://xboxlive.com): family read, parent xuid."""
         async with self._token_lock:
-            tokens = self._tokens
-            if tokens is not None and not force and _valid(tokens.xsts_not_after):
-                return tokens
-            session = self._session_getter()
-            if tokens is not None and _valid(tokens.user_not_after):
-                try:
-                    uhs, xsts, until, xid = await async_xsts(session, tokens.user_token)
-                except XapproveRefused:
-                    self._tokens = tokens = None  # the user token went stale: start over
-                else:
-                    tokens.uhs, tokens.xsts, tokens.xsts_not_after = uhs, xsts, until
-                    tokens.parent_xuid = xid or tokens.parent_xuid
-                    return tokens
-            async with self._refresh_token_source() as refresh_token:
-                self._tokens = await async_token_chain(session, refresh_token)
-            return self._tokens
+            return await self._xsts_tokens(XBOX_SCOPE, XBOXLIVE_RP, force)
+
+    async def async_auth_headers(
+        self, method: AuthMethod | None = None, *, force: bool = False
+    ) -> dict[str, str]:
+        method = method or self.method
+        async with self._token_lock:
+            if method.scheme == "xbl3":
+                tokens = await self._xsts_tokens(method.msa_scope, method.relying_party, force)
+                value = tokens.header()
+            else:
+                if force and method.msa_scope != FAMILY_TOKEN:
+                    self._access.pop(method.msa_scope, None)
+                token = await self._msa_access(method.msa_scope)
+                value = {
+                    "wlid_t": f"WLID1.0 t={token}",
+                    "wlid_d": f"WLID1.0 d={token}",
+                    "bearer": f"Bearer {token}",
+                    "msauth": f'MSAuth1.0 usertoken="{token}", type="MSACT"',
+                }[method.scheme]
+        headers = {"Authorization": value}
+        if method.contract:
+            headers["x-xbl-contract-version"] = method.contract
+        return headers
 
     async def _request(
         self, method: str, url: str, *, json: Any = None, extra_headers: dict | None = None,
         step: str = "xapprove",
     ) -> Any:
-        """One authorised request; a 401/403 is retried once with fresh tokens."""
+        """One authorised request; a 401/403 is retried once with fresh tokens.
+
+        xapprove uses ``self.method``; the family read the base XSTS.
+        """
         for attempt in (0, 1):
-            tokens = await self.async_tokens(force=attempt == 1)
-            headers = {"Authorization": tokens.header(), "Accept": "application/json"}
+            if step == "family":
+                tokens = await self.async_tokens(force=attempt == 1)
+                headers = {"Authorization": tokens.header()}
+            else:
+                headers = await self.async_auth_headers(force=attempt == 1)
+            headers["Accept"] = "application/json"
             headers.update(extra_headers or {})
             kwargs: dict[str, Any] = {"headers": headers}
             if json is not None:
@@ -519,12 +759,40 @@ class XapproveClient:
             return payload
         raise XapproveError(step)  # not reached
 
+    async def async_try(self, method: AuthMethod, url: str) -> dict[str, Any]:
+        """probe_xapprove: one read-only GET with ``method``, no retry; facts only.
+
+        ``state`` (the parsed overrides) is added on a 2xx answer.
+        """
+        facts: dict[str, Any] = {"name": method.name}
+        try:
+            headers = await self.async_auth_headers(method)
+        except XapproveRefused as err:
+            facts.update({"stage": "token", **err.facts()})
+            return facts
+        except XapproveError as err:
+            facts.update({"stage": "token", "error": str(err)})
+            return facts
+        headers["Accept"] = "application/json"
+        try:
+            status, payload, resp_headers = await _call(
+                self._session_getter(), "GET", url, headers=headers
+            )
+        except XapproveError as err:
+            facts.update({"stage": "xapprove", "error": str(err)})
+            return facts
+        facts.update({"stage": "xapprove", "status": status, "xerr": _xerr(payload, resp_headers)})
+        www = _www_authenticate(resp_headers)
+        if www is not None:
+            facts["www_authenticate"] = www
+        if 200 <= status < 300:
+            facts["state"] = parse_overrides(payload)
+        return facts
+
     # Reads ------------------------------------------------------------------
 
     async def async_get_overrides(self, xuid: str) -> dict[str, Any]:
-        payload = await self._request(
-            "GET", f"{XAPPROVE_HOST}/api/v1/user/{xuid}/settings/screentime/overrides"
-        )
+        payload = await self._request("GET", overrides_url(xuid))
         state = parse_overrides(payload)
         if state is None:
             raise XapproveError("xapprove: unreadable overrides answer")
@@ -553,7 +821,7 @@ class XapproveClient:
         """
         payload = await self._request(
             "POST",
-            f"{XAPPROVE_HOST}/api/v1/user/{xuid}/settings/screentime/overrides/create",
+            f"{overrides_url(xuid)}/create",
             json={
                 "overrideType": override_type,
                 "target": TARGET_XBOX_SCREEN_TIME,
@@ -565,3 +833,6 @@ class XapproveClient:
     async def async_cancel(self, xuid: str) -> dict[str, Any] | None:
         return await self.async_create(xuid, OVERRIDE_CANCEL, dt_util.utcnow())
 
+
+def overrides_url(xuid: str) -> str:
+    return f"{XAPPROVE_HOST}/api/v1/user/{xuid}/settings/screentime/overrides"

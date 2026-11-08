@@ -48,6 +48,7 @@ from typing import Any
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -69,17 +70,21 @@ from .screen_time import (
     parse_utc,
 )
 from .xapprove import (
+    DEFAULT_METHOD,
+    METHODS_BY_NAME,
     OVERRIDE_ALLOW,
     OVERRIDE_BLOCK,
-    XAPPROVE_HOST,
+    PROBE_METHODS,
+    AuthMethod,
     XapproveClient,
     XapproveError,
     XapproveRefused,
     XapproveUnavailable,
-    async_token_chain,
+    is_adult,
     match_children,
+    member_roles,
     member_xuid,
-    parse_overrides,
+    overrides_url,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -126,6 +131,13 @@ class XboxXapproveMixin:
         #: account id -> names, from the poll in progress (self.data is not
         #: set yet on the first poll).
         self._xapprove_roster: dict[str, dict[str, Any]] = {}
+        #: The way of signing xapprove requests that probe_xapprove found to
+        #: work (xapprove.PROBE_METHODS), kept across restarts.
+        self._xapprove_method_store: Store = Store(
+            self.hass, 1, f"{DOMAIN}.xapprove.{entry.entry_id}"
+        )
+        self._xapprove_method: AuthMethod = DEFAULT_METHOD
+        self._xapprove_method_loaded = False
 
     # ------------------------------------------------------------------
     # Client, token source, refusal
@@ -143,12 +155,40 @@ class XboxXapproveMixin:
                 raise XapproveUnavailable("No mobile refresh token is stored.")
             yield token
 
+    def _family_access_token(self) -> str | None:
+        if self.api is None:
+            return None
+        return getattr(self.api.api.authenticator, "access_token", None)
+
     def _xapprove_client(self) -> XapproveClient:
         if self._xapprove is None:
             self._xapprove = XapproveClient(
-                lambda: async_get_clientsession(self.hass), self._xapprove_refresh_token
+                lambda: async_get_clientsession(self.hass),
+                self._xapprove_refresh_token,
+                method=self._xapprove_method,
+                family_token_getter=self._family_access_token,
             )
         return self._xapprove
+
+    async def _async_load_xapprove_method(self) -> None:
+        if self._xapprove_method_loaded:
+            return
+        self._xapprove_method_loaded = True
+        data = await self._xapprove_method_store.async_load()
+        name = data.get("method") if isinstance(data, dict) else None
+        if name in METHODS_BY_NAME:
+            self._xapprove_method = METHODS_BY_NAME[name]
+            if self._xapprove is not None:
+                self._xapprove.method = self._xapprove_method
+
+    async def _async_save_xapprove_method(self, method: AuthMethod) -> None:
+        self._xapprove_method = method
+        self._xapprove_method_loaded = True
+        if self._xapprove is not None:
+            self._xapprove.method = method
+        await self._xapprove_method_store.async_save(
+            {"method": method.name, "found": iso_utc(dt_util.utcnow())}
+        )
 
     @property
     def xapprove_enabled(self) -> bool:
@@ -231,10 +271,12 @@ class XboxXapproveMixin:
             raise XapproveUnavailable(f"The Xbox family could not be read ({err}).") from err
         if not members:
             return
-        for account_id, found in match_children(members, children).items():
+        exclude = {client.parent_xuid} if client.parent_xuid else set()
+        for account_id, found in match_children(members, children, exclude).items():
             self._xuids[account_id] = found
 
     async def _async_xapprove_xuid(self, account_id: Any) -> str:
+        await self._async_load_xapprove_method()
         account_id = str(account_id)
         option = self._option_xuid(account_id)
         if option is not None:
@@ -702,108 +744,58 @@ class XboxXapproveMixin:
     # ------------------------------------------------------------------
 
     async def async_probe_xapprove(self, confirm_risk: bool = False) -> dict[str, Any]:
-        """probe_xapprove: token steps, the child lookup and one overrides read.
+        """probe_xapprove: token steps, the child lookup, and read-only overrides GETs.
 
-        Answers with non-secret facts only: no token, xuid or gamertag.
+        The GET is tried with each way of signing it in xapprove.PROBE_METHODS
+        until one answers 2xx; that one is saved and used by the integration
+        from then on (behind the same option). Answers with non-secret facts
+        only: no token, xuid or gamertag.
         """
         if not confirm_risk:
             raise ServiceValidationError(
-                "probe_xapprove uses the stored Microsoft sign-in for the Xbox Live scope. "
-                "Microsoft does not document whether that endpoint revokes the old "
-                "refresh token on use; if it did, the integration would need a new "
-                "sign-in. Call it again with confirm_risk: true to accept that."
+                "probe_xapprove uses the stored Microsoft sign-in for the Xbox Live scope "
+                "(and for the xapprove scope). Microsoft does not document whether that "
+                "endpoint revokes the old refresh token on use; if it did, the integration "
+                "would need a new sign-in. Call it again with confirm_risk: true to accept that."
             )
         if self.api is None:
             raise HomeAssistantError("The Microsoft API is not ready yet.")
+        await self._async_load_xapprove_method()
         authenticator = self.api.api.authenticator
         session = async_get_clientsession(self.hass)
         steps: dict[str, Any] = {}
         result: dict[str, Any] = {
             "entry_id": self.entry.entry_id,
             "option_enabled": self._xapprove_enabled,
+            "method_before": self._xapprove_method.name,
             "refused_earlier": dict(self._xapprove_refusal) if self._xapprove_refusal else None,
             "steps": steps,
         }
-        tokens = None
+        # The whole probe runs with the Family token refresh held off, so the
+        # stored token cannot rotate under it.
         async with authenticator._login_lock:
             stored = authenticator.refresh_token
             if not stored:
                 raise HomeAssistantError("No mobile refresh token is stored.")
-            try:
-                tokens = await async_token_chain(session, stored, steps)
-            except XapproveError as err:
-                result["token_error"] = str(err)
-            result["stored_refresh_token_unchanged"] = authenticator.refresh_token == stored
-        stored = None
-        if tokens is not None:
-            result["parent_xuid_claim_present"] = bool(tokens.parent_xuid)
 
             @asynccontextmanager
-            async def _no_refresh():
-                raise XapproveUnavailable("the probe uses the tokens it just got")
-                yield  # pragma: no cover
+            async def _stored():
+                yield stored
 
-            client = XapproveClient(lambda: session, _no_refresh)
-            client._tokens = tokens
-            children = self._children()
-            family: dict[str, Any] = {}
-            matched: dict[str, tuple[str, str]] = {}
-            try:
-                members = await client.async_family_members()
-            except XapproveRefused as err:
-                family = {"ok": False, **err.facts()}
-            except XapproveError as err:
-                family = {"ok": False, "error": str(err)}
-            else:
-                if members is None:
-                    family = {"ok": False, "error": "no parent xuid claim or no member list"}
-                else:
-                    keys: set[str] = set()
-                    for member in members:
-                        keys.update(str(k) for k in member)
-                    family = {
-                        "ok": True,
-                        "members": len(members),
-                        "members_with_xuid": sum(1 for m in members if member_xuid(m)),
-                        "adults": sum(1 for m in members if m.get("isAdult") is True),
-                        "member_keys": sorted(keys),
-                    }
-                    matched = match_children(members, children)
-            result["family"] = family
-            resolved: dict[str, Any] = {}
-            first: tuple[str, str] | None = None
-            for account_id in children:
-                option = self._option_xuid(account_id)
-                xuid, via = (option, "option") if option else matched.get(account_id, (None, None))
-                resolved[account_id] = {"resolved": xuid is not None, "via": via}
-                if xuid is not None and first is None:
-                    first = (account_id, xuid)
-            result["children"] = resolved
-            if first is not None:
-                read: dict[str, Any] = {"account_id": first[0]}
-                try:
-                    payload = await client._request(
-                        "GET",
-                        f"{XAPPROVE_HOST}/api/v1/user/{first[1]}/settings/screentime/overrides",
-                    )
-                except XapproveRefused as err:
-                    read.update({"ok": False, **err.facts()})
-                except XapproveError as err:
-                    read.update({"ok": False, "error": str(err)})
-                else:
-                    state = parse_overrides(payload)
-                    read["ok"] = True
-                    read["readable"] = state is not None
-                    if state is not None:
-                        read.update({
-                            "override_active": state["type"] != NO_OVERRIDE,
-                            "type": state["type"],
-                            "raw_type": state.get("raw_type"),
-                            "valid_until": state["valid_until"],
-                            "actions": state.get("actions"),
-                        })
-                result["overrides_read"] = read
+            client = XapproveClient(
+                lambda: session, _stored, family_token_getter=self._family_access_token
+            )
+            client.token_facts = steps
             tokens = None
+            try:
+                tokens = await client.async_tokens()
+            except XapproveError as err:
+                result["token_error"] = str(err)
+            if tokens is not None:
+                await self._async_probe_family_and_read(client, tokens, result)
+            client.forget_tokens()
+            result["stored_refresh_token_unchanged"] = authenticator.refresh_token == stored
+            stored = None
         try:
             await authenticator.perform_refresh()
         except Exception as err:  # noqa: BLE001 - reported, not raised
@@ -816,3 +808,94 @@ class XboxXapproveMixin:
             result["family_refresh_after"] = {"ok": True}
             await self._async_persist_current_auth()
         return result
+
+    async def _async_probe_family_and_read(
+        self, client: XapproveClient, tokens: Any, result: dict[str, Any]
+    ) -> None:
+        result["parent_xuid_claim_present"] = bool(tokens.parent_xuid)
+        children = self._children()
+        family: dict[str, Any] = {}
+        matched: dict[str, tuple[str, str]] = {}
+        try:
+            members = await client.async_family_members()
+        except XapproveRefused as err:
+            family = {"ok": False, **err.facts()}
+        except XapproveError as err:
+            family = {"ok": False, "error": str(err)}
+        else:
+            if members is None:
+                family = {"ok": False, "error": "no parent xuid claim or no member list"}
+            else:
+                keys: set[str] = set()
+                roles: set[str] = set()
+                for member in members:
+                    keys.update(str(k) for k in member)
+                    roles.update(member_roles(member))
+                parent = tokens.parent_xuid
+                family = {
+                    "ok": True,
+                    "members": len(members),
+                    "members_with_xuid": sum(1 for m in members if member_xuid(m)),
+                    "adults": sum(1 for m in members if is_adult(m)),
+                    "signed_in_parent_listed": bool(
+                        parent and any(member_xuid(m) == parent for m in members)
+                    ),
+                    "roles": sorted(roles),
+                    "member_keys": sorted(keys),
+                }
+                matched = match_children(members, children, {parent} if parent else set())
+        result["family"] = family
+        resolved: dict[str, Any] = {}
+        first: tuple[str, str] | None = None
+        for account_id in children:
+            option = self._option_xuid(account_id)
+            xuid, via = (option, "option") if option else matched.get(account_id, (None, None))
+            resolved[account_id] = {"resolved": xuid is not None, "via": via}
+            if xuid is not None and first is None:
+                first = (account_id, xuid)
+        result["children"] = resolved
+        if first is None:
+            return
+        url = overrides_url(first[1])
+        attempts: list[dict[str, Any]] = []
+        working: AuthMethod | None = None
+        state: dict[str, Any] | None = None
+        for method in PROBE_METHODS:
+            facts = await client.async_try(method, url)
+            state = facts.pop("state", None)
+            attempts.append(facts)
+            status = facts.get("status")
+            if isinstance(status, int) and 200 <= status < 300:
+                working = method
+                break
+        result["overrides_attempts"] = attempts
+        result["working_method"] = working.name if working else None
+        read: dict[str, Any] = {"account_id": first[0]}
+        if working is None:
+            base = attempts[0] if attempts else {}
+            read.update({
+                "ok": False,
+                "status": base.get("status"),
+                "xerr": base.get("xerr"),
+                "error": base.get("error"),
+            })
+            result["method_saved"] = False
+        else:
+            read.update({
+                "ok": True,
+                "method": working.name,
+                "readable": state is not None,
+            })
+            if state is not None:
+                read.update({
+                    "override_active": state["type"] != NO_OVERRIDE,
+                    "type": state["type"],
+                    "raw_type": state.get("raw_type"),
+                    "valid_until": state["valid_until"],
+                    "actions": state.get("actions"),
+                })
+            # The integration signs xapprove this way from now on.
+            await self._async_save_xapprove_method(working)
+            self._xapprove_refused_until = 0.0
+            result["method_saved"] = True
+        result["overrides_read"] = read
