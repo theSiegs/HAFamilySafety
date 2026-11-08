@@ -57,6 +57,13 @@ DEFAULT_XBOX_XAPPROVE: Final = False
 #: the automatic lookup in the Xbox family.
 CONF_XBOX_XUIDS: Final = "xbox_xuids"
 XAPPROVE_REFUSED_ISSUE: Final = "xapprove_refused"
+#: The Xbox Family Settings sign-in (xbox_sisu.py): Store key prefix, the
+#: options-flow choice that starts it, and the issue when it needs redoing.
+XBOX_SIGNIN_STORAGE_KEY: Final = f"{DOMAIN}.xbox_signin"
+CONF_XBOX_SIGN_IN: Final = "xbox_sign_in"
+CONF_XBOX_SIGN_OUT: Final = "xbox_sign_out"
+CONF_XBOX_SIGNED_IN_AT: Final = "xbox_signed_in_at"
+XBOX_SIGNIN_EXPIRED_ISSUE: Final = "xbox_signin_expired"
 #: Fired once for each pending request (more time, an app) that appears.
 EVENT_REQUEST: Final = f"{DOMAIN}_request"
 #: Fired once when a pending request leaves the list (approved, denied, expired).

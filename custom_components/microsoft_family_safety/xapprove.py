@@ -29,6 +29,7 @@ Nothing secret is logged or returned: no token, gamertag or Xbox user id.
 from __future__ import annotations
 
 import asyncio
+import json as jsonlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import logging
@@ -390,7 +391,13 @@ class AuthMethod:
     * ``msauth``: ``MSAuth1.0 usertoken="<token>", type="MSACT"`` (what the
       Family Safety mobile API takes);
 
-    the last four with the MSA access token for ``msa_scope`` itself.
+    the last four with the MSA access token for ``msa_scope`` itself;
+    * ``sisu``: ``XBL3.0 x=<uhs>;<xsts>`` with the XSTS of the Xbox Family
+      Settings sign-in (xbox_sisu.py), the request signed with its ProofKey
+      (``Signature`` header); ``sisu_unsigned`` the same without signing;
+    * ``sisu_wlid``: ``WLID1.0 t=<token>``, an MSA token of the Xbox Family
+      Settings client for ``msa_scope``, signed.
+
     ``contract``: an ``x-xbl-contract-version`` header, or none.
     """
 
@@ -407,9 +414,17 @@ def _contracts(name: str, **kwargs: Any) -> list[AuthMethod]:
     ]
 
 
-#: Every way probe_xapprove tries, in order. None needs a device or title
-#: token, SISU, or the Xbox app's client id.
+#: The ways that need the Xbox Family Settings sign-in (SISU).
+SISU_SCHEMES = frozenset({"sisu", "sisu_unsigned", "sisu_wlid"})
+
+#: Every way probe_xapprove tries, in order: the Xbox Family Settings sign-in
+#: first (live 2026-11-08, every other way got 401 token_required), then the
+#: ways from the Family Safety sign-in, kept as diagnostics.
 PROBE_METHODS: list[AuthMethod] = [
+    AuthMethod("sisu", scheme="sisu"),
+    AuthMethod("sisu_unsigned", scheme="sisu_unsigned"),
+    AuthMethod("sisu_contract_1", scheme="sisu", contract="1"),
+    AuthMethod("sisu_xapprove_scope_wlid", scheme="sisu_wlid", msa_scope=XAPPROVE_SCOPE),
     # a. The XSTS for http://xboxlive.com, with and without a contract version.
     *_contracts("xbl3"),
     # b. An XSTS for xapprove's own relying party.
@@ -434,7 +449,10 @@ PROBE_METHODS: list[AuthMethod] = [
     AuthMethod("xbl3_family_token_ticket", msa_scope=FAMILY_TOKEN),
 ]
 METHODS_BY_NAME: dict[str, AuthMethod] = {m.name: m for m in PROBE_METHODS}
-DEFAULT_METHOD = PROBE_METHODS[0]
+#: Without the Xbox Family Settings sign-in.
+DEFAULT_METHOD = METHODS_BY_NAME["xbl3"]
+#: With it.
+SISU_METHOD = METHODS_BY_NAME["sisu"]
 
 
 def _record(steps: dict | None, name: str, value: Any) -> None:
@@ -584,8 +602,10 @@ class XapproveClient:
     stored mobile refresh token while the integration's own token refresh is
     held off (the authenticator's login lock). ``family_token_getter`` gives
     the integration's current Family access token (for the methods that use
-    it). ``method`` says how xapprove's Authorization header is made; the
-    Xbox family read always uses the XSTS for http://xboxlive.com.
+    it). ``sisu`` is the Xbox Family Settings sign-in (xbox_sisu.XboxSisuAuth)
+    when there is one: its XSTS then also serves the Xbox family read, and its
+    ProofKey signs the requests. ``method`` says how xapprove's Authorization
+    header is made.
 
     Tokens are cached in memory per MSA scope (access token, Xbox user token)
     and per scope and relying party (XSTS) until shortly before they expire.
@@ -599,7 +619,9 @@ class XapproveClient:
         *,
         method: AuthMethod = DEFAULT_METHOD,
         family_token_getter: Callable[[], str | None] | None = None,
+        sisu: Any = None,
     ) -> None:
+        self.sisu = sisu
         self._session_getter = session_getter
         self._refresh_token_source = refresh_token_source
         self._family_token_getter = family_token_getter
@@ -621,6 +643,8 @@ class XapproveClient:
         self._user.clear()
         self._xsts.clear()
         self._failed.clear()
+        if self.sisu is not None:
+            self.sisu.forget_tokens()
 
     def seed(self, tokens: XboxTokens) -> None:
         """Start from a base chain already run (scope MBI_SSL, http://xboxlive.com)."""
@@ -629,7 +653,10 @@ class XapproveClient:
 
     @property
     def parent_xuid(self) -> str | None:
-        tokens = self._xsts.get((XBOX_SCOPE, XBOXLIVE_RP))
+        tokens = (
+            getattr(self.sisu, "_tokens", None) if self.sisu is not None
+            else self._xsts.get((XBOX_SCOPE, XBOXLIVE_RP))
+        )
         return tokens.parent_xuid if tokens else None
 
     # Token steps (callers hold _token_lock) -----------------------------------
@@ -703,14 +730,40 @@ class XapproveClient:
     # Public token entry points ------------------------------------------------
 
     async def async_tokens(self, *, force: bool = False) -> XboxTokens:
-        """The base XSTS (MBI_SSL, http://xboxlive.com): family read, parent xuid."""
+        """The XSTS for http://xboxlive.com used for the family read and the
+        parent's xuid: the Xbox Family Settings sign-in's when there is one,
+        else the one from the Family Safety sign-in."""
+        if self.sisu is not None:
+            return await self.sisu.async_xsts(force=force)
         async with self._token_lock:
             return await self._xsts_tokens(XBOX_SCOPE, XBOXLIVE_RP, force)
 
     async def async_auth_headers(
-        self, method: AuthMethod | None = None, *, force: bool = False
+        self,
+        method: AuthMethod | None = None,
+        *,
+        force: bool = False,
+        http_method: str = "GET",
+        url: str = "",
+        body: bytes = b"",
     ) -> dict[str, str]:
+        """The Authorization header (and Signature, for a signed way) of one request."""
         method = method or self.method
+        if method.scheme in SISU_SCHEMES:
+            if self.sisu is None:
+                raise XapproveUnavailable("No Xbox Family Settings sign-in.")
+            if method.scheme == "sisu_wlid":
+                if force:
+                    self.sisu.forget_tokens()
+                value = f"WLID1.0 t={await self.sisu.async_access_token(method.msa_scope)}"
+            else:
+                value = (await self.sisu.async_xsts(force=force)).header()
+            headers = {"Authorization": value}
+            if method.scheme != "sisu_unsigned":
+                headers["Signature"] = self.sisu.sign(http_method, url, value, body)
+            if method.contract:
+                headers["x-xbl-contract-version"] = method.contract
+            return headers
         async with self._token_lock:
             if method.scheme == "xbl3":
                 tokens = await self._xsts_tokens(method.msa_scope, method.relying_party, force)
@@ -738,17 +791,24 @@ class XapproveClient:
 
         xapprove uses ``self.method``; the family read the base XSTS.
         """
+        body = jsonlib.dumps(json, separators=(",", ":")).encode() if json is not None else b""
         for attempt in (0, 1):
             if step == "family":
                 tokens = await self.async_tokens(force=attempt == 1)
                 headers = {"Authorization": tokens.header()}
+                if self.sisu is not None:
+                    headers["Signature"] = self.sisu.sign(method, url, headers["Authorization"], body)
             else:
-                headers = await self.async_auth_headers(force=attempt == 1)
+                headers = await self.async_auth_headers(
+                    force=attempt == 1, http_method=method, url=url, body=body
+                )
             headers["Accept"] = "application/json"
             headers.update(extra_headers or {})
             kwargs: dict[str, Any] = {"headers": headers}
             if json is not None:
-                kwargs["json"] = json
+                # The exact bytes that were signed.
+                headers["Content-Type"] = "application/json"
+                kwargs["data"] = body
             status, payload, resp_headers = await _call(self._session_getter(), method, url, **kwargs)
             if status in (401, 403):
                 if attempt == 0:
@@ -766,7 +826,7 @@ class XapproveClient:
         """
         facts: dict[str, Any] = {"name": method.name}
         try:
-            headers = await self.async_auth_headers(method)
+            headers = await self.async_auth_headers(method, http_method="GET", url=url)
         except XapproveRefused as err:
             facts.update({"stage": "token", **err.facts()})
             return facts

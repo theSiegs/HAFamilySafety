@@ -58,6 +58,8 @@ from .const import (
     DOMAIN,
     LOCK_PATH_XAPPROVE,
     XAPPROVE_REFUSED_ISSUE,
+    XBOX_SIGNIN_EXPIRED_ISSUE,
+    XBOX_SIGNIN_STORAGE_KEY,
 )
 from .screen_time import (
     ALLOW_UNTIL,
@@ -75,6 +77,8 @@ from .xapprove import (
     OVERRIDE_ALLOW,
     OVERRIDE_BLOCK,
     PROBE_METHODS,
+    SISU_METHOD,
+    SISU_SCHEMES,
     AuthMethod,
     XapproveClient,
     XapproveError,
@@ -86,6 +90,7 @@ from .xapprove import (
     member_xuid,
     overrides_url,
 )
+from .xbox_sisu import XboxSignInExpired, XboxSisuAuth
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -138,6 +143,11 @@ class XboxXapproveMixin:
         )
         self._xapprove_method: AuthMethod = DEFAULT_METHOD
         self._xapprove_method_loaded = False
+        #: The Xbox Family Settings sign-in (options flow), if there is one.
+        self._xbox_signin_store: Store = Store(
+            self.hass, 1, f"{XBOX_SIGNIN_STORAGE_KEY}.{entry.entry_id}"
+        )
+        self._sisu: XboxSisuAuth | None = None
 
     # ------------------------------------------------------------------
     # Client, token source, refusal
@@ -167,19 +177,42 @@ class XboxXapproveMixin:
                 self._xapprove_refresh_token,
                 method=self._xapprove_method,
                 family_token_getter=self._family_access_token,
+                sisu=self._sisu,
             )
         return self._xapprove
 
+    @property
+    def xbox_signed_in(self) -> bool:
+        return self._sisu is not None
+
+    async def _async_save_xbox_signin(self, credential: dict[str, Any]) -> None:
+        """Microsoft rotated the Xbox sign-in's refresh token: keep the new one."""
+        await self._xbox_signin_store.async_save(credential)
+
     async def _async_load_xapprove_method(self) -> None:
+        """Before the first xapprove call: the Xbox sign-in and the saved way."""
         if self._xapprove_method_loaded:
             return
         self._xapprove_method_loaded = True
+        credential = await self._xbox_signin_store.async_load()
+        if isinstance(credential, dict) and credential.get("refresh_token") and credential.get("proof_key"):
+            try:
+                self._sisu = XboxSisuAuth(
+                    lambda: async_get_clientsession(self.hass),
+                    credential,
+                    self._async_save_xbox_signin,
+                )
+            except ValueError as err:
+                _LOGGER.warning("The stored Xbox Family Settings sign-in is unreadable (%s)", type(err).__name__)
         data = await self._xapprove_method_store.async_load()
         name = data.get("method") if isinstance(data, dict) else None
-        if name in METHODS_BY_NAME:
-            self._xapprove_method = METHODS_BY_NAME[name]
-            if self._xapprove is not None:
-                self._xapprove.method = self._xapprove_method
+        method = METHODS_BY_NAME.get(name) if name else None
+        if method is not None and method.scheme in SISU_SCHEMES and self._sisu is None:
+            method = None  # signed out since
+        self._xapprove_method = method or (SISU_METHOD if self._sisu is not None else DEFAULT_METHOD)
+        if self._xapprove is not None:
+            self._xapprove.method = self._xapprove_method
+            self._xapprove.sisu = self._sisu
 
     async def _async_save_xapprove_method(self, method: AuthMethod) -> None:
         self._xapprove_method = method
@@ -209,6 +242,16 @@ class XboxXapproveMixin:
             )
         self._xapprove_refusal = err.facts()
         self._xapprove_refused_until = time.monotonic() + _REFUSED_BACKOFF
+        if isinstance(err, XboxSignInExpired):
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                f"{XBOX_SIGNIN_EXPIRED_ISSUE}_{self.entry.entry_id}",
+                is_fixable=False,
+                severity=ir.IssueSeverity.WARNING,
+                translation_key=XBOX_SIGNIN_EXPIRED_ISSUE,
+                translation_placeholders={"title": self.entry.title or DOMAIN},
+            )
         if self._xapprove is not None:
             self._xapprove.forget_tokens()
         ir.async_create_issue(
@@ -229,6 +272,9 @@ class XboxXapproveMixin:
             _LOGGER.info("The Xbox Family Settings API (xapprove) accepts the Xbox token again")
             self._xapprove_refusal = None
         ir.async_delete_issue(self.hass, DOMAIN, self._xapprove_issue_id())
+        ir.async_delete_issue(
+            self.hass, DOMAIN, f"{XBOX_SIGNIN_EXPIRED_ISSUE}_{self.entry.entry_id}"
+        )
 
     # ------------------------------------------------------------------
     # The child's Xbox user id
@@ -783,17 +829,41 @@ class XboxXapproveMixin:
                 yield stored
 
             client = XapproveClient(
-                lambda: session, _stored, family_token_getter=self._family_access_token
+                lambda: session, _stored, family_token_getter=self._family_access_token,
+                sisu=self._sisu,
             )
             client.token_facts = steps
+            if self._sisu is not None:
+                self._sisu.token_facts = steps
+            result["xbox_signed_in"] = self._sisu is not None
+            result["identity"] = (
+                "xbox_family_settings" if self._sisu is not None else "family_safety_signin"
+            )
             tokens = None
             try:
                 tokens = await client.async_tokens()
             except XapproveError as err:
-                result["token_error"] = str(err)
+                if self._sisu is None:
+                    result["token_error"] = str(err)
+                else:
+                    # The Xbox sign-in failed: say how, and look the family up
+                    # with the Family Safety sign-in instead.
+                    result["xbox_signin_error"] = (
+                        err.facts() if isinstance(err, XapproveRefused) else {"error": str(err)}
+                    )
+                    if isinstance(err, XapproveRefused):
+                        self._xapprove_mark_refused(err)
+                    client.sisu = None
+                    result["identity"] = "family_safety_signin"
+                    try:
+                        tokens = await client.async_tokens()
+                    except XapproveError as err2:
+                        result["token_error"] = str(err2)
             if tokens is not None:
                 await self._async_probe_family_and_read(client, tokens, result)
             client.forget_tokens()
+            if self._sisu is not None:
+                self._sisu.token_facts = {}
             result["stored_refresh_token_unchanged"] = authenticator.refresh_token == stored
             stored = None
         try:
@@ -857,10 +927,15 @@ class XboxXapproveMixin:
         if first is None:
             return
         url = overrides_url(first[1])
+        # The family was read with the Family Safety sign-in if the Xbox one
+        # failed; the xapprove attempts still try the Xbox one first.
+        client.sisu = self._sisu
         attempts: list[dict[str, Any]] = []
         working: AuthMethod | None = None
         state: dict[str, Any] | None = None
         for method in PROBE_METHODS:
+            if method.scheme in SISU_SCHEMES and self._sisu is None:
+                continue  # no Xbox Family Settings sign-in: nothing to try
             facts = await client.async_try(method, url)
             state = facts.pop("state", None)
             attempts.append(facts)

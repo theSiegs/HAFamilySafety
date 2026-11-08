@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import secrets
 from ipaddress import ip_address
 from typing import Any
 from urllib.parse import unquote
@@ -15,7 +16,10 @@ import homeassistant.helpers.config_validation as cv
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.network import NoURLAvailableError, get_url
+from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
 from homeassistant.helpers.selector import (
     SelectOptionDict,
     SelectSelector,
@@ -23,7 +27,9 @@ from homeassistant.helpers.selector import (
     SelectSelectorMode,
 )
 
+from . import xbox_sisu
 from ._httpx_web_adapter import apply_httpx_web_transport_patch
+from .xapprove import XapproveError
 from ._httpx_web_tuning import apply_httpx_web_tuning_patch
 from .const import (
     CONF_ALLOWED_USERS,
@@ -34,6 +40,10 @@ from .const import (
     CONF_XBOX_XAPPROVE,
     DEFAULT_XBOX_XAPPROVE,
     CONF_XBOX_XUIDS,
+    CONF_XBOX_SIGN_IN,
+    CONF_XBOX_SIGN_OUT,
+    CONF_XBOX_SIGNED_IN_AT,
+    XBOX_SIGNIN_STORAGE_KEY,
     CONF_APP_USAGE_SENSORS,
     DEFAULT_APP_USAGE_SENSORS,
     CONF_XBOX_FEATURES,
@@ -1463,18 +1473,35 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
         """Initialize options flow."""
         self._config_entry = config_entry
+        self._pending_data: dict[str, Any] = {}
+        #: (code_verifier, state, authorize URL) of the Xbox sign-in in progress.
+        self._xbox_pkce: tuple[str, str, str] | None = None
+
+    def _xbox_signin_store(self) -> Store:
+        return Store(self.hass, 1, f"{XBOX_SIGNIN_STORAGE_KEY}.{self._config_entry.entry_id}")
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         if user_input is not None:
             data = dict(user_input)
+            sign_in = bool(data.pop(CONF_XBOX_SIGN_IN, False))
+            sign_out = bool(data.pop(CONF_XBOX_SIGN_OUT, False))
             data[CONF_XBOX_FEATURES] = _wants_xbox(data.get(CONF_PLATFORMS))
             # The add-on fields are gone from the form; keep a legacy entry's
             # values so saving the options does not cut it off its add-on.
             for key in (CONF_AUTH_URL, CONF_API_KEY):
                 if self._config_entry.options.get(key):
                     data[key] = self._config_entry.options[key]
+            if self._config_entry.options.get(CONF_XBOX_SIGNED_IN_AT):
+                data[CONF_XBOX_SIGNED_IN_AT] = self._config_entry.options[CONF_XBOX_SIGNED_IN_AT]
+            if sign_out:
+                # Forget the Xbox Family Settings sign-in (the option change reloads).
+                await self._xbox_signin_store().async_remove()
+                data.pop(CONF_XBOX_SIGNED_IN_AT, None)
+            elif sign_in:
+                self._pending_data = data
+                return await self.async_step_xbox_signin()
             return self.async_create_entry(title="", data=data)
         current_interval = self._config_entry.options.get(
             CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL
@@ -1543,12 +1570,55 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
                             "suggested_value": self._config_entry.options.get(CONF_XBOX_XUIDS, "")
                         },
                     ): cv.string,
+                    vol.Optional(CONF_XBOX_SIGN_IN, default=False): cv.boolean,
+                    vol.Optional(CONF_XBOX_SIGN_OUT, default=False): cv.boolean,
                     vol.Optional(
                         CONF_ALLOW_INSECURE_HTTP_AUTH,
                         default=current_allow_insecure_http_auth,
                     ): cv.boolean,
                 }
             ),
+        )
+
+
+    async def async_step_xbox_signin(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Sign in to Xbox Family Settings: open the link, paste the address back."""
+        if self._xbox_pkce is None:
+            verifier, challenge = xbox_sisu.new_pkce()
+            state = secrets.token_urlsafe(16)
+            self._xbox_pkce = (verifier, state, xbox_sisu.authorize_url(challenge, state))
+        verifier, state, url = self._xbox_pkce
+        errors: dict[str, str] = {}
+        detail = ""
+        if user_input is not None:
+            try:
+                credential = await xbox_sisu.async_complete_sign_in(
+                    async_get_clientsession(self.hass),
+                    user_input.get("redirect_url", ""),
+                    state,
+                    verifier,
+                )
+            except ValueError as err:
+                code, _, detail = str(err).partition(":")
+                errors["base"] = (
+                    code if code in ("invalid_redirect", "state_mismatch", "signin_error")
+                    else "invalid_redirect"
+                )
+            except XapproveError as err:
+                errors["base"] = "xbox_signin_failed"
+                detail = str(err)[:200]
+            else:
+                await self._xbox_signin_store().async_save(credential)
+                data = dict(self._pending_data)
+                data[CONF_XBOX_SIGNED_IN_AT] = dt_util.utcnow().isoformat()
+                return self.async_create_entry(title="", data=data)
+        return self.async_show_form(
+            step_id="xbox_signin",
+            data_schema=vol.Schema({vol.Required("redirect_url"): cv.string}),
+            errors=errors,
+            description_placeholders={"url": url, "detail": detail},
         )
 
 

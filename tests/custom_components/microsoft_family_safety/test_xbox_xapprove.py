@@ -96,6 +96,8 @@ class XboxServer:
         #: XSTS relying party -> status, for the ones other than http://xboxlive.com.
         self.rp_status: dict[str, int] = {}
         self.scopes: list[str] = []
+        #: Authorization values the Xbox family read accepts.
+        self.family_auth = {BASE_AUTH}
 
     def state(self) -> dict:
         overrides = []
@@ -155,7 +157,7 @@ class XboxServer:
                 "DisplayClaims": {"xui": [{"uhs": "4242", "xid": PARENT_XUID, "gtg": "SamParent"}]},
             })
         if url.startswith("https://accounts.xboxlive.com/family/"):
-            assert kwargs["headers"]["Authorization"] == f"XBL3.0 x=4242;{XSTS_TOKEN}"
+            assert kwargs["headers"]["Authorization"] in self.family_auth
             if self.family_status != 200:
                 return FakeResponse(self.family_status, None)
             # As seen live: no isAdult, a role per member.
@@ -175,7 +177,7 @@ class XboxServer:
                 )
             if url.endswith("/settings/screentime/overrides/create"):
                 assert method == "POST"
-                body = kwargs["json"]
+                body = kwargs["json"] if "json" in kwargs else json.loads(kwargs["data"])
                 assert body["target"] == 1
                 self.creates.append(dict(body))
                 if not self.create_ignored:
@@ -629,8 +631,9 @@ async def test_probe_tries_everything_when_nothing_works(rig, server, caplog):
     result = await rig.async_probe_xapprove(True)
 
     assert [a["name"] for a in result["overrides_attempts"]] == [
-        m.name for m in xapprove.PROBE_METHODS
+        m.name for m in xapprove.PROBE_METHODS if m.scheme not in xapprove.SISU_SCHEMES
     ]
+    assert result["identity"] == "family_safety_signin" and result["xbox_signed_in"] is False
     tried = {a["name"]: a for a in result["overrides_attempts"]}
     assert tried["wlid_t_xapprove_scope"] == {
         "name": "wlid_t_xapprove_scope", "stage": "token", "step": "msa_refresh",

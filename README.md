@@ -179,6 +179,7 @@ Legacy and native mode are mutually exclusive per config entry; there is no auto
 | Xbox lock without the web session | on / off | off | Locks the Xbox through today's Xbox schedule while the web session is down; see [below](#xbox-lock-without-the-web-session) |
 | Xbox lock and extra time through the Xbox Family Settings API (xapprove) | on / off | off | Locks, unlocks and gives Xbox extra time without the web session; see [below](#xbox-through-the-xbox-family-settings-api-xapprove) |
 | Xbox user ids | `child=xuid, ...` | *(empty: looked up)* | Only if the automatic lookup fails; see [below](#xbox-through-the-xbox-family-settings-api-xapprove) |
+| Sign in to Xbox Family Settings / Sign out | tick and submit | off | Opens the Xbox sign-in page; see [below](#sign-in-to-xbox-family-settings) |
 | Allow insecure local HTTP authentication (testing only) | on / off | off | See below |
 
 #### Strict mode
@@ -222,7 +223,9 @@ While such a lock holds, the switch reads locked, `hold` is `ours` with `overrid
 
 #### Xbox through the Xbox Family Settings API (xapprove)
 
-The Xbox Family Settings app pauses a child's Xbox and gives extra time through its own API, `https://xapprove.xboxlive.com`, signed with an Xbox Live token instead of the Family web session. With **Xbox lock and extra time through the Xbox Family Settings API (xapprove)** on (off by default), the integration does the same, with an Xbox Live token it gets from **its own stored Microsoft sign-in** (the steps of [`probe_xbox_token`](#xbox-token-probe-diagnostic): the `MBI_SSL` Xbox scope, Xbox user authentication, XSTS for `http://xboxlive.com`). It does not use the Xbox app's own identity. The tokens are kept in memory only, the Xbox user token for about two weeks and the XSTS token for about 16 hours, so the stored sign-in is used for the Xbox scope again only when the Xbox user token runs out, or after a restart.
+The Xbox Family Settings app pauses a child's Xbox and gives extra time through its own API, `https://xapprove.xboxlive.com`, signed with an Xbox Live token instead of the Family web session. With **Xbox lock and extra time through the Xbox Family Settings API (xapprove)** on (off by default), the integration does the same.
+
+xapprove only takes the token the Xbox Family Settings app itself gets: tried live, it answered `401 token_required` to every token the Family Safety sign-in can produce. So it needs the separate [Xbox Family Settings sign-in](#sign-in-to-xbox-family-settings) below. Without that sign-in, the integration still tries the Family Safety sign-in's token (the steps of [`probe_xbox_token`](#xbox-token-probe-diagnostic)), which is refused, so the Xbox lock falls back as described under **Fallback**.
 
 What it does, for the Xbox only (Windows is unchanged):
 
@@ -246,7 +249,25 @@ Each write goes to `target` 1 (screen time on all of the child's Xbox consoles),
 
 **Fallback.** When xapprove cannot be used for a call (no Xbox user id for the child, a network error, a reply that does not show the write) the call goes on through the web route and, if turned on, today's Xbox schedule, exactly as before. When Microsoft **refuses the token** (401 or 403 from a token step or from xapprove, after one retry with fresh tokens), xapprove is left alone for 6 hours, a warning is logged once and a Repairs issue "The Xbox Family Settings API refused the Xbox token" says so; it goes away at the first call that works again.
 
-**The risk.** The same as for `probe_xbox_token`: Microsoft does not document whether using the stored refresh token on the older `login.live.com` endpoint for another scope can revoke it. If it did, the integration would ask for a new sign-in. The Xbox-scope refresh token Microsoft sends back is thrown away; the integration keeps its own. Run [`probe_xapprove`](#xbox-family-settings-api-probe-diagnostic) first and turn the option on when it reads the overrides and `family_refresh_after` is `ok`.
+**The risk.** See the sign-in below. Run [`probe_xapprove`](#xbox-family-settings-api-probe-diagnostic) after signing in and turn the option on when it reads the overrides (`working_method: sisu`).
+
+#### Sign in to Xbox Family Settings
+
+This is a second Microsoft sign-in, separate from the Family Safety one, made **as the Xbox Family Settings app**: the integration uses that app's public client id (`00000000482C8F49`) and the Xbox Authentication Library's "SISU" flow, the way the open-source XAL implementations do.
+
+1. **Settings > Devices & services > Microsoft Family Safety > Configure**, tick **Sign in to Xbox Family Settings (next page)** and submit.
+2. The next page shows a link, **Sign in to Xbox Family Settings**. Open it, ideally in a private browser window so you can pick the account.
+3. Sign in with the Microsoft account of a **parent** of your Microsoft family (the one the integration already uses) and accept.
+4. You end on a blank page whose address starts with `https://login.live.com/oauth20_desktop.srf?code=`. Copy that **whole address** from the address bar.
+5. Paste it into the field on the Home Assistant page and submit, within a few minutes (the code expires).
+
+Home Assistant exchanges the code, makes the device key, and checks the whole chain (device token, SISU authorize, XSTS) before it saves anything; an error says which step failed and nothing is stored. The integration reloads, and from then on xapprove is signed with this sign-in (`working_method` `sisu`), and the Xbox family lookup uses it too, so the Family Safety sign-in is no longer used for Xbox Live at all. To remove it, tick **Sign out of Xbox Family Settings** and submit.
+
+**What is stored**, in Home Assistant's storage (`.storage/microsoft_family_safety.xbox_signin.<entry id>`), never in the options, the logs or the diagnostics: the Microsoft **refresh token** of this sign-in (renewed by Microsoft at each use, and the new one saved), an **EC P-256 private key** made for this entry (its public half, the "ProofKey", is registered with Xbox Live; it signs every Xbox request with the `Signature` header), and a random **device id**. Access, device, user, title and XSTS tokens are kept in memory only. The options only get the time of the sign-in. Anyone with that storage file can act as this Xbox sign-in, as with the integration's other stored sign-in.
+
+**How it keeps working.** The XSTS token lasts about 16 hours; then the refresh token gets a new access token and SISU authorize runs again (the device token, about two weeks, is renewed when it runs out). If Microsoft refuses the refresh token (a password change, a revoked consent, a long pause), a Repairs issue **Sign in to Xbox Family Settings again** appears and the Xbox lock falls back; sign in again as above.
+
+**The risk.** This is **unofficial use of a Microsoft first-party client id**. Microsoft does not offer it to third parties, can change the flow or block it at any time, and could object to its use. Nothing breaks when it stops working: the Xbox lock and extra time fall back to the Microsoft web session and, if turned on, today's Xbox schedule, a Repairs issue says so, and you can sign out of Xbox Family Settings in the options.
 
 #### Insecure local HTTP authentication
 
@@ -610,14 +631,15 @@ response_variable: probe
 
 `probe_xapprove` checks, inside Home Assistant and without writing anything, whether the Xbox through xapprove can work: it runs the token steps from the stored sign-in, looks up the children's Xbox user ids, and reads the first resolved child's override (`GET /api/v1/user/{xuid}/settings/screentime/overrides`), trying each way of signing that read in turn until one answers 200:
 
+0. with the [Xbox Family Settings sign-in](#sign-in-to-xbox-family-settings): its XSTS, signed with the device key (`sisu`), unsigned (`sisu_unsigned`), with contract version 1 (`sisu_contract_1`), and an MSA token of that client for the xapprove scope as `WLID1.0 t=` (`sisu_xapprove_scope_wlid`); skipped without that sign-in;
 1. the XSTS for `http://xboxlive.com` (`XBL3.0 x=<uhs>;<token>`), without and with `x-xbl-contract-version` 1, 2 and 3 (`xbl3`, `xbl3_contract_1` ...);
 2. an XSTS for the relying parties `http://xapprove.xboxlive.com` and `https://xapprove.xboxlive.com/`, each without and with a contract version (`xbl3_rp_http_xapprove...`, `xbl3_rp_https_xapprove...`);
 3. an MSA token for scope `service::xapprove.xboxlive.com::MBI_SSL` from the stored sign-in (its refresh token thrown away as always): sent directly as `WLID1.0 t=`, `WLID1.0 d=`, `Bearer` and `MSAuth1.0` (`wlid_t_xapprove_scope` ...), then as the ticket for Xbox user authentication and XSTS (`xbl3_xapprove_scope_ticket`, `..._rp_http_xapprove`);
 4. the relying party `rp://xapprove.xboxlive.com/`, the Xbox user-auth MSA token sent directly, and the integration's own Family token (the one the Family Safety mobile API takes, so no extra use of the sign-in) as `MSAuth1.0`, as `WLID1.0 t=` and as the user-authentication ticket.
 
-None of them needs a device or title token, SISU, or the Xbox app's client id. A token step that fails is not asked again for the next way that needs it. The first way that answers 200 is **saved and used by the integration from then on**, also after a restart (`working_method`, `method_saved`); until one has, the integration uses the first.
+Ways 1 to 4 use the Family Safety sign-in only (no device or title token, no SISU). A token step that fails is not asked again for the next way that needs it. The first way that answers 200 is **saved and used by the integration from then on**, also after a restart (`working_method`, `method_saved`); until one has, the integration uses the first.
 
-It answers with non-secret facts only: `steps` (per token step, the HTTP status, XErr and granted scope; steps for another scope or relying party carry it in brackets), whether the XSTS token carries the parent's id (`parent_xuid_claim_present`), the family lookup (`members`, `members_with_xuid`, `adults`, `signed_in_parent_listed`, the distinct `roles` and the member field **names**), per child `resolved` and `via` (`option`, `family_id`, `family_name`, `elimination`), `overrides_attempts` (per way tried: `name`, `stage` `token` or `xapprove`, `status`, `xerr`, `step`/`error` for a token failure, and `www_authenticate` `{name, value}` when xapprove sends that header), `working_method`, and `overrides_read` (`ok`, `method`, `override_active`, `type`, `raw_type`, `valid_until`, `actions`; or `status`/`xerr` of the first way when none worked). Like `probe_xbox_token` it needs `confirm_risk: true`, is for administrators, throws away the refresh token Microsoft returns, and ends with one normal refresh reported as `family_refresh_after`. No token, gamertag or Xbox user id is returned or logged.
+It answers with non-secret facts only: `identity` (`xbox_family_settings` when the Xbox sign-in was used, else `family_safety_signin`), `xbox_signed_in`, `xbox_signin_error` (the failing step, status and XErr when the Xbox sign-in itself failed; the family is then looked up with the Family Safety sign-in), `steps` (per token step, including `sisu_msa_refresh`, `device_authenticate` and `sisu_authorize` for the Xbox sign-in, the HTTP status, XErr and granted scope; steps for another scope or relying party carry it in brackets), whether the XSTS token carries the parent's id (`parent_xuid_claim_present`), the family lookup (`members`, `members_with_xuid`, `adults`, `signed_in_parent_listed`, the distinct `roles` and the member field **names**), per child `resolved` and `via` (`option`, `family_id`, `family_name`, `elimination`), `overrides_attempts` (per way tried: `name`, `stage` `token` or `xapprove`, `status`, `xerr`, `step`/`error` for a token failure, and `www_authenticate` `{name, value}` when xapprove sends that header), `working_method`, and `overrides_read` (`ok`, `method`, `override_active`, `type`, `raw_type`, `valid_until`, `actions`; or `status`/`xerr` of the first way when none worked). Like `probe_xbox_token` it needs `confirm_risk: true`, is for administrators, throws away the refresh token Microsoft returns, and ends with one normal refresh reported as `family_refresh_after`. No token, gamertag or Xbox user id is returned or logged.
 
 ```yaml
 service: microsoft_family_safety.probe_xapprove
