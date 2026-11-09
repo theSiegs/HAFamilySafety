@@ -116,7 +116,14 @@
       },
       "xbox_signin_app": {
         "title": "Sign in to Xbox Family Settings (app-style)",
-        "description": "This sign-in goes the way the Xbox Family Settings app does it, which may be what Xbox needs before it lets Home Assistant pause the Xbox. It keeps this entry's device key. Use the **parent** Microsoft account. Like the pasted-address sign-in, it needs a **computer** with Chrome, Edge or Firefox: the page you end on erases its own address, so the address is copied from the browser's network log.\n\n1. Open a new private or incognito window and press **F12**. Go to the **Network** tab and tick **Preserve log**.\n2. In that window, open [this sign-in link]({url}) (right-click it, Copy link address, paste it into the window).\n3. Sign in with the parent account and accept if Microsoft asks. You end on a blank page.\n4. In the Network tab, type **oauth20_desktop.srf** in the filter box, right-click the request and choose **Copy > Copy URL**. It starts with https://login.live.com/oauth20_desktop.srf?code= .\n5. Paste it below and submit right away: the code and this sign-in expire within minutes.\n\nHome Assistant then finishes the Xbox sign-in, reads your Xbox account the way the app's setup page does (it never creates or changes anything), and checks a child's Xbox settings. If you close this page, start again from Configure: the link is only good for this page.",
+        "description": "This signs in the way the Xbox Family Settings app does, which may be what Xbox needs before it lets Home Assistant pause the Xbox. Use the **parent** Microsoft account. Home Assistant opens the Microsoft sign-in in your browser and reads the result itself, so you do not need any developer tools. It keeps this entry's device key and replaces its refresh token.\n\nSubmit to open the sign-in. If your Home Assistant has no HTTPS address a browser can reach, tick **Paste the address myself instead** to use the manual way (a computer's browser tools).",
+        "data": {
+          "paste_instead": "Paste the address myself instead (no browser sign-in)"
+        }
+      },
+      "xbox_signin_app_paste": {
+        "title": "Sign in to Xbox Family Settings (app-style, paste)",
+        "description": "{why}This sign-in goes the way the Xbox Family Settings app does it, which may be what Xbox needs before it lets Home Assistant pause the Xbox. It keeps this entry's device key. Use the **parent** Microsoft account. Like the pasted-address sign-in, it needs a **computer** with Chrome, Edge or Firefox: the page you end on erases its own address, so the address is copied from the browser's network log.\n\n1. Open a new private or incognito window and press **F12**. Go to the **Network** tab and tick **Preserve log**.\n2. In that window, open [this sign-in link]({url}) (right-click it, Copy link address, paste it into the window).\n3. Sign in with the parent account and accept if Microsoft asks. You end on a blank page.\n4. In the Network tab, type **oauth20_desktop.srf** in the filter box, right-click the request and choose **Copy > Copy URL**. It starts with https://login.live.com/oauth20_desktop.srf?code= .\n5. Paste it below and submit right away: the code and this sign-in expire within minutes.\n\nHome Assistant then finishes the Xbox sign-in, reads your Xbox account the way the app's setup page does (it never creates or changes anything), and checks a child's Xbox settings. If you close this page, start again from Configure: the link is only good for this page.",
         "data": {
           "redirect_url": "The oauth20_desktop.srf address"
         },
@@ -173,7 +180,8 @@
       "xbox_device_code": "Use the **parent** Microsoft account: the same one you sign in to Family Safety with, not a child's.\n\n1. On any phone or computer, go to **{url}**.\n2. Enter the code **{code}**.\n3. Sign in with the parent account and accept if Microsoft asks for permission.\n\nThis page goes on by itself once you have signed in (the code is valid for about 15 minutes). Keep it open meanwhile."
     },
     "abort": {
-      "xbox_app_signin_unavailable": "Xbox did not start the app-style sign-in ({detail}). Nothing was changed. Try again in a few minutes, or use the other sign-in."
+      "xbox_app_signin_unavailable": "Xbox did not start the app-style sign-in ({detail}). Nothing was changed. Try again in a few minutes, or use the other sign-in.",
+      "xbox_app_signin_failed": "The app-style Xbox sign-in did not finish ({detail}). Nothing was changed. Open Configure and try again."
     }
   },
   "services": {

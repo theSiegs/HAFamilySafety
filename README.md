@@ -273,13 +273,24 @@ If the code expires or the sign-in is declined, a page says so and offers **Get 
 4. In the Network tab, find the request named **oauth20_desktop.srf** (type it in the filter box), right-click it and choose **Copy > Copy URL**. It starts with `https://login.live.com/oauth20_desktop.srf?code=`.
 5. Paste it into the page and submit within a few minutes (the code in it expires soon). Spaces or quotes around it, a missing `https://`, or only the code itself are accepted. Pasting the erased `?removed=true` address is recognised and answered with these steps. Then step 3 above follows.
 
-**The app-style sign-in** (experimental). Tick **Sign in to Xbox Family Settings, app-style (next page)** in Configure when the sign-in above works but Xbox still refuses (`probe_xapprove` answers 401 for every way). It signs in the way the Xbox Family Settings app does: Home Assistant first asks Xbox Live for a sign-in session (`sisu/authenticate`), then you sign in through the link it gives, and Home Assistant authorizes that session (with the consent tokens the app sends), reads your Xbox account the way the app's setup page does (`ReadAccount`, `ReadProfile`; it never creates, reserves, sets or accepts anything) and checks a child's Xbox settings. It keeps the device key and device id of the earlier sign-in and replaces its refresh token. Like the pasted-address sign-in it needs a **computer** with Chrome, Edge or Firefox:
+**The app-style sign-in** (experimental). Tick **Sign in to Xbox Family Settings, app-style (next page)** in Configure when the sign-in above works but Xbox still refuses (`probe_xapprove` answers 401 for every way). It signs in the way the Xbox Family Settings app does: Home Assistant first asks Xbox Live for a sign-in session (`sisu/authenticate`), then you sign in through Microsoft, and Home Assistant authorizes that session (with the consent tokens the app sends), reads your Xbox account the way the app's setup page does (`ReadAccount`, `ReadProfile`; it never creates, reserves, sets or accepts anything) and checks a child's Xbox settings. It keeps the device key and device id of the earlier sign-in and replaces its refresh token.
+
+By default this is **browser-assisted, with no developer tools**: Home Assistant opens the Microsoft sign-in in your browser through its own OAuth proxy (the same one the Family Safety sign-in uses) and reads the result itself.
+
+1. In Configure, tick **Sign in to Xbox Family Settings, app-style (next page)** and submit.
+2. On the confirm page, leave **Paste the address myself instead** unticked and submit. Home Assistant opens the Microsoft sign-in; press **Open website** if your browser asks.
+3. Sign in with the **parent** account and accept if Microsoft asks. Home Assistant captures the result and returns to the dialog by itself.
+4. The same three result pages follow (works / refused / signed in, not checked). When Xbox still refuses and its setup page has a session, the page adds **Finish Xbox setup** with a link to that Xbox page: open it in a browser at once, finish what it asks (Home Assistant never does that itself), then run the app-style sign-in again.
+
+The browser sign-in needs Home Assistant to have an **HTTPS address a browser can reach** (the proxy carries Microsoft credentials). When it has only a local HTTP address, tick the insecure-local-HTTP option in Configure, or use the pasted-address fallback below. If no reachable URL exists, Home Assistant falls back to the fallback automatically and says why.
+
+**Pasted-address fallback.** Tick **Paste the address myself instead** on the confirm page (or Home Assistant sends you here when no browser-reachable HTTPS URL exists). This needs a **computer** with Chrome, Edge or Firefox and its developer tools:
 
 1. Open a new private or incognito window, press **F12**, and in the **Network** tab tick **Preserve log**.
 2. In that window, open the page's **sign-in link** (right-click it, copy the link address, paste it into the window).
 3. Sign in with the parent account and accept if Microsoft asks. You end on a blank page.
 4. In the Network tab, filter on **oauth20_desktop.srf**, right-click the request and choose **Copy > Copy URL**.
-5. Paste it into the page and submit right away (the code and the session expire within minutes). The same three result pages follow. When Xbox still refuses and its setup page has a session, the page adds **Finish Xbox setup** with a link to that Xbox page: open it in a browser at once, finish what it asks (Home Assistant never does that itself), then run the app-style sign-in again.
+5. Paste it into the page and submit right away (the code and the session expire within minutes). The same result pages follow.
 
 The integration then reloads, and from then on xapprove is signed with this sign-in (`working_method` `sisu`), and the Xbox family lookup uses it too.
 

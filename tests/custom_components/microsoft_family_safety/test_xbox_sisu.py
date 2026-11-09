@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from homeassistant import data_entry_flow
 from homeassistant.helpers import issue_registry as ir
@@ -593,11 +593,15 @@ async def test_an_expired_code_offers_a_new_one_or_the_address(hass, server, has
 
 
 async def _to_the_app_sign_in(hass, entry):
+    """Through the pasted-address fallback of the app-style sign-in."""
     result = await hass.config_entries.options.async_init(entry.entry_id)
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], {**INIT_FORM, "xbox_sign_in_app": True},
     )
-    return result
+    assert result["step_id"] == "xbox_signin_app"
+    return await hass.config_entries.options.async_configure(
+        result["flow_id"], {"paste_instead": True},
+    )
 
 
 def _app_landed(result, code: str = CODE) -> dict:
@@ -619,7 +623,7 @@ async def test_the_app_style_sign_in_works(hass, server, hass_storage):
     )
     with patch(SETUP, return_value=True):
         result = await _to_the_app_sign_in(hass, entry)
-        assert result["step_id"] == "xbox_signin_app"
+        assert result["step_id"] == "xbox_signin_app_paste"
         assert result["description_placeholders"]["url"].startswith(
             "https://login.live.com/oauth20_authorize.srf?"
         )
@@ -695,3 +699,110 @@ async def test_the_app_style_sign_in_aborts_without_a_link(hass, server, hass_st
         result = await _to_the_app_sign_in(hass, entry)
     assert result["type"] == data_entry_flow.FlowResultType.ABORT
     assert result["reason"] == "xbox_app_signin_unavailable"
+
+
+# The app-style sign-in through the browser OAuth proxy (no DevTools) ---------------
+
+
+class _FakeProxy:
+    """Stands in for MicrosoftFamilyAuthProxy: it captures only the code URL."""
+
+    created: list = []
+
+    def __init__(self, hass, *, callback_url, start_url, completion_mode, **kwargs):
+        self.start_url = start_url
+        self.completion_mode = completion_mode
+        self.complete = True
+        self.reads: list[str] = []
+        self.access_path = "/auth/microsoft_family_safety/proxy/xbox-test"
+        state = parse_qs(urlsplit(start_url).query).get("state", ["s"])[0]
+        self._redirect = f"https://login.live.com/oauth20_desktop.srf?code={CODE}&state={state}"
+        _FakeProxy.created.append(self)
+
+    @property
+    def oauth_redirect_url(self):
+        self.reads.append("oauth_redirect_url")
+        return self._redirect
+
+    def export_cookies(self):  # pragma: no cover - never used on this path
+        self.reads.append("export_cookies")
+        return []
+
+
+def _patch_proxy():
+    import custom_components.microsoft_family_safety.auth.native_proxy as np
+    _FakeProxy.created.clear()
+    return (
+        patch.object(np, "MicrosoftFamilyAuthProxy", _FakeProxy),
+        patch.object(np, "register_native_proxy", lambda hass, proxy: None),
+        patch.object(np, "unregister_native_proxy", AsyncMock()),
+        patch(
+            "custom_components.microsoft_family_safety.config_flow._browser_hass_url",
+            return_value="https://ha.example:8123",
+        ),
+    )
+
+
+async def test_the_app_sign_in_through_the_browser_proxy(hass, server, hass_storage):
+    coord, entry = await make_rig(hass, server, {CONF_XBOX_XAPPROVE: False})
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coord
+    before = await coord._xbox_signin_store.async_load()
+    server.web_page = True
+    server.web_page_needs_session = True
+    server.accepts = lambda h: "~sess" in h.get("Authorization", "") and any(
+        f"~s{n}" in h["Authorization"] for n in server.done_sessions
+    )
+    patches = _patch_proxy()
+    with patch(SETUP, return_value=True), patches[0], patches[1], patches[2], patches[3]:
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {**INIT_FORM, "xbox_sign_in_app": True},
+        )
+        assert result["step_id"] == "xbox_signin_app"
+        # Submit the confirm form: Home Assistant opens the browser proxy.
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {"paste_instead": False},
+        )
+        assert result["type"] == data_entry_flow.FlowResultType.EXTERNAL_STEP
+        assert result["step_id"] == "xbox_app_check_proxy"
+        assert result["url"].endswith("/auth/microsoft_family_safety/proxy/xbox-test")
+        # The proxy has captured the code; advancing runs the check.
+        advanced = await hass.config_entries.options.async_configure(result["flow_id"])
+        assert advanced["type"] == data_entry_flow.FlowResultType.EXTERNAL_STEP_DONE
+        checked = await hass.config_entries.options.async_configure(result["flow_id"])
+        assert checked["step_id"] == "xbox_signin_works", checked
+        done = await hass.config_entries.options.async_configure(
+            result["flow_id"], {CONF_XBOX_XAPPROVE: True},
+        )
+    assert done["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert entry.options[CONF_XBOX_XAPPROVE] is True
+    # Only the code URL was taken from the proxy.
+    assert _FakeProxy.created and set(_FakeProxy.created[0].reads) == {"oauth_redirect_url"}
+    # The SISU session was still bound (SessionId on authorize) and the proxy
+    # start_url was the Microsoft sign-in link.
+    assert server.authorize_bodies[-1]["SessionId"]
+    assert _FakeProxy.created[0].start_url.startswith("https://login.live.com/oauth20_authorize.srf")
+    # A new refresh token; the device key and device id are kept.
+    stored = hass_storage[f"{DOMAIN}.xbox_signin.{entry.entry_id}"]["data"]
+    assert stored["refresh_token"] != before["refresh_token"]
+    assert stored["proof_key"] == before["proof_key"] and stored["device_id"] == before["device_id"]
+    assert "sisu-refresh" not in json.dumps(dict(entry.options))
+
+
+async def test_the_app_sign_in_falls_back_to_paste_without_https(hass, server, hass_storage):
+    coord, entry = await make_rig(hass, server, {CONF_XBOX_XAPPROVE: False})
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coord
+    import custom_components.microsoft_family_safety.config_flow as cf
+    with patch(SETUP, return_value=True), patch.object(
+        cf, "_browser_hass_url", side_effect=cf.NativeAuthHttpsRequired
+    ):
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {**INIT_FORM, "xbox_sign_in_app": True},
+        )
+        # Submit the confirm form with the browser sign-in: no HTTPS -> paste.
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {"paste_instead": False},
+        )
+        assert result["step_id"] == "xbox_signin_app_paste"
+        assert "HTTPS" in result["description_placeholders"]["why"]

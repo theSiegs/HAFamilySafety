@@ -75,6 +75,54 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
+def _is_local_http_url(url: URL) -> bool:
+    """Return True only for HTTP URLs that are clearly local/private."""
+    if url.scheme != "http" or not url.host:
+        return False
+    host = url.host.lower().rstrip(".")
+    if host in {"localhost", "homeassistant", "homeassistant.local"} or host.endswith(".local"):
+        return True
+    try:
+        address = ip_address(host)
+    except ValueError:
+        return False
+    return address.is_private or address.is_loopback or address.is_link_local
+
+
+def _browser_hass_url(hass: HomeAssistant, allow_insecure_http_auth: bool) -> str:
+    """A browser-reachable HA URL for the temporary auth proxy.
+
+    HTTPS is always preferred. Plain HTTP is permitted only when the user
+    explicitly opted in and the URL is clearly local/private. Raises
+    NativeAuthHttpsRequired or NativeAuthLocalHttpRequired otherwise.
+    """
+    candidates: list[str] = []
+    for kwargs in ({"prefer_external": True}, {"allow_external": False}):
+        try:
+            candidate = get_url(hass, **kwargs)
+        except NoURLAvailableError:
+            continue
+        if candidate not in candidates:
+            candidates.append(candidate)
+    for candidate in candidates:
+        if URL(candidate).scheme == "https":
+            return candidate
+    if allow_insecure_http_auth:
+        for candidate in reversed(candidates):
+            url = URL(candidate)
+            if _is_local_http_url(url):
+                _LOGGER.warning(
+                    "Microsoft Family Safety authentication is using an "
+                    "UNENCRYPTED local Home Assistant HTTP proxy at %s. "
+                    "Microsoft credentials and session data are not protected "
+                    "against interception on the local network.",
+                    url.host,
+                )
+                return candidate
+        raise NativeAuthLocalHttpRequired
+    raise NativeAuthHttpsRequired
+
+
 def _build_auth_url() -> str:
     """Build the Microsoft Family Safety mobile OAuth URL."""
     return str(URL(MS_LOGIN_URL).with_query(MS_AUTH_PARAMS))
@@ -223,54 +271,11 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     @staticmethod
     def _is_local_http_url(url: URL) -> bool:
         """Return True only for HTTP URLs that are clearly local/private."""
-        if url.scheme != "http" or not url.host:
-            return False
-        host = url.host.lower().rstrip(".")
-        if host in {"localhost", "homeassistant", "homeassistant.local"} or host.endswith(".local"):
-            return True
-        try:
-            address = ip_address(host)
-        except ValueError:
-            return False
-        return address.is_private or address.is_loopback or address.is_link_local
+        return _is_local_http_url(url)
 
     def _browser_hass_url(self) -> str:
-        """Return a browser-reachable HA URL for the temporary auth proxy.
-
-        HTTPS is always preferred. Plain HTTP is permitted only when the user
-        explicitly opted in and the URL is clearly local/private.
-        """
-        candidates: list[str] = []
-        for kwargs in (
-            {"prefer_external": True},
-            {"allow_external": False},
-        ):
-            try:
-                candidate = get_url(self.hass, **kwargs)
-            except NoURLAvailableError:
-                continue
-            if candidate not in candidates:
-                candidates.append(candidate)
-
-        for candidate in candidates:
-            if URL(candidate).scheme == "https":
-                return candidate
-
-        if self._allow_insecure_http_auth:
-            for candidate in reversed(candidates):
-                url = URL(candidate)
-                if self._is_local_http_url(url):
-                    _LOGGER.warning(
-                        "Microsoft Family Safety authentication is using an "
-                        "UNENCRYPTED local Home Assistant HTTP proxy at %s. "
-                        "Microsoft credentials and session data are not protected "
-                        "against interception on the local network.",
-                        url.host,
-                    )
-                    return candidate
-            raise NativeAuthLocalHttpRequired
-
-        raise NativeAuthHttpsRequired
+        """Return a browser-reachable HA URL for the temporary auth proxy."""
+        return _browser_hass_url(self.hass, self._allow_insecure_http_auth)
 
     async def _detect_legacy_auth(self) -> None:
         """Detect an optional legacy Playwright auth source without blocking setup."""
@@ -1495,6 +1500,14 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
         #: WebPage it ended on (shown when the check did not work).
         self._xbox_app: xbox_sisu.AppSignInStart | None = None
         self._xbox_web_page: str | None = None
+        #: The browser proxy of the app-style sign-in, the HA URL it is on,
+        #: and why the paste fallback is shown instead (or "").
+        self._xbox_app_proxy: Any | None = None
+        self._xbox_app_browser_url: str = ""
+        self._xbox_app_proxy_why: str = ""
+        self._allow_insecure_http_auth = bool(
+            config_entry.options.get(CONF_ALLOW_INSECURE_HTTP_AUTH, False)
+        )
 
     def _xbox_signin_store(self) -> Store:
         return Store(self.hass, 1, f"{XBOX_SIGNIN_STORAGE_KEY}.{self._config_entry.entry_id}")
@@ -1693,10 +1706,142 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
     async def async_step_xbox_signin_app(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """The app-style sign-in: sisu/authenticate gives the link; the user
+        """App-style sign-in, browser-assisted: Home Assistant opens Microsoft
+        in the browser and captures the code through its OAuth proxy (no
+        DevTools). A tick sends the user to the pasted-address fallback."""
+        if user_input is None:
+            return self.async_show_form(
+                step_id="xbox_signin_app",
+                data_schema=vol.Schema(
+                    {vol.Optional("paste_instead", default=False): cv.boolean}
+                ),
+            )
+        if not await self._async_start_xbox_app():
+            return self.async_abort(
+                reason="xbox_app_signin_unavailable",
+                description_placeholders={"detail": self._xbox_app_proxy_why},
+            )
+        if user_input.get("paste_instead"):
+            return await self.async_step_xbox_signin_app_paste()
+        return await self._async_start_xbox_app_proxy()
+
+    async def _async_start_xbox_app(self) -> bool:
+        """Run sisu/authenticate for the sign-in link (once). False on failure
+        (the reason is kept in ``_xbox_app_proxy_why``)."""
+        if self._xbox_app is not None:
+            return True
+        session = async_get_clientsession(self.hass)
+        coordinator = (self.hass.data.get(DOMAIN) or {}).get(self._config_entry.entry_id)
+        sisu = getattr(coordinator, "_sisu", None)
+        try:
+            self._xbox_app = await xbox_sisu.async_start_app_sign_in(
+                session,
+                await self._xbox_signin_store().async_load(),
+                getattr(sisu, "title_id", None),
+            )
+        except XapproveError as err:
+            self._xbox_app_proxy_why = str(err)[:200]
+            return False
+        return True
+
+    async def _async_start_xbox_app_proxy(self) -> FlowResult:
+        """Start the OAuth proxy on the sign-in link, or fall back to paste."""
+        try:
+            self._xbox_app_browser_url = _browser_hass_url(
+                self.hass, self._allow_insecure_http_auth
+            )
+        except NativeAuthHttpsRequired:
+            self._xbox_app_proxy_why = "no_https"
+            return await self.async_step_xbox_signin_app_paste()
+        except NativeAuthLocalHttpRequired:
+            self._xbox_app_proxy_why = "local_http"
+            return await self.async_step_xbox_signin_app_paste()
+        try:
+            from .auth.native_proxy import (
+                AUTH_CALLBACK_PATH,
+                MicrosoftFamilyAuthProxy,
+                register_native_proxy,
+            )
+        except Exception as err:  # noqa: BLE001 - the paste step still works
+            _LOGGER.debug("Native auth proxy could not be loaded for Xbox: %s", err)
+            self._xbox_app_proxy_why = "unavailable"
+            return await self.async_step_xbox_signin_app_paste()
+        hass_url = URL(self._xbox_app_browser_url)
+        callback_url = str(
+            hass_url.with_path(AUTH_CALLBACK_PATH).with_query({"flow_id": self.flow_id})
+        )
+        self._xbox_app_proxy = MicrosoftFamilyAuthProxy(
+            self.hass,
+            callback_url=callback_url,
+            start_url=self._xbox_app.url,
+            completion_mode="oauth",
+        )
+        register_native_proxy(self.hass, self._xbox_app_proxy)
+        return self.async_external_step(
+            step_id="xbox_app_check_proxy",
+            url=str(hass_url.with_path(self._xbox_app_proxy.access_path)),
+        )
+
+    async def async_step_xbox_app_check_proxy(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Wait at the proxy until it has captured the oauth20_desktop.srf code."""
+        proxy = self._xbox_app_proxy
+        if proxy is not None and (not proxy.complete or not proxy.oauth_redirect_url):
+            return self.async_external_step(
+                step_id="xbox_app_check_proxy",
+                url=str(URL(self._xbox_app_browser_url).with_path(proxy.access_path)),
+            )
+        return self.async_external_step_done(next_step_id="xbox_app_finish_proxy")
+
+    async def async_step_xbox_app_finish_proxy(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """The proxy captured the code: finish the app-style sign-in with it.
+
+        Only ``oauth_redirect_url`` (a full oauth20_desktop.srf?code=... URL,
+        parsed by ``app_code_from_redirect``) is taken from the proxy."""
+        proxy = self._xbox_app_proxy
+        start = self._xbox_app
+        redirect_url = proxy.oauth_redirect_url if proxy is not None else None
+        if proxy is not None:
+            try:
+                from .auth.native_proxy import unregister_native_proxy
+
+                await unregister_native_proxy(self.hass, proxy)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Could not close the Xbox OAuth proxy cleanly: %s", err)
+        self._xbox_app_proxy = None
+        if not redirect_url or start is None:
+            return self.async_abort(
+                reason="xbox_app_signin_failed",
+                description_placeholders={"detail": "no sign-in was captured in the browser"},
+            )
+        try:
+            result = await xbox_sisu.async_finish_app_sign_in(
+                async_get_clientsession(self.hass), start, redirect_url
+            )
+        except (ValueError, XapproveError) as err:
+            return self.async_abort(
+                reason="xbox_app_signin_failed",
+                description_placeholders={"detail": str(err)[:200]},
+            )
+        self._xbox_app = None
+        self._xbox_web_page = result.web_page_url
+        return await self._async_finish_xbox_sign_in(result.sign_in)
+
+    async def async_step_xbox_signin_app_paste(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """The app-style sign-in, pasted-address fallback (DevTools): the user
         signs in and pastes the address; then code, consent tokens,
         sisu/authorize with the session, the web view's reads, the check."""
         session = async_get_clientsession(self.hass)
+        if self._xbox_app is None and not await self._async_start_xbox_app():
+            return self.async_abort(
+                reason="xbox_app_signin_unavailable",
+                description_placeholders={"detail": self._xbox_app_proxy_why},
+            )
         if self._xbox_app is None:
             coordinator = (self.hass.data.get(DOMAIN) or {}).get(self._config_entry.entry_id)
             sisu = getattr(coordinator, "_sisu", None)
@@ -1739,11 +1884,24 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
                 self._xbox_app = None
                 self._xbox_web_page = result.web_page_url
                 return await self._async_finish_xbox_sign_in(result.sign_in)
+        why = {
+            "no_https": (
+                "Home Assistant has no HTTPS address a browser can reach, so the "
+                "browser sign-in could not start. Sign in this way instead, or set "
+                "up an HTTPS URL.\n\n"
+            ),
+            "local_http": (
+                "Home Assistant has only a local HTTP address. Sign in this way, or "
+                "tick the insecure-local-HTTP option in Configure for the browser "
+                "sign-in.\n\n"
+            ),
+            "unavailable": "The browser sign-in could not start. Sign in this way instead.\n\n",
+        }.get(self._xbox_app_proxy_why, "")
         return self.async_show_form(
-            step_id="xbox_signin_app",
+            step_id="xbox_signin_app_paste",
             data_schema=vol.Schema({vol.Required("redirect_url"): cv.string}),
             errors=errors,
-            description_placeholders={"url": start.url, "detail": detail},
+            description_placeholders={"url": start.url, "detail": detail, "why": why},
         )
 
     async def _async_finish_xbox_sign_in(self, sign_in: xbox_sisu.SignIn) -> FlowResult:
