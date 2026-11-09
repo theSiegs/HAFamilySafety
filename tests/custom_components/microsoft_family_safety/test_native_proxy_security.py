@@ -47,6 +47,8 @@ def _hass(handler: str = DOMAIN) -> MagicMock:
     hass.data = {_CALLBACK_TOKENS: {"good-token": (FLOW, time.monotonic() + 60)}}
     hass.config_entries.flow.async_get.return_value = {"handler": handler, "step_id": "other"}
     hass.config_entries.flow.async_configure = AsyncMock(return_value={"type": "external_done"})
+    # Close the fire-and-forget renotify coroutine the callback schedules.
+    hass.async_create_task = lambda coro, *a, **k: coro.close()
     return hass
 
 
@@ -70,7 +72,7 @@ async def test_callback_without_the_flow_token_never_touches_the_flow(query: str
     with pytest.raises(web.HTTPForbidden):
         await _callback(hass, query)
     hass.config_entries.flow.async_get.assert_not_called()
-    hass.config_entries.flow.async_configure.assert_not_awaited()
+    hass.config_entries.flow.async_configure.assert_not_called()
 
 
 async def test_callback_refuses_an_expired_token() -> None:
@@ -84,7 +86,7 @@ async def test_callback_refuses_a_flow_of_another_integration() -> None:
     hass = _hass(handler="other_integration")
     with pytest.raises(web.HTTPForbidden):
         await _callback(hass, f"flow_id={FLOW}&token=good-token")
-    hass.config_entries.flow.async_configure.assert_not_awaited()
+    hass.config_entries.flow.async_configure.assert_not_called()
 
 
 async def test_callback_resumes_its_own_flow() -> None:
@@ -238,3 +240,52 @@ async def test_marketing_page_moves_on_to_the_next_family_route(
     response = await _redirect(proxy, "https://www.microsoft.com/fr-fr/microsoft-365/family-safety")
     assert "/__ms_host__/account.microsoft.com/family/windows/home/direct" in response.headers["Location"]
     assert proxy._family_bootstrap_attempts == 1
+
+
+def _hass_options(handler: str = "entry-1") -> MagicMock:
+    """An options flow owns the sign-in: its handler is the config entry id,
+    and the proxy was registered with flow_kind='options'."""
+    hass = MagicMock()
+    registry_proxy = MagicMock(spec=MicrosoftFamilyAuthProxy)
+    registry_proxy.callback_url = (
+        f"{ORIGIN}/auth/microsoft_family_safety/callback?flow_id={FLOW}&token=good-token"
+    )
+    registry_proxy.flow_kind = "options"
+    registry_proxy.diagnostic_summary.return_value = {}
+    hass.data = {
+        _CALLBACK_TOKENS: {"good-token": (FLOW, time.monotonic() + 60)},
+        native_proxy._PROXY_REGISTRY: {"p": registry_proxy},
+    }
+    hass.config_entries.options.async_get.return_value = {
+        "handler": handler, "step_id": "xbox_app_check_proxy"
+    }
+    hass.config_entries.options.async_configure = AsyncMock(
+        return_value={"type": "external_done", "step_id": "xbox_app_finish_proxy"}
+    )
+    entry = MagicMock()
+    entry.domain = DOMAIN
+    hass.config_entries.async_get_entry.return_value = entry
+    # Close the fire-and-forget renotify coroutine the callback schedules.
+    hass.async_create_task = lambda coro, *a, **k: coro.close()
+    return hass
+
+
+async def test_callback_resumes_an_options_flow() -> None:
+    """Regression: the Xbox app-style sign-in runs in an options flow, which
+    the callback must resume through hass.config_entries.options, not .flow."""
+    hass = _hass_options()
+    response = await _callback(hass, f"flow_id={FLOW}&token=good-token")
+    assert response.status == 200
+    hass.config_entries.options.async_configure.assert_awaited_once()
+    # The config-entries flow manager (where only config flows live) is untouched.
+    hass.config_entries.flow.async_configure.assert_not_called()
+
+
+async def test_callback_refuses_an_options_flow_of_another_integration() -> None:
+    hass = _hass_options()
+    other = MagicMock()
+    other.domain = "other_integration"
+    hass.config_entries.async_get_entry.return_value = other
+    with pytest.raises(web.HTTPForbidden):
+        await _callback(hass, f"flow_id={FLOW}&token=good-token")
+    hass.config_entries.options.async_configure.assert_not_awaited()

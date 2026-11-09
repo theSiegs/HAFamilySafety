@@ -1775,6 +1775,7 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
             callback_url=callback_url,
             start_url=self._xbox_app.url,
             completion_mode="oauth",
+            flow_kind="options",
         )
         register_native_proxy(self.hass, self._xbox_app_proxy)
         return self.async_external_step(

@@ -221,8 +221,14 @@ class MicrosoftFamilyAuthProxy:
         start_url: str = "https://account.microsoft.com/",
         completion_mode: str = "web",
         initial_cookies: list[dict[str, Any]] | None = None,
+        flow_kind: str = "config",
     ) -> None:
         self.hass = hass
+        #: Which flow manager owns the flow this proxy serves: "config"
+        #: (the config-entries flow, the default) or "options" (an options
+        #: flow, e.g. the Xbox app-style sign-in). The callback resumes the
+        #: flow through the matching manager.
+        self.flow_kind = flow_kind
         self.token = token or secrets.token_urlsafe(24)
         # The token proves to the callback view that the browser went through
         # this proxy; server-side uses have no callback.
@@ -1781,8 +1787,27 @@ _AUTO_SUBMIT_STEPS = frozenset({"auth_success", "reauth_success"})
 _AUTO_ADVANCE_AFTER_SECONDS = 20.0
 
 
+def _flow_manager(hass: HomeAssistant, flow_kind: str):
+    """The flow manager that owns a flow of ``flow_kind``."""
+    if flow_kind == "options":
+        return hass.config_entries.options
+    return hass.config_entries.flow
+
+
+def _flow_kind_for(hass: HomeAssistant, flow_id: str) -> str:
+    """"options" when a registered proxy for ``flow_id`` was started from an
+    options flow, else "config"."""
+    for candidate in hass.data.get(_PROXY_REGISTRY, {}).values():
+        if (
+            isinstance(candidate, MicrosoftFamilyAuthProxy)
+            and f"flow_id={flow_id}" in candidate.callback_url
+        ):
+            return getattr(candidate, "flow_kind", "config")
+    return "config"
+
+
 async def _async_renotify_frontend(
-    hass: HomeAssistant, flow_id: str, expected_step: str | None
+    hass: HomeAssistant, flow_id: str, expected_step: str | None, flow_kind: str = "config"
 ) -> None:
     """Nudge, then if needed drive, a flow the frontend no longer follows.
 
@@ -1818,8 +1843,9 @@ async def _async_renotify_frontend(
                 "still on step %s", flow_id, sent, expected_step,
             )
             return
+        manager = _flow_manager(hass, flow_kind)
         try:
-            current = hass.config_entries.flow.async_get(flow_id)
+            current = manager.async_get(flow_id)
         except UnknownFlow:
             return
         step = current.get("step_id")
@@ -1843,7 +1869,7 @@ async def _async_renotify_frontend(
                 "server-side", flow_id, step, now - step_since,
             )
             try:
-                result = await hass.config_entries.flow.async_configure(
+                result = await manager.async_configure(
                     flow_id, {} if step in _AUTO_SUBMIT_STEPS else None
                 )
             except UnknownFlow:
@@ -1903,10 +1929,18 @@ class MicrosoftFamilyAuthorizationCallbackView(HomeAssistantView):
             raise web.HTTPBadRequest(text="Missing flow_id")
         if not _callback_token_matches(hass, flow_id, request.query.get("token", "")):
             raise web.HTTPForbidden(text="Invalid authentication callback")
+        flow_kind = _flow_kind_for(hass, flow_id)
+        manager = _flow_manager(hass, flow_kind)
         try:
             try:
-                before = hass.config_entries.flow.async_get(flow_id)
-                if before.get("handler") != DOMAIN:
+                before = manager.async_get(flow_id)
+                handler = before.get("handler")
+                ok = handler == DOMAIN
+                if not ok and flow_kind == "options":
+                    # An options flow's handler is its config entry id.
+                    entry = hass.config_entries.async_get_entry(handler) if handler else None
+                    ok = entry is not None and entry.domain == DOMAIN
+                if not ok:
                     raise web.HTTPForbidden(text="Invalid authentication callback")
                 before_step = before.get("step_id")
                 before_source = (before.get("context") or {}).get("source")
@@ -1962,7 +1996,7 @@ class MicrosoftFamilyAuthorizationCallbackView(HomeAssistantView):
                     },
                 )
                 hass.async_create_task(
-                    _async_renotify_frontend(hass, flow_id, before_step),
+                    _async_renotify_frontend(hass, flow_id, before_step, flow_kind),
                     "Microsoft Family Safety auth flow frontend re-notify",
                 )
                 result = {
@@ -1972,7 +2006,7 @@ class MicrosoftFamilyAuthorizationCallbackView(HomeAssistantView):
             else:
                 # Mobile OAuth and any web completion that occurs before the HA
                 # progress handoff still advance through the canonical external step.
-                result = await hass.config_entries.flow.async_configure(
+                result = await manager.async_configure(
                     flow_id=flow_id, user_input={"native_callback": True}
                 )
         except UnknownFlow as err:
@@ -1982,8 +2016,8 @@ class MicrosoftFamilyAuthorizationCallbackView(HomeAssistantView):
                     "step_id": item.get("step_id"),
                     "source": (item.get("context") or {}).get("source"),
                 }
-                for item in hass.config_entries.flow.async_progress()
-                if item.get("handler") == DOMAIN
+                for item in manager.async_progress()
+                if flow_kind == "options" or item.get("handler") == DOMAIN
             ]
             _LOGGER.error(
                 "Could not resume native auth flow %s: UnknownFlow; "
@@ -2046,7 +2080,7 @@ class MicrosoftFamilyAuthorizationCallbackView(HomeAssistantView):
             # still parked on this exact EXTERNAL_STEP_DONE next-step id.  HA's
             # frontend GET then remains the sole consumer of the transition.
             hass.async_create_task(
-                _async_renotify_frontend(hass, flow_id, result.get("step_id")),
+                _async_renotify_frontend(hass, flow_id, result.get("step_id"), flow_kind),
                 "Microsoft Family Safety auth flow frontend re-notify",
             )
         else:
