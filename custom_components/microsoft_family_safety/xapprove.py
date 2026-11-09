@@ -430,6 +430,9 @@ class AuthMethod:
     app_like: bool = True
     accept_language: str | None = None
     sisu_profile: str = ""
+    #: Force a specific XstsVariant (probe only, to try more than no_claims);
+    #: None = the sign-in's usual pick.
+    xsts_variant: str | None = None
 
 
 #: The SISU profiles with the consent service tokens (xbox_sisu.SISU_PROFILES),
@@ -455,6 +458,10 @@ def _methods() -> list[AuthMethod]:
     msa: dict[str, Any] = {"relying_party": None, "msa_scope": XAPPROVE_SCOPE}
     return [
         *_pair("xsts", token="xsts", relying_party=RP_XBOXLIVE),
+        # The XSTS step stops at no_claims; also try xapprove with the tokens
+        # of the next two variants that still return one (low odds, free).
+        AuthMethod("xsts_no_title_signed", token="xsts", relying_party=RP_XBOXLIVE, xsts_variant="no_title"),
+        AuthMethod("xsts_sisu_device_signed", token="xsts", relying_party=RP_XBOXLIVE, xsts_variant="sisu_device"),
         *[
             AuthMethod(f"{profile}_xsts_signed", token="xsts", relying_party=RP_XBOXLIVE, sisu_profile=profile)
             for profile in ("webview", "webview_reauth", "session", "session_ucs")
@@ -477,10 +484,11 @@ def _methods() -> list[AuthMethod]:
 
 
 #: Every way of signing xapprove requests, the most app-like first: the
-#: XSTS from the explicit step (no OptionalDisplayClaims), then the same
-#: from a sisu/authorize with the consent service tokens (UCS), SISU's own
-#: XSTS (also with contract versions 1-3 and Accept-Language), the
-#: xapprove-scope MSA token. Live 2026-11-08: every XSTS or SISU token got
+#: XSTS from the explicit step (no OptionalDisplayClaims, plus the no_title
+#: and sisu_device tokens tried as two extra ways), then the web view and
+#: session profiles, a sisu/authorize with the consent service tokens (UCS),
+#: SISU's own XSTS (also with contract versions 1-3), the xapprove-scope MSA
+#: token. Live 2026-11-08: every XSTS or SISU token got
 #: 401 with an empty body and no WWW-Authenticate (accepted as a token, not
 #: authorized), the MSA token 401 token_required; the XSTS step for
 #: xapprove's own relying parties 400 in every variant (dropped).
@@ -539,6 +547,75 @@ def redact(text: str) -> str:
     text = _JWT.sub("<jwt>", text)
     text = _LONG_TOKEN.sub("<redacted>", text)
     return _LONG_NUMBER.sub("<number>", text)
+
+
+#: The Xbox title-endpoints document (no auth): which host/RelyingParty and
+#: signature policy each service wants. Read by probe_xapprove to see whether
+#: xapprove asks for a relying party or policy the integration is not using.
+ENDPOINTS_URL = "https://title.mgt.xboxlive.com/titles/default/endpoints?type=1"
+#: Endpoint entries kept: xapprove, plus xboxlive.com/accounts for comparison.
+_ENDPOINT_WORDS = ("xapprove", "xboxlive.com", "accounts")
+
+
+def _policy(policies: Any, index: Any) -> dict[str, Any] | None:
+    if not isinstance(policies, list) or not isinstance(index, int):
+        return None
+    for policy in policies:
+        if isinstance(policy, dict) and policy.get("Version") == index + 1:
+            break
+    else:
+        policy = policies[index] if 0 <= index < len(policies) else None
+    if not isinstance(policy, dict):
+        return None
+    return {
+        "version": policy.get("Version"),
+        "supportedAlgorithms": policy.get("SupportedAlgorithms"),
+        "maxBodyBytes": policy.get("MaxBodyBytes"),
+    }
+
+
+def summarize_endpoints(payload: Any) -> dict[str, Any]:
+    """The endpoints that mention xapprove (and xboxlive/accounts for
+    comparison), with their host, relying party, token type and signature
+    policy. Public endpoint metadata, no secrets."""
+    if not isinstance(payload, dict):
+        return {"error": "unreadable endpoints answer"}
+    endpoints = payload.get("EndPoints")
+    policies = payload.get("SignaturePolicies")
+    if not isinstance(endpoints, list):
+        return {"error": "no EndPoints in the answer"}
+    kept: list[dict[str, Any]] = []
+    for entry in endpoints:
+        if not isinstance(entry, dict):
+            continue
+        hay = " ".join(
+            str(entry.get(k, "")) for k in ("Host", "RelyingParty", "SubRelyingParty")
+        ).lower()
+        if not any(word in hay for word in _ENDPOINT_WORDS):
+            continue
+        index = entry.get("SignaturePolicyIndex")
+        kept.append({
+            "host": entry.get("Host"),
+            "protocol": entry.get("Protocol"),
+            "relyingParty": entry.get("RelyingParty"),
+            "subRelyingParty": entry.get("SubRelyingParty"),
+            "tokenType": entry.get("TokenType"),
+            "signaturePolicyIndex": index,
+            "signaturePolicy": _policy(policies, index),
+        })
+    return {"xapprove": [e for e in kept if "xapprove" in str(e["host"]).lower()], "related": kept}
+
+
+async def async_fetch_endpoints(session: aiohttp.ClientSession) -> dict[str, Any]:
+    """probe_xapprove: one unauthenticated GET of the title-endpoints document.
+    Never raises; on any trouble it records the status (or the error)."""
+    try:
+        status, payload, _headers = await _call(session, "GET", ENDPOINTS_URL)
+    except XapproveError as err:
+        return {"error": str(err)}
+    if not 200 <= status < 300:
+        return {"status": status}
+    return {"status": status, **summarize_endpoints(payload)}
 
 
 def _reported_header(name: str) -> bool:
@@ -650,6 +727,7 @@ class XapproveClient:
         elif method.token == "xsts":
             value = (await sisu.async_title_xsts(
                 method.relying_party or RP_XBOXLIVE, force=force, profile=method.sisu_profile,
+                variant=method.xsts_variant,
             )).header()
         else:
             value = (await sisu.async_xsts(force=force, profile=method.sisu_profile)).header()

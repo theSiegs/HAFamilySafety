@@ -71,6 +71,7 @@ from .screen_time import (
     parse_utc,
 )
 from .xapprove import (
+    async_fetch_endpoints,
     DEFAULT_METHOD,
     OVERRIDE_ALLOW,
     OVERRIDE_BLOCK,
@@ -986,6 +987,9 @@ class XboxXapproveMixin:
         self._sisu.proxy_way = None
         self._sisu.diagnose = True
         self._sisu.token_facts = steps
+        # The Xbox title-endpoints document (no auth): which host, relying
+        # party and signature policy xapprove asks for.
+        result["endpoints"] = await async_fetch_endpoints(session)
         try:
             tokens = await client.async_tokens()
         except XapproveError as err:

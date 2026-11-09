@@ -575,6 +575,7 @@ UCS_SCOPES = [
 ]
 ALL_NAMES = [
     "xsts_signed", "xsts_unsigned",
+    "xsts_no_title_signed", "xsts_sisu_device_signed",
     "webview_xsts_signed", "webview_reauth_xsts_signed",
     "session_xsts_signed", "session_ucs_xsts_signed",
     *[f"{p}_xsts_signed" for p in UCS],
@@ -589,6 +590,7 @@ ALL_NAMES = [
 #: Every probe attempt, "way@path", in order.
 ALL_ATTEMPTS = [
     "xsts_signed@overrides", "xsts_signed@screentime", "xsts_unsigned@overrides",
+    "xsts_no_title_signed@overrides", "xsts_sisu_device_signed@overrides",
     "webview_xsts_signed@overrides", "webview_reauth_xsts_signed@overrides",
     "session_xsts_signed@overrides", "session_ucs_xsts_signed@overrides",
     *[f"{p}_xsts_signed@overrides" for p in UCS],
@@ -633,14 +635,16 @@ def _accepts_only(name: str):
 def test_the_probe_attempts_most_app_like_first():
     assert [m.name for m in xapprove.PROBE_METHODS] == ALL_NAMES
     assert [f"{m.name}@{p}" for m, p in xapprove.PROBE_ATTEMPTS] == ALL_ATTEMPTS
-    assert len(ALL_ATTEMPTS) == 30
+    assert len(ALL_ATTEMPTS) == 32
     assert xapprove.DEFAULT_METHOD.name == "xsts_signed"
     for method in xapprove.PROBE_METHODS:
         assert method.app_like
         assert method.signed == method.name.endswith("_signed")
 
 
-@pytest.mark.parametrize("name", [n for n in ALL_NAMES if not n.startswith(("webview", "session"))])
+@pytest.mark.parametrize(
+    "name", [n for n in ALL_NAMES if not n.startswith(("webview", "session", "xsts_no", "xsts_sisu"))]
+)
 async def test_the_probe_finds_each_way_and_the_lock_uses_it(rig, server, name):
     server.accepts = _accepts_only(name)
     result = await rig.async_probe_xapprove(True)
@@ -750,8 +754,9 @@ async def test_without_a_sisu_device_token_that_variant_is_skipped(rig, server):
     assert result["xsts"]["http://xboxlive.com"] == {"variant": None, "xui_keys": None}
     # Every variant refused once: the unsigned attempt does not sweep again.
     # (the plain profile, the two web view ones, the two session ones and
-    # the eight UCS ones, 5 sent variants each)
-    assert server.sisu_calls.count("xsts:http://xboxlive.com") == 65
+    # the eight UCS ones, 5 sent variants each, plus the forced no_title
+    # attempt; forced sisu_device is skipped without a device token)
+    assert server.sisu_calls.count("xsts:http://xboxlive.com") == 66
     first = result["overrides_attempts"][0]
     assert first["stage"] == "token" and first["xerr"] == 2148916279
     assert result["working_method"] == "sisu_signed"
@@ -1035,3 +1040,66 @@ async def test_a_session_with_the_consent_tokens(rig, server):
     assert result["working_method"] == "session_ucs_xsts_signed"
     assert result["steps"]["sisu_authorize[session_ucs]"]["ucs_sent"] is True
     _no_secrets(result)
+
+
+# Round 6: endpoints, the extra XSTS-variant tokens, the authorize Flow -------------
+
+
+async def test_the_endpoints_document_is_read(rig, server):
+    result = await rig.async_probe_xapprove(True)
+    endpoints = result["endpoints"]
+    assert endpoints["status"] == 200
+    xapprove_entries = endpoints["xapprove"]
+    assert len(xapprove_entries) == 1
+    entry = xapprove_entries[0]
+    assert entry["host"] == "xapprove.xboxlive.com"
+    assert entry["relyingParty"] == "http://xapprove.xboxlive.com/"
+    assert entry["subRelyingParty"] == "http://xapprove.xboxlive.com/screentime"
+    assert entry["tokenType"] == "JWT" and entry["signaturePolicyIndex"] == 2
+    assert entry["signaturePolicy"] == {
+        "version": 3, "supportedAlgorithms": ["ES256", "RS256"], "maxBodyBytes": 1048576
+    }
+    # accounts.xboxlive.com is kept for comparison.
+    assert any(e["host"] == "accounts.xboxlive.com" for e in endpoints["related"])
+    _no_secrets(result)
+
+
+async def test_the_endpoints_document_failure_is_recorded(rig, server):
+    server.endpoints_status = 500
+    result = await rig.async_probe_xapprove(True)
+    assert result["endpoints"] == {"status": 500}
+    # The rest of the probe still runs.
+    assert "overrides_attempts" in result
+
+
+async def test_the_extra_xsts_variant_tokens_are_tried(rig, server):
+    # With a device token in SISU's answer, both extra XSTS variants produce
+    # a token; xapprove sees each (here it rejects all but the MSA token).
+    server.sisu_device_token = True
+    server.accepts = lambda h: h.get("Authorization") == f"WLID1.0 t={SISU_ACCESS}"
+    result = await rig.async_probe_xapprove(True)
+    by_name = {a["name"]: a for a in result["overrides_attempts"]}
+    # Both reached xapprove (401), not a token-stage failure.
+    assert by_name["xsts_no_title_signed"]["stage"] == "xapprove"
+    assert by_name["xsts_sisu_device_signed"]["stage"] == "xapprove"
+    assert result["steps"]["xsts_authorize[http://xboxlive.com|no_title]"]["status"] == 200
+    assert result["steps"]["xsts_authorize[http://xboxlive.com|sisu_device]"]["status"] == 200
+    assert result["working_method"] == "msa_wlid_signed"
+    _no_secrets(result)
+
+
+async def test_the_extra_xsts_variant_is_skipped_without_a_device_token(rig, server):
+    # Live: SISU returns no DeviceToken, so sisu_device is skipped cleanly.
+    server.sisu_device_token = False
+    server.accepts = lambda h: False
+    result = await rig.async_probe_xapprove(True)
+    by_name = {a["name"]: a for a in result["overrides_attempts"]}
+    assert by_name["xsts_sisu_device_signed"]["stage"] == "token"
+    _no_secrets(result)
+
+
+async def test_the_authorize_flow_is_recorded(rig, server):
+    server.authorize_flow = "CreateGamertag"
+    result = await rig.async_probe_xapprove(True)
+    step = result["steps"]["sisu_authorize"]
+    assert step["flow"] == "CreateGamertag" and "Flow" in step["response_keys"]

@@ -511,6 +511,11 @@ async def async_sisu_authorize(
             "title_xti_keys": sorted(str(k) for k in xti),
             "title_id": redact(_title_id(xti) or "") or None,
             "response_keys": sorted(str(k) for k in payload) if isinstance(payload, dict) else None,
+            # ``Flow`` may name what SISU thinks is unfinished for our device.
+            "flow": (
+                redact(str(payload["Flow"]))[:300]
+                if isinstance(payload, dict) and payload.get("Flow") is not None else None
+            ),
             "web_page": page.facts if page else None,
             "session_id_sent": bool(session_id),
         })
@@ -1069,12 +1074,16 @@ class XboxSisuAuth:
             return await self._async_sisu(force, profile)
 
     async def async_title_xsts(
-        self, relying_party: str = RP_XBOXLIVE, *, force: bool = False, profile: str = ""
+        self, relying_party: str = RP_XBOXLIVE, *, force: bool = False, profile: str = "",
+        variant: str | None = None,
     ) -> XboxTokens:
         """An XSTS from the explicit XSTS step (SISU's user, device and title
         tokens) for ``relying_party``: how the Xbox Family Settings app gets
-        the token it sends to xapprove. ``force`` renews SISU's tokens too."""
+        the token it sends to xapprove. ``force`` renews SISU's tokens too.
+        ``variant`` (probe) pins one XstsVariant instead of the usual pick."""
         key = xsts_key(relying_party, profile)
+        if variant:
+            key = f"{key}#{variant}"
         async with self._lock:
             cached = self._xsts.get(key)
             if cached is not None and not force and _valid(cached.xsts_not_after):
@@ -1084,20 +1093,25 @@ class XboxSisuAuth:
                 raise self._xsts_failed[key]
             session = self._session_getter()
             await self._async_device(session)
+            order = (
+                [XSTS_VARIANTS_BY_NAME[variant]] if variant in XSTS_VARIANTS_BY_NAME
+                else self._variant_order()
+            )
             first: XapproveError | None = None
-            for variant in self._variant_order():
+            for one in order:
                 try:
                     tokens = await async_xsts_authorize(
                         session, self.key, sisu_tokens, self._device[0], relying_party,
-                        self.token_facts, variant, profile,
+                        self.token_facts, one, profile,
                     )
                 except XapproveRefused as err:
                     first = first or err
                     continue
-                except XstsVariantSkipped:
+                except XstsVariantSkipped as err:
+                    first = first or err
                     continue
                 self._xsts[key] = tokens
-                self.xsts_variants[key] = variant.name
+                self.xsts_variants[key] = one.name
                 return tokens
             error = first or XapproveError(f"{xsts_step(relying_party, profile=profile)}: no variant answered")
             self._xsts_failed[key] = error

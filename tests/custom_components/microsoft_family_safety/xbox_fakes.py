@@ -66,6 +66,31 @@ WEB_PAGE_HTML = (
     '<script src="https://cdn.example.com/x.js"></script></head></html>'
 )
 WEB_PAGE_JS = 'proxy({"ReadAccount":{}}); proxy({"ReadProfile":{}}); CreateAccount(); AcceptTerms();'
+#: A small title-endpoints document, with an xapprove entry whose signature
+#: policy and relying party differ from the ones the integration uses.
+ENDPOINTS_DOC = {
+    "EndPoints": [
+        {
+            "Protocol": "https", "Host": "xapprove.xboxlive.com", "HostType": "fqdn",
+            "RelyingParty": "http://xapprove.xboxlive.com/",
+            "SubRelyingParty": "http://xapprove.xboxlive.com/screentime",
+            "TokenType": "JWT", "SignaturePolicyIndex": 2,
+        },
+        {
+            "Protocol": "https", "Host": "accounts.xboxlive.com", "HostType": "fqdn",
+            "RelyingParty": "http://xboxlive.com", "TokenType": "JWT", "SignaturePolicyIndex": 1,
+        },
+        {
+            "Protocol": "https", "Host": "notifications.xboxlive.com", "HostType": "fqdn",
+            "RelyingParty": "http://notifications.xboxlive.com", "SignaturePolicyIndex": 0,
+        },
+    ],
+    "SignaturePolicies": [
+        {"Version": 1, "SupportedAlgorithms": ["ES256"], "MaxBodyBytes": 8192},
+        {"Version": 2, "SupportedAlgorithms": ["ES256"], "MaxBodyBytes": 4096},
+        {"Version": 3, "SupportedAlgorithms": ["ES256", "RS256"], "MaxBodyBytes": 1048576},
+    ],
+}
 #: The explicit XSTS step's token per relying party.
 XSTS_TOKENS = {
     "http://xboxlive.com": "xsts-xboxlive-SECRET",
@@ -219,6 +244,10 @@ class XboxServer:
         #: The PKCE challenge of the last sisu/authenticate (the code
         #: exchange's verifier must match it).
         self.last_challenge: str | None = None
+        #: The title-endpoints document: 200 by default, or an error status.
+        self.endpoints_status = 200
+        #: A ``Flow`` value to add to every sisu/authorize answer, or None.
+        self.authorize_flow = None
 
     def state(self) -> dict:
         overrides = []
@@ -241,6 +270,11 @@ class XboxServer:
     def request(self, method, url, **kwargs):
         self.calls.append((method, url))
         headers = kwargs.get("headers") or {}
+        if url.startswith(xapprove.ENDPOINTS_URL):
+            assert method == "GET" and "Authorization" not in headers
+            if self.endpoints_status != 200:
+                return FakeResponse(self.endpoints_status, None)
+            return FakeResponse(200, ENDPOINTS_DOC)
         body = kwargs.get("data") if isinstance(kwargs.get("data"), bytes) else b""
         if url == sisu.DEVICE_CODE_URL:
             form = kwargs["data"]
@@ -389,6 +423,7 @@ class XboxServer:
                     "DisplayClaims": {"xti": {"tid": TITLE_ID}},
                 }} if self.title_token else {}),
                 **({"WebPage": web_page} if web_page else {}),
+                **({"Flow": self.authorize_flow} if self.authorize_flow is not None else {}),
                 "UserToken": {"Token": f"sisu-user-SECRET{shape}",
                               "NotAfter": iso_utc(dt_util.utcnow() + timedelta(days=14))},
                 "AuthorizationToken": {
