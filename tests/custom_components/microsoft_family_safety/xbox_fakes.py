@@ -8,6 +8,7 @@ import asyncio
 import base64
 import json
 import struct
+from urllib.parse import parse_qs, urlsplit
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -56,6 +57,15 @@ UCS_TOKENS = {
 SESSION_ID = "session-id-SECRET"
 OAUTH_REDIRECT = "https://login.live.com/oauth20_authorize.srf?redirect-SECRET"
 TITLE_ID = "1016898439"
+#: The web view: its page, the sig of its URL, its session ids.
+WEB_PAGE_BASE = "https://sisu.xboxlive.com/client/v68/00000000482c8f49/view/index.html"
+WEB_SIG = "websig-SECRET-" + "Q" * 40
+WEB_SID = "websid-{}-SECRET"
+WEB_PAGE_HTML = (
+    '<html><head><script src="/client/v68/app.js"></script>'
+    '<script src="https://cdn.example.com/x.js"></script></head></html>'
+)
+WEB_PAGE_JS = 'proxy({"ReadAccount":{}}); proxy({"ReadProfile":{}}); CreateAccount(); AcceptTerms();'
 #: The explicit XSTS step's token per relying party.
 XSTS_TOKENS = {
     "http://xboxlive.com": "xsts-xboxlive-SECRET",
@@ -74,6 +84,7 @@ SECRETS = (
     PARENT_XUID, CHILD_XUID, GAMERTAG, CODE, SISU_ACCESS, DEVICE_TOKEN, SISU_XSTS,
     "sisu-refresh-", TITLE_TOKEN, "sisu-user-SECRET", DEVICE_CODE, *XSTS_TOKENS.values(),
     SISU_DEVICE_TOKEN, *UCS_TOKENS.values(), SESSION_ID, "redirect-SECRET", "other-scope-refresh-SECRET",
+    "websid-", WEB_SIG,
 )
 
 
@@ -189,6 +200,20 @@ class XboxServer:
         self.authorize_accepts = lambda payload, headers: True
         #: Every sisu/authenticate body.
         self.authenticate_bodies: list[dict] = []
+        #: The web view: whether authorize answers a WebPage (live: always),
+        #: and still after a session was finished; the sessions made, the
+        #: ones finished (ReadAccount then ReadProfile), the ones made after.
+        self.web_page = False
+        self.web_page_after_done = True
+        self.sessions = 0
+        self.read_account: set[int] = set()
+        self.done_sessions: set[int] = set()
+        self.fresh_sessions: set[int] = set()
+        #: Which proxy POSTs answer 200: (headers, session id) -> bool.
+        self.proxy_accepts = lambda h, sid: (
+            h.get("Authorization", "").startswith("XBL3.0") and "Signature" in h and sid.startswith("websid-")
+        )
+        self.proxy_calls: list[str] = []
 
     def state(self) -> dict:
         overrides = []
@@ -273,6 +298,33 @@ class XboxServer:
                 "Token": DEVICE_TOKEN, "NotAfter": iso_utc(dt_util.utcnow() + timedelta(days=14)),
                 "DisplayClaims": {"xdi": {"did": "F700000000000001", "dcs": "0"}},
             })
+        if url.startswith(sisu.SISU_PROXY_URL + "?"):
+            sid = parse_qs(urlsplit(url).query)["sessionid"][0]
+            payload = json.loads(kwargs["data"])
+            assert headers["x-xbl-contract-version"] == "3"
+            assert headers["Content-Type"] == "application/json"
+            if "Signature" in headers:
+                verify_signature(
+                    headers["Signature"], self.jwk, "POST", url, headers.get("Authorization", ""),
+                    kwargs["data"],
+                )
+            read = next(iter(payload))
+            assert payload == {read: {}} and read in ("ReadAccount", "ReadProfile")
+            self.proxy_calls.append(read)
+            if not self.proxy_accepts(headers, sid):
+                return FakeResponse(401, None)
+            session = int(sid.split("-")[1]) if sid.startswith("websid-") else 0
+            if read == "ReadAccount":
+                self.read_account.add(session)
+                return FakeResponse(200, {"Account": {"Gamertag": "SamParent", "AgeGroup": "Adult"}})
+            if session in self.read_account:
+                self.done_sessions.add(session)
+            return FakeResponse(200, {"Profile": {"Gamertag": "SamParent"}, "Prompts": []})
+        if url.startswith(WEB_PAGE_BASE):
+            assert method == "GET"
+            return FakeResponse(200, None, {"Content-Type": "text/html"}, WEB_PAGE_HTML)
+        if url == "https://sisu.xboxlive.com/client/v68/app.js":
+            return FakeResponse(200, None, {"Content-Type": "text/javascript"}, WEB_PAGE_JS)
         if url == sisu.SISU_AUTHENTICATE_URL:
             self.sisu_calls.append("authenticate")
             payload = json.loads(kwargs["data"])
@@ -297,6 +349,17 @@ class XboxServer:
             if not self.authorize_accepts(payload, headers):
                 return FakeResponse(400, {"XErr": 2148916233})
             shape = authorize_shape(payload, headers)
+            web_page = None
+            if self.web_page:
+                self.sessions += 1
+                if self.done_sessions:
+                    self.fresh_sessions.add(self.sessions)
+                shape += f"~s{self.sessions}"
+                if self.web_page_after_done or not self.done_sessions:
+                    web_page = (
+                        f"{WEB_PAGE_BASE}?MS-CV=abc.1&redirect=ms-xal-00000000482c8f49%3A%2F%2Fauth"
+                        f"&sid={WEB_SID.format(self.sessions)}&sig={WEB_SIG}&state=st1"
+                    )
             return FakeResponse(200, {
                 **({"DeviceToken": SISU_DEVICE_TOKEN} if self.sisu_device_token else {}),
                 **({"TitleToken": {
@@ -304,6 +367,7 @@ class XboxServer:
                     "NotAfter": iso_utc(dt_util.utcnow() + timedelta(days=14)),
                     "DisplayClaims": {"xti": {"tid": TITLE_ID}},
                 }} if self.title_token else {}),
+                **({"WebPage": web_page} if web_page else {}),
                 "UserToken": {"Token": f"sisu-user-SECRET{shape}",
                               "NotAfter": iso_utc(dt_util.utcnow() + timedelta(days=14))},
                 "AuthorizationToken": {
@@ -346,7 +410,7 @@ class XboxServer:
         if "Signature" in headers and self.jwk is not None:
             verify_signature(headers["Signature"], self.jwk, method, url, headers["Authorization"], body)
         if url.startswith("https://accounts.xboxlive.com/family/"):
-            assert headers["Authorization"] == SISU_AUTH
+            assert headers["Authorization"].startswith(SISU_AUTH)
             if self.family_status != 200:
                 return FakeResponse(self.family_status, None)
             # As seen live: no isAdult, a role per member.

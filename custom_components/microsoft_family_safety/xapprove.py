@@ -392,6 +392,8 @@ class XboxTokens:
     device_token: str = field(default="", repr=False)
     #: The title id (TitleToken xti ``tid``), if SISU's answer had one.
     title_id: str | None = None
+    #: SISU's WebPage (xbox_sisu.WebPage), if its answer had one.
+    web_page: Any = field(default=None, repr=False)
 
     def header(self) -> str:
         return f"XBL3.0 x={self.uhs};{self.xsts}"
@@ -455,6 +457,10 @@ def _methods() -> list[AuthMethod]:
         *_pair("xsts", token="xsts", relying_party=RP_XBOXLIVE),
         *[
             AuthMethod(f"{profile}_xsts_signed", token="xsts", relying_party=RP_XBOXLIVE, sisu_profile=profile)
+            for profile in ("webview", "webview_reauth")
+        ],
+        *[
+            AuthMethod(f"{profile}_xsts_signed", token="xsts", relying_party=RP_XBOXLIVE, sisu_profile=profile)
             for profile in UCS_PROFILES
         ],
         *[
@@ -465,7 +471,6 @@ def _methods() -> list[AuthMethod]:
         *_pair("sisu_c1", contract="1", **sisu),
         *_pair("sisu_c2", contract="2", **sisu),
         *_pair("sisu_c3", contract="3", **sisu),
-        *_pair("sisu_lang", accept_language="en-US", **sisu),
         *_pair("msa_wlid", token="msa_wlid", **msa),
         *_pair("msa_xbl", token="msa_xbl", **msa),
     ]

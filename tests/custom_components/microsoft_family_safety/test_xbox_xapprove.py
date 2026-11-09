@@ -11,6 +11,7 @@ today's Xbox schedule; the Family web session is never used for the Xbox.
 from __future__ import annotations
 
 import json
+import re
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -20,6 +21,7 @@ from homeassistant.exceptions import HomeAssistantError, ServiceValidationError,
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.util import dt as dt_util
 
+from custom_components.microsoft_family_safety import xbox_sisu
 from custom_components.microsoft_family_safety import (
     _register_services,
     binary_sensor,
@@ -46,8 +48,8 @@ from .xbox_fakes import (
     SISU_DEVICE_TOKEN,
     TITLE_ID,
     UCS_TOKENS,
+    WEB_SIG,
     XSTS_AUTH,
-    XSTS_TOKENS,
     XSTS_XUI,
     XboxServer,
     hours as _hours,
@@ -573,26 +575,26 @@ UCS_SCOPES = [
 ]
 ALL_NAMES = [
     "xsts_signed", "xsts_unsigned",
+    "webview_xsts_signed", "webview_reauth_xsts_signed",
     *[f"{p}_xsts_signed" for p in UCS],
     "ucs_raw_prompts_noc_sisu_signed", "ucs_t_prompts_noc_sisu_signed",
     "sisu_signed", "sisu_unsigned",
     "sisu_c1_signed", "sisu_c1_unsigned",
     "sisu_c2_signed", "sisu_c2_unsigned",
     "sisu_c3_signed", "sisu_c3_unsigned",
-    "sisu_lang_signed", "sisu_lang_unsigned",
     "msa_wlid_signed", "msa_wlid_unsigned",
     "msa_xbl_signed", "msa_xbl_unsigned",
 ]
 #: Every probe attempt, "way@path", in order.
 ALL_ATTEMPTS = [
     "xsts_signed@overrides", "xsts_signed@screentime", "xsts_unsigned@overrides",
+    "webview_xsts_signed@overrides", "webview_reauth_xsts_signed@overrides",
     *[f"{p}_xsts_signed@overrides" for p in UCS],
     "ucs_raw_prompts_noc_sisu_signed@overrides", "ucs_t_prompts_noc_sisu_signed@overrides",
     "sisu_signed@overrides", "sisu_signed@screentime", "sisu_unsigned@overrides",
     "sisu_c1_signed@overrides", "sisu_c1_unsigned@overrides",
     "sisu_c2_signed@overrides", "sisu_c2_unsigned@overrides",
     "sisu_c3_signed@overrides", "sisu_c3_unsigned@overrides",
-    "sisu_lang_signed@overrides", "sisu_lang_unsigned@overrides",
     "msa_wlid_signed@overrides", "msa_wlid_unsigned@overrides",
     "msa_xbl_signed@overrides", "msa_xbl_unsigned@overrides",
 ]
@@ -636,7 +638,7 @@ def test_the_probe_attempts_most_app_like_first():
         assert method.signed == method.name.endswith("_signed")
 
 
-@pytest.mark.parametrize("name", ALL_NAMES)
+@pytest.mark.parametrize("name", [n for n in ALL_NAMES if not n.startswith("webview")])
 async def test_the_probe_finds_each_way_and_the_lock_uses_it(rig, server, name):
     server.accepts = _accepts_only(name)
     result = await rig.async_probe_xapprove(True)
@@ -745,8 +747,9 @@ async def test_without_a_sisu_device_token_that_variant_is_skipped(rig, server):
     assert steps["xsts_authorize[http://xboxlive.com|app]"]["status"] == 400
     assert result["xsts"]["http://xboxlive.com"] == {"variant": None, "xui_keys": None}
     # Every variant refused once: the unsigned attempt does not sweep again.
-    # (the plain profile and the eight UCS ones, 5 sent variants each)
-    assert server.sisu_calls.count("xsts:http://xboxlive.com") == 45
+    # (the plain profile, the two web view ones and the eight UCS ones,
+    # 5 sent variants each)
+    assert server.sisu_calls.count("xsts:http://xboxlive.com") == 55
     first = result["overrides_attempts"][0]
     assert first["stage"] == "token" and first["xerr"] == 2148916279
     assert result["working_method"] == "sisu_signed"
@@ -880,3 +883,115 @@ async def test_title_id_and_sisu_authenticate_are_reported(rig, server):
 async def test_xapprove_asks_for_gzip(rig, server):
     await rig.async_lock_platform(CHILD, "Xbox", _hours(3))
     assert server.xapprove_headers[-1]["Accept-Encoding"] == "gzip"
+
+
+# The SISU web view (WebPage) -------------------------------------------------------
+
+
+def _session_of(headers) -> int | None:
+    found = re.search(r"~s(\d+)$", headers.get("Authorization", ""))
+    return int(found.group(1)) if found else None
+
+
+async def test_the_web_view_is_replayed_before_the_xsts(rig, server):
+    server.web_page = True
+    # As the capture suggests: xapprove takes the tokens of a session whose
+    # web view was finished (ReadAccount, then ReadProfile).
+    server.accepts = lambda h: _session_of(h) in server.done_sessions and "Signature" in h
+    result = await rig.async_probe_xapprove(True)
+
+    assert result["working_method"] == "webview_xsts_signed"
+    assert result["proxy_way"] == "page_xbl_signed"
+    page = result["steps"]["sisu_authorize"]["web_page"]
+    assert page == {
+        "host": "sisu.xboxlive.com",
+        "path": "/client/v68/00000000482c8f49/view/index.html",
+        "view": "view",
+        "query_keys": ["MS-CV", "redirect", "sid", "sig", "state"],
+        "fragment_keys": [],
+        "sid_present": True,
+        "sig_present": True,
+        "sig_shape": {"length": len(WEB_SIG), "base64_like": True, "dots": 0, "jwt_like": False},
+        "redirect_scheme": "ms-xal-00000000482c8f49",
+    }
+    steps = result["steps"]
+    read = steps["sisu_proxy[webview|page_xbl_signed|ReadAccount]"]
+    assert read["status"] == 200 and read["response_keys"] == {"Account": ["AgeGroup", "Gamertag"]}
+    profile = steps["sisu_proxy[webview|page_xbl_signed|ReadProfile]"]
+    assert profile["status"] == 200 and profile["response_keys"] == {"Profile": ["Gamertag"], "Prompts": "list"}
+    assert server.proxy_calls == ["ReadAccount", "ReadProfile"]
+    fetch = steps["web_page_fetch"]
+    assert fetch["status"] == 200 and fetch["scripts"] == ["/client/v68/app.js", "/x.js"]
+    assert {"ReadAccount", "ReadProfile", "CreateAccount", "AcceptTerms"} <= set(fetch["further_steps"])
+    text = json.dumps(result)
+    assert "SamParent" not in text
+    _no_secrets(result)
+
+    # The lock uses it too: a new SISU session is replayed again first.
+    rig._sisu.forget_tokens()
+    locked = await rig.async_lock_platform(CHILD, "Xbox", _hours(3))
+    assert locked["lock_path"] == "xapprove"
+
+
+async def test_the_proxy_ways_are_tried_in_turn(rig, server):
+    server.web_page = True
+    server.proxy_accepts = lambda h, sid: "Authorization" not in h and "Signature" not in h
+    server.accepts = lambda h: _session_of(h) in server.done_sessions and "Signature" in h
+    result = await rig.async_probe_xapprove(True)
+
+    assert result["proxy_way"] == "page_none_unsigned"
+    steps = result["steps"]
+    for name in ("page_xbl_signed", "page_none_signed", "page_sig_signed", "page_xbl_unsigned"):
+        assert steps[f"sisu_proxy[webview|{name}|ReadAccount]"]["status"] == 401
+    assert result["working_method"] == "webview_xsts_signed"
+    _no_secrets(result)
+
+
+async def test_reauthorizing_after_the_web_view(rig, server):
+    server.web_page = True
+    server.web_page_after_done = False
+    # Only a session made after one was finished is accepted.
+    server.accepts = lambda h: _session_of(h) in server.fresh_sessions and "Signature" in h
+    result = await rig.async_probe_xapprove(True)
+
+    assert result["working_method"] == "webview_reauth_xsts_signed"
+    after = result["steps"]["sisu_authorize[webview_reauth][after]"]
+    assert after["status"] == 200 and after["web_page"] is None
+    _no_secrets(result)
+
+
+async def test_no_proxy_way_answers(rig, server):
+    server.web_page = True
+    server.proxy_accepts = lambda h, sid: False
+    server.accepts = lambda h: False
+    result = await rig.async_probe_xapprove(True)
+
+    assert result["proxy_way"] == ""
+    assert result["steps"]["web_view[webview]"] == {"proxy_way": None}
+    # Not swept again for the second web view way.
+    assert result["steps"]["web_view[webview_reauth]"] == {"skipped": "no proxy way answered before"}
+    # The six page ways and the two with the authenticate session id.
+    assert server.proxy_calls == ["ReadAccount"] * 8
+    assert result["working_method"] is None
+    _no_secrets(result)
+
+
+async def test_without_a_web_page_nothing_is_replayed(rig, server):
+    server.accepts = lambda h: False
+    result = await rig.async_probe_xapprove(True)
+    assert result["steps"]["web_view[webview]"] == {"skipped": "no WebPage in SISU's answer"}
+    assert server.proxy_calls == []
+
+
+def test_a_web_page_is_described_without_its_values():
+    page = xbox_sisu.parse_web_page(
+        "https://sisu.xboxlive.com/client/v68/2535400000000002/consent/index.html"
+        "?sid=abc&sig=eyJhbGciOi.x.y#token=1&state=2"
+    )
+    assert page.sid == "abc" and page.sig == "eyJhbGciOi.x.y"
+    facts = page.facts
+    assert facts["path"] == "/client/v68/<number>/consent/index.html" and facts["view"] == "consent"
+    assert facts["fragment_keys"] == ["state", "token"]
+    assert facts["sig_shape"] == {"length": 14, "base64_like": False, "dots": 2, "jwt_like": True}
+    assert "abc" not in json.dumps(facts) and "eyJ" not in json.dumps(facts)
+    assert xbox_sisu.parse_web_page(None) is None

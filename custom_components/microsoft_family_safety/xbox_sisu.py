@@ -54,7 +54,7 @@ import secrets
 import struct
 import time
 from typing import Any, Awaitable, Callable
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 import uuid
 
 import aiohttp
@@ -71,6 +71,7 @@ from .xapprove import (
     XboxTokens,
     _call,
     _not_after,
+    _call_text,
     _valid,
     redact,
     _xerr,
@@ -416,6 +417,10 @@ class SisuProfile:
     ucs_form: str = "raw"
     prompts: bool = False
     contract: str | None = "1"
+    #: Replay the web view's proxy reads (WebPage) after authorize, as the
+    #: app does, before the XSTS; ``reauth``: authorize once more after.
+    webview: bool = False
+    reauth: bool = False
 
 
 PLAIN_PROFILE = SisuProfile("")
@@ -435,7 +440,15 @@ def _ucs_profiles() -> list[SisuProfile]:
 
 #: The plain profile, then the UCS ones, the app's (no contract, UserPrompts)
 #: first.
-SISU_PROFILES: dict[str, SisuProfile] = {p.name: p for p in [PLAIN_PROFILE, *_ucs_profiles()]}
+SISU_PROFILES: dict[str, SisuProfile] = {
+    p.name: p
+    for p in [
+        PLAIN_PROFILE,
+        SisuProfile("webview", webview=True),
+        SisuProfile("webview_reauth", webview=True, reauth=True),
+        *_ucs_profiles(),
+    ]
+}
 #: The consent service scopes the app asks for before sisu/authorize.
 UCS_CHECKIN_SCOPE = "https://consentservice.microsoft.com/checkin/UnifiedUserConsent.Read"
 UCS_WEB_SCOPE = "https://consentservice.microsoft.com/web/UnifiedUserConsent.ReadWrite"
@@ -453,6 +466,7 @@ async def async_sisu_authorize(
     facts: dict | None = None,
     profile: SisuProfile = PLAIN_PROFILE,
     ucs: tuple[str, str] | None = None,
+    step: str | None = None,
 ) -> XboxTokens:
     body: dict[str, Any] = {
         "AccessToken": f"t={msa_access_token}",
@@ -470,10 +484,11 @@ async def async_sisu_authorize(
         body["UcsWebToken"] = f"{prefix}{ucs[1]}"
     if profile.prompts:
         body["UserPrompts"] = []
-    step = sisu_step(profile)
+    step = step or sisu_step(profile)
     status, payload, headers = await _signed_post(
         session, key, SISU_AUTHORIZE_URL, body, step, facts, contract=profile.contract
     )
+    page = parse_web_page(payload.get("WebPage")) if isinstance(payload, dict) else None
     auth = payload.get("AuthorizationToken") if isinstance(payload, dict) else None
     xui = _xui(auth)
     title = payload.get("TitleToken") if isinstance(payload, dict) and isinstance(payload.get("TitleToken"), dict) else {}
@@ -489,6 +504,7 @@ async def async_sisu_authorize(
             "title_xti_keys": sorted(str(k) for k in xti),
             "title_id": redact(_title_id(xti) or "") or None,
             "response_keys": sorted(str(k) for k in payload) if isinstance(payload, dict) else None,
+            "web_page": page.facts if page else None,
         })
         if profile.ucs:
             facts[step]["ucs_sent"] = ucs is not None
@@ -505,6 +521,7 @@ async def async_sisu_authorize(
             xui_keys=tuple(sorted(str(k) for k in xui)),
             device_token=device if isinstance(device, str) else "",
             title_id=_title_id(xti),
+            web_page=page,
         )
     if status and 400 <= status < 500:
         raise XapproveRefused(step, status, _xerr(payload, headers))
@@ -516,10 +533,10 @@ SISU_AUTHENTICATE_URL = "https://sisu.xboxlive.com/authenticate"
 
 async def async_sisu_authenticate_probe(
     session: aiohttp.ClientSession, key: ProofKey, device_token: str, title_id: str | None
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], str | None]:
     """probe_xapprove only: one signed sisu/authenticate as the app sends it,
-    to see what it answers. Booleans and names only: never the session id or
-    the redirect URL. Nothing is kept."""
+    to see what it answers: (facts, its session id). The facts are booleans
+    and names only, never the session id or the redirect URL."""
     _verifier, challenge = new_pkce()
     body: dict[str, Any] = {"AppId": CLIENT_ID}
     if title_id:
@@ -551,7 +568,10 @@ async def async_sisu_authenticate_probe(
         "session_id_header": any(str(n).lower() == "x-sessionid" for n in headers),
         "response_header_names": sorted(str(n) for n in headers),
     })
-    return result
+    sid = next((str(v) for n, v in headers.items() if str(n).lower() == "x-sessionid"), None)
+    if sid is None and isinstance(payload, dict) and isinstance(payload.get("SessionId"), str):
+        sid = payload["SessionId"]
+    return result, sid
 
 
 class XstsVariantSkipped(XapproveError):
@@ -665,6 +685,194 @@ async def async_xsts_authorize(
 
 
 # ----------------------------------------------------------------------
+# The SISU web view ("WebPage" in sisu/authorize's answer)
+# ----------------------------------------------------------------------
+#
+# Live 2026-11-08 every sisu/authorize answered a WebPage. In the app's
+# capture the app then opened it (sisu.xboxlive.com/client/v68/<app id>/view/
+# index.html?MS-CV&redirect&sid&sig&state), the page POSTed
+# sisu.xboxlive.com/proxy?sessionid=<sid> (x-xbl-contract-version 3) with
+# {"ReadAccount":{}} and then {"ReadProfile":{}}, and only after that did
+# the app ask for its XSTS tokens. How the page authorizes those POSTs is
+# not in the capture: the ways below are guesses (see ProxyWay).
+
+SISU_PROXY_URL = "https://sisu.xboxlive.com/proxy"
+PROXY_READS = ("ReadAccount", "ReadProfile")
+#: Words of a further step the page could ask for (reported, never called).
+_FURTHER_STEP = re.compile(
+    r"\b((?:Read|Write|Create|Accept|Set|Update|Complete|Finish|Claim|Change|Reserve|Verify|Consent)"
+    r"[A-Z][A-Za-z]{2,40})\b"
+)
+_SCRIPT_SRC = re.compile(r"<script[^>]+src=[\"']([^\"']+)[\"']", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class WebPage:
+    """The parts of a WebPage URL that matter. Never logged; ``facts`` is
+    what may be shown (names, shapes, no values)."""
+
+    url: str = field(repr=False)
+    sid: str | None = field(default=None, repr=False)
+    sig: str | None = field(default=None, repr=False)
+    facts: dict[str, Any] = field(default_factory=dict)
+
+
+def _redact_path(path: str) -> str:
+    """A URL path with each segment redacted on its own (a whole path is
+    long enough to look like a token)."""
+    return "/".join(redact(segment) for segment in path.split("/"))
+
+
+def _shape(value: str) -> dict[str, Any]:
+    """What a value looks like, not what it is."""
+    return {
+        "length": len(value),
+        "base64_like": bool(re.fullmatch(r"[A-Za-z0-9+/_=-]+", value)),
+        "dots": value.count("."),
+        "jwt_like": value.startswith("eyJ"),
+    }
+
+
+def parse_web_page(url: Any) -> WebPage | None:
+    """A WebPage URL and its non-secret facts: host, path (ids redacted),
+    the segment that names the page (before the file name), query and
+    fragment key names, whether ``sid``/``sig`` are present and the shape
+    of ``sig``, the scheme of ``redirect``."""
+    if not isinstance(url, str) or not url:
+        return None
+    parts = urlsplit(url)
+    query = parse_qs(parts.query, keep_blank_values=True)
+    fragment = parse_qs(parts.fragment, keep_blank_values=True)
+    segments = [s for s in parts.path.split("/") if s]
+    view = segments[-2] if len(segments) >= 2 and "." in segments[-1] else (segments[-1] if segments else None)
+    sid = (query.get("sid") or [None])[0] or None
+    sig = (query.get("sig") or [None])[0] or None
+    redirect = (query.get("redirect") or [""])[0]
+    facts: dict[str, Any] = {
+        "host": parts.netloc,
+        "path": _redact_path(parts.path),
+        "view": redact(view) if view else None,
+        "query_keys": sorted(query),
+        "fragment_keys": sorted(fragment),
+        "sid_present": bool(sid),
+        "sig_present": bool(sig),
+        "sig_shape": _shape(sig) if sig else None,
+        "redirect_scheme": redact(urlsplit(redirect).scheme) if redirect else None,
+    }
+    return WebPage(url, sid, sig, facts)
+
+
+@dataclass(frozen=True)
+class ProxyWay:
+    """One guess at how the web view authorizes its proxy POSTs.
+
+    ``sid``: ``web_page`` (the WebPage's ``sid``) or ``authenticate`` (the
+    X-SessionId of a sisu/authenticate); ``auth``: ``none``, ``xbl`` (SISU's
+    ``XBL3.0 x=<uhs>;<AuthorizationToken>``) or ``sig`` (the WebPage's
+    ``sig`` as the Authorization value, a guess); ``signed``: the ProofKey
+    Signature header.
+    """
+
+    name: str
+    sid: str = "web_page"
+    auth: str = "xbl"
+    signed: bool = True
+
+
+PROXY_WAYS: list[ProxyWay] = [
+    ProxyWay("page_xbl_signed"),
+    ProxyWay("page_none_signed", auth="none"),
+    ProxyWay("page_sig_signed", auth="sig"),
+    ProxyWay("page_xbl_unsigned", signed=False),
+    ProxyWay("page_none_unsigned", auth="none", signed=False),
+    ProxyWay("page_sig_unsigned", auth="sig", signed=False),
+    ProxyWay("authn_xbl_signed", sid="authenticate"),
+    ProxyWay("authn_none_signed", sid="authenticate", auth="none"),
+]
+
+
+def _key_names(payload: Any) -> dict[str, Any] | list[str] | None:
+    """The key names of an answer, one level deep (no values)."""
+    if not isinstance(payload, dict):
+        return None
+    return {
+        str(k): sorted(str(x) for x in v) if isinstance(v, dict) else type(v).__name__
+        for k, v in payload.items()
+    }
+
+
+def _further_steps(*texts: Any) -> list[str]:
+    found: set[str] = set()
+    for text in texts:
+        found.update(_FURTHER_STEP.findall(json.dumps(text) if not isinstance(text, str) else text))
+    return sorted(found)[:40]
+
+
+async def async_sisu_proxy(
+    session: aiohttp.ClientSession,
+    key: ProofKey,
+    sid: str,
+    read: str,
+    authorization: str | None,
+    signed: bool,
+    step: str,
+    facts: dict | None,
+) -> bool:
+    """One proxy POST of the web view (a read: ReadAccount or ReadProfile).
+    True on a 2xx. Facts: status, XErr, key names, further step words."""
+    url = f"{SISU_PROXY_URL}?{urlencode({'sessionid': sid})}"
+    raw = json.dumps({read: {}}, separators=(",", ":")).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "x-xbl-contract-version": "3",
+    }
+    if authorization:
+        headers["Authorization"] = authorization
+    if signed:
+        headers["Signature"] = key.sign("POST", url, authorization or "", raw)
+    status, payload, resp_headers = await _call(session, "POST", url, data=raw, headers=headers)
+    _record(facts, step, {
+        "status": status,
+        "xerr": _xerr(payload, resp_headers),
+        "response_keys": _key_names(payload),
+        "further_steps": _further_steps(_key_names(payload)) if payload is not None else [],
+    })
+    return status is not None and 200 <= status < 300
+
+
+async def async_web_page_probe(session: aiohttp.ClientSession, page: WebPage) -> dict[str, Any]:
+    """probe_xapprove: GET the WebPage (read-only) and up to three of its
+    scripts on the same host; report the status, content type, the script
+    paths (redacted) and the proxy-like command words found in them."""
+    out: dict[str, Any] = {}
+    try:
+        status, _payload, headers, text = await _call_text(session, "GET", page.url)
+    except XapproveError as err:
+        return {"error": str(err)}
+    content_type = next((v for k, v in headers.items() if str(k).lower() == "content-type"), None)
+    scripts = _SCRIPT_SRC.findall(text or "")
+    out.update({
+        "status": status,
+        "content_type": str(content_type)[:80] if content_type else None,
+        "scripts": [_redact_path(urlsplit(s).path)[:120] for s in scripts[:10]],
+    })
+    texts = [text or ""]
+    base = urlsplit(page.url)
+    for src in scripts[:3]:
+        target = urljoin(page.url, src)
+        if urlsplit(target).netloc != base.netloc:
+            continue
+        try:
+            _s, _p, _h, script = await _call_text(session, "GET", target)
+        except XapproveError:
+            continue
+        texts.append(script or "")
+    out["further_steps"] = _further_steps(*texts)
+    return out
+
+
+# ----------------------------------------------------------------------
 # The stored sign-in
 # ----------------------------------------------------------------------
 
@@ -712,6 +920,13 @@ class XboxSisuAuth:
         self.preferred_variant: str | None = None
         #: The title id from SISU's TitleToken (xti tid), when one came.
         self.title_id: str | None = None
+        #: The session id of the diagnostic sisu/authenticate (memory only).
+        self.authenticate_sid: str | None = None
+        #: The ProxyWay that answered the web view's reads; "" when none did
+        #: (the replay is then not swept again); None before any try.
+        self.proxy_way: str | None = None
+        #: probe_xapprove: also fetch the WebPage and its scripts.
+        self.diagnose = False
         self._access: dict[str, MsaTokens] = {}
         self._lock = asyncio.Lock()
         self.token_facts: dict[str, Any] = {}
@@ -836,7 +1051,52 @@ class XboxSisuAuth:
         )
         if tokens.title_id:
             self.title_id = tokens.title_id
+        if profile.webview:
+            await self._async_web_view(session, profile, tokens)
+            if profile.reauth:
+                tokens = await async_sisu_authorize(
+                    session, self.key, msa.access_token, self._device[0], self.token_facts, profile,
+                    ucs, step=f"{sisu_step(profile)}[after]",
+                )
         return tokens
+
+    async def _async_web_view(self, session: aiohttp.ClientSession, profile: SisuProfile, tokens: XboxTokens) -> None:
+        """Replay the web view's proxy reads for SISU's WebPage (see ProxyWay):
+        each way in turn until ReadAccount answers, then ReadProfile the same
+        way. Read-only: nothing on the account is created or accepted."""
+        prefix = f"web_view[{profile.name}]"
+        page = tokens.web_page
+        if page is None:
+            _record(self.token_facts, prefix, {"skipped": "no WebPage in SISU's answer"})
+            return
+        if self.diagnose and "web_page_fetch" not in self.token_facts:
+            _record(self.token_facts, "web_page_fetch", await async_web_page_probe(session, page))
+        if self.proxy_way == "":
+            _record(self.token_facts, prefix, {"skipped": "no proxy way answered before"})
+            return
+        ways = list(PROXY_WAYS)
+        if self.proxy_way:
+            ways.sort(key=lambda w: w.name != self.proxy_way)
+        for way in ways:
+            sid = page.sid if way.sid == "web_page" else self.authenticate_sid
+            if not sid or (way.auth == "sig" and not page.sig):
+                continue
+            auth = {"none": None, "xbl": tokens.header(), "sig": page.sig}[way.auth]
+            ok = await async_sisu_proxy(
+                session, self.key, sid, PROXY_READS[0], auth, way.signed,
+                f"sisu_proxy[{profile.name}|{way.name}|{PROXY_READS[0]}]", self.token_facts,
+            )
+            if not ok:
+                continue
+            await async_sisu_proxy(
+                session, self.key, sid, PROXY_READS[1], auth, way.signed,
+                f"sisu_proxy[{profile.name}|{way.name}|{PROXY_READS[1]}]", self.token_facts,
+            )
+            self.proxy_way = way.name
+            _record(self.token_facts, prefix, {"proxy_way": way.name})
+            return
+        self.proxy_way = ""
+        _record(self.token_facts, prefix, {"proxy_way": None})
 
     async def _async_sisu(self, force: bool, profile_name: str = "") -> XboxTokens:
         """SISU's tokens of a profile, renewed when they ran out. The caller
@@ -870,7 +1130,10 @@ class XboxSisuAuth:
         async with self._lock:
             session = self._session_getter()
             await self._async_device(session)
-            return await async_sisu_authenticate_probe(session, self.key, self._device[0], self.title_id)
+            facts, self.authenticate_sid = await async_sisu_authenticate_probe(
+                session, self.key, self._device[0], self.title_id
+            )
+            return facts
 
     def sign(self, method: str, url: str, authorization: str, body: bytes) -> str:
         return self.key.sign(method, url, authorization, body)

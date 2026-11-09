@@ -982,6 +982,9 @@ class XboxXapproveMixin:
         client = XapproveClient(lambda: session, sisu=self._sisu)
         # Fresh tokens, so that every step shows up in ``steps``.
         self._sisu.forget_tokens()
+        # A fresh web view replay, and the WebPage itself fetched (read-only).
+        self._sisu.proxy_way = None
+        self._sisu.diagnose = True
         self._sisu.token_facts = steps
         try:
             tokens = await client.async_tokens()
@@ -1016,6 +1019,8 @@ class XboxXapproveMixin:
             result["xsts"] = xsts
             result["xsts_xui_keys"] = {rp: v["xui_keys"] for rp, v in xsts.items()}
         self._sisu.token_facts = {}
+        self._sisu.diagnose = False
+        result["proxy_way"] = self._sisu.proxy_way
         return result
 
     async def _async_probe_family_and_read(
