@@ -32,9 +32,13 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.util import dt as dt_util
 
 from ._pyfamilysafety_compat import apply_patches, is_stale_roster_error
-from .api_client import FamilySafetyWebAPI
+from .api_client import FamilySafetyWebAPI, MOBILE_OVERRIDE_CANCEL
 from .app_pause import AppPauser
 from .xbox_mobile_lock import XboxMobileLockMixin
+from .xbox_mobile_override import (
+    XboxMobileOverrideMixin,
+    XboxMobileOverrideUnavailable,
+)
 from .xbox_token_probe import async_probe_xbox_token
 from .app_usage import EVENT_APP_USAGE, AppUsageGrowthTracker
 from . import site_sync
@@ -56,6 +60,7 @@ from .const import (
     CONF_STRICT_MODE,
     DEFAULT_APP_USAGE_SENSORS,
     LOCK_PATH_WEB,
+    LOCK_PATH_MOBILE_OVERRIDE,
     CONF_XBOX_FEATURES,
     DEFAULT_STRICT_MODE,
     EVENT_LOCK_REASSERTED,
@@ -180,7 +185,7 @@ def _ms_to_minutes(milliseconds: int | float | None) -> int:
 
 
 class FamilySafetyDataUpdateCoordinator(
-    XboxMobileLockMixin, DataUpdateCoordinator[dict[str, Any]]
+    XboxMobileLockMixin, XboxMobileOverrideMixin, DataUpdateCoordinator[dict[str, Any]]
 ):
     """Fetch and coordinate Microsoft Family Safety state."""
 
@@ -286,6 +291,7 @@ class FamilySafetyDataUpdateCoordinator(
         #: hold key -> when strict mode last placed that lock again.
         self._last_reassert: dict[str, datetime] = {}
         self._init_xbox_mobile_lock(entry)
+        self._init_xbox_mobile_override(entry)
         if not self._mobile_only:
             ir.async_delete_issue(hass, DOMAIN, f"{XBOX_LOCK_ISSUE}_{entry.entry_id}")
 
@@ -953,6 +959,16 @@ class FamilySafetyDataUpdateCoordinator(
         self._check_platform_lockable(platform)
         requested = dt_util.as_utc(valid_until or (dt_util.now() + timedelta(hours=24)))
         key = self._hold_key(account_id, platform)
+        if platform.lower() == "xbox" and self._xbox_mobile_override_enabled:
+            # Preferred headless path: a mobile device-limits override. Falls
+            # through to the web/schedule paths when it cannot be used.
+            try:
+                return await self._async_lock_xbox_override(account_id, requested, key)
+            except XboxMobileOverrideUnavailable as err:
+                _LOGGER.info(
+                    "Xbox mobile override not used for %s (%s); using the web/"
+                    "schedule path", account_id, err,
+                )
         fallback = platform.lower() == "xbox" and self._xbox_mobile_fallback
         if fallback:
             async with self._hold_lock(key):
@@ -1160,6 +1176,12 @@ class FamilySafetyDataUpdateCoordinator(
         if account is None:
             raise ValueError(f"Account {account_id} not found")
         self._check_platform_lockable(platform)
+        if platform.lower() == "xbox" and self._xbox_mobile_override_enabled:
+            # Extra time through the mobile allow override (experimental, and
+            # it needs no web session, so it skips the web-only Xbox check).
+            return await self._async_bonus_xbox_override(
+                account_id, dt_util.as_utc(until), self._hold_key(account_id, platform)
+            )
         self._check_xbox_bonus_possible(platform, "give")
         until = dt_util.as_utc(until)
         key = self._hold_key(account_id, platform)
@@ -1225,6 +1247,24 @@ class FamilySafetyDataUpdateCoordinator(
         if account is None:
             raise ValueError(f"Account {account_id} not found")
         self._check_platform_lockable(platform)
+        if platform.lower() == "xbox" and self._xbox_mobile_override_enabled:
+            key = self._hold_key(account_id, platform)
+            async with self._hold_lock(key):
+                await self._async_load_bonuses()
+                if self.web_api is not None:
+                    try:
+                        await self.web_api.set_mobile_device_override(
+                            account_id, "Xbox", MOBILE_OVERRIDE_CANCEL, dt_util.utcnow()
+                        )
+                    except Exception as err:
+                        raise HomeAssistantError(
+                            f"Could not cancel the Xbox extra time ({err})."
+                        ) from err
+                removed = self._bonuses.pop(key, None) is not None
+                if removed:
+                    await self._bonus_store.async_save(self._bonuses)
+            await self.async_request_refresh()
+            return {"platform": "Xbox", "cancelled": True, "lock_path": LOCK_PATH_MOBILE_OVERRIDE}
         self._check_xbox_bonus_possible(platform, "cancel")
         key = self._hold_key(account_id, platform)
         async with self._hold_lock(key):
@@ -1267,6 +1307,9 @@ class FamilySafetyDataUpdateCoordinator(
         async with self._hold_lock(key):
             await self._async_load_platform_holds()
             hold = self._platform_holds.get(key)
+            if platform.lower() == "xbox" and self._is_override_hold(hold):
+                await self._async_release_xbox_override(account_id, key, hold)
+                return
             if platform.lower() == "xbox" and self._is_mobile_hold(hold):
                 await self._async_unlock_xbox_mobile(account_id, key, hold)
                 return
@@ -1309,6 +1352,8 @@ class FamilySafetyDataUpdateCoordinator(
             async with self._hold_lock(key):
                 await self._async_load_platform_holds()
                 hold = self._platform_holds.get(key)
+                if self._is_override_hold(hold):
+                    return await self._async_unlock_xbox_override(account_id, key, hold)
                 if self._is_mobile_hold(hold):
                     return await self._async_unlock_xbox_mobile(account_id, key, hold)
                 if hold is None and self._xbox_mobile_fallback and self._xbox_web_unavailable():

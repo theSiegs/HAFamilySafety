@@ -768,3 +768,54 @@ probe_xbox_token:
       default: false
       selector:
         boolean:
+
+probe_xbox_mobile_overrides:
+  name: Probe Xbox mobile overrides (diagnostic)
+  description: "Administrators only. Reads each child's Family Safety device-limits override state over the mobile API (GET only, nothing is changed) and answers with non-secret facts: whether the child has an Xbox in device limits, whether it is blocked now, and the override types and counts. No tokens, Xbox user ids, gamertags or device ids are returned or logged."
+  fields:
+    entry_id:
+      name: Config entry
+      description: The Microsoft Family Safety entry to use. Optional with a single entry.
+      required: false
+      selector:
+        config_entry:
+          integration: microsoft_family_safety
+    confirm_risk:
+      name: Confirm the risk
+      description: "Must be true. Reads live state from Microsoft for every child."
+      required: true
+      default: false
+      selector:
+        boolean:
+
+test_xbox_mobile_override:
+  name: Test Xbox mobile override (diagnostic)
+  description: "Administrators only. Confirms the mobile Xbox override path live. With dry true it only reads and reports which children's Xbox has no active hold (pick one of those). Otherwise, for the given child whose Xbox has no active hold, it sets a short self-clearing block (~2-3 min), reads it back, then cancels it and reads back to confirm it is gone. It always clears what it set and never leaves the Xbox blocked; if the Xbox already has an active hold it aborts and changes nothing. Returns a non-secret trace."
+  fields:
+    entry_id:
+      name: Config entry
+      description: The Microsoft Family Safety entry to use. Optional with a single entry.
+      required: false
+      selector:
+        config_entry:
+          integration: microsoft_family_safety
+    child:
+      name: Child
+      description: The child to test, by first name or account id. Required unless dry is true.
+      required: false
+      selector:
+        text:
+    dry:
+      name: Dry run (read only)
+      description: "When true, nothing is written: it only reports which children's Xbox is safe to test."
+      required: false
+      default: false
+      selector:
+        boolean:
+    confirm_risk:
+      name: Confirm the risk
+      description: "Must be true. A non-dry run writes a short, self-clearing Xbox block to Microsoft."
+      required: true
+      default: false
+      selector:
+        boolean:

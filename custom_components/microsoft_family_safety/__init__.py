@@ -47,6 +47,8 @@ from .const import (
     SERVICE_ADD_TIME_BONUS,
     SERVICE_CANCEL_TIME_BONUS,
     SERVICE_PROBE_XBOX_TOKEN,
+    SERVICE_PROBE_XBOX_MOBILE_OVERRIDES,
+    SERVICE_TEST_XBOX_MOBILE_OVERRIDE,
     CONF_ALLOWED_USERS,
 )
 from .coordinator import FamilySafetyDataUpdateCoordinator
@@ -172,6 +174,18 @@ SERVICE_CANCEL_TIME_BONUS_SCHEMA = child_schema({
 
 SERVICE_PROBE_XBOX_TOKEN_SCHEMA = vol.Schema({
     vol.Optional("entry_id"): cv.string,
+    vol.Optional("confirm_risk", default=False): cv.boolean,
+})
+
+SERVICE_PROBE_XBOX_MOBILE_OVERRIDES_SCHEMA = vol.Schema({
+    vol.Optional("entry_id"): cv.string,
+    vol.Optional("confirm_risk", default=False): cv.boolean,
+})
+
+SERVICE_TEST_XBOX_MOBILE_OVERRIDE_SCHEMA = vol.Schema({
+    vol.Optional("entry_id"): cv.string,
+    vol.Optional("child"): cv.string,
+    vol.Optional("dry", default=False): cv.boolean,
     vol.Optional("confirm_risk", default=False): cv.boolean,
 })
 
@@ -424,9 +438,8 @@ def _register_services(hass: HomeAssistant) -> None:
         )
 
 
-    async def probe_xbox_token(call: ServiceCall) -> dict:
-        """Administrators only: never per child, the entry's own sign-in."""
-        await async_require_admin(hass, call)
+    def _entry_coordinator(call: ServiceCall) -> FamilySafetyDataUpdateCoordinator:
+        """The coordinator for ``entry_id``, or the only one. Admin services."""
         coordinators = {
             entry_id: c for entry_id, c in hass.data.get(DOMAIN, {}).items()
             if isinstance(c, FamilySafetyDataUpdateCoordinator)
@@ -436,18 +449,52 @@ def _register_services(hass: HomeAssistant) -> None:
             coordinator = coordinators.get(entry_id)
             if coordinator is None:
                 raise ServiceValidationError(f"No loaded Microsoft Family Safety entry {entry_id}.")
-        elif len(coordinators) == 1:
-            coordinator = next(iter(coordinators.values()))
-        else:
-            raise ServiceValidationError(
-                "Give entry_id: there is not exactly one Microsoft Family Safety entry."
-            )
-        return await coordinator.async_probe_xbox_token(call.data["confirm_risk"])
+            return coordinator
+        if len(coordinators) == 1:
+            return next(iter(coordinators.values()))
+        raise ServiceValidationError(
+            "Give entry_id: there is not exactly one Microsoft Family Safety entry."
+        )
+
+    async def probe_xbox_token(call: ServiceCall) -> dict:
+        """Administrators only: never per child, the entry's own sign-in."""
+        await async_require_admin(hass, call)
+        return await _entry_coordinator(call).async_probe_xbox_token(
+            call.data["confirm_risk"]
+        )
 
     hass.services.async_register(
         DOMAIN, SERVICE_PROBE_XBOX_TOKEN,
         guard_service(hass, probe_xbox_token),
         schema=SERVICE_PROBE_XBOX_TOKEN_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
+    )
+
+    async def probe_xbox_mobile_overrides(call: ServiceCall) -> dict:
+        """Administrators only: read-only GET of each child's override state."""
+        await async_require_admin(hass, call)
+        return await _entry_coordinator(call).async_probe_xbox_mobile_overrides(
+            call.data["confirm_risk"]
+        )
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_PROBE_XBOX_MOBILE_OVERRIDES,
+        guard_service(hass, probe_xbox_mobile_overrides),
+        schema=SERVICE_PROBE_XBOX_MOBILE_OVERRIDES_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
+    )
+
+    async def test_xbox_mobile_override(call: ServiceCall) -> dict:
+        """Administrators only: bounded, self-clearing live write test."""
+        await async_require_admin(hass, call)
+        return await _entry_coordinator(call).async_test_xbox_mobile_override(
+            call.data["confirm_risk"], call.data.get("child"), call.data["dry"]
+        )
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_TEST_XBOX_MOBILE_OVERRIDE,
+        guard_service(hass, test_xbox_mobile_override),
+        schema=SERVICE_TEST_XBOX_MOBILE_OVERRIDE_SCHEMA,
         supports_response=SupportsResponse.ONLY,
     )
 

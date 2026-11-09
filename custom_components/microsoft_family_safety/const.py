@@ -45,9 +45,18 @@ EVENT_LOCK_REASSERTED: Final = f"{DOMAIN}_lock_reasserted"
 CONF_XBOX_LOCK_MOBILE_FALLBACK: Final = "xbox_lock_mobile_fallback"
 DEFAULT_XBOX_LOCK_MOBILE_FALLBACK: Final = False
 XBOX_SCHEDULE_NOT_RESTORED_ISSUE: Final = "xbox_schedule_not_restored"
+# Xbox lock through a Family Safety *mobile* device-limits override
+# (/v4/devicelimits/{child}/overrides, the pyfamilysafety endpoint) instead of
+# rewriting today's schedule day. Default off: installing the branch changes
+# nothing until this is ticked (or the override path is confirmed live). When
+# on, an Xbox lock prefers a BlockUntil override, unlock cancels it, and extra
+# time sends an allow override; the schedule rewrite stays as the fallback.
+CONF_XBOX_MOBILE_OVERRIDE: Final = "xbox_mobile_override"
+DEFAULT_XBOX_MOBILE_OVERRIDE: Final = False
 #: How an Xbox lock was placed (``lock_path`` attribute and service answers).
 LOCK_PATH_WEB: Final = "web"
 LOCK_PATH_MOBILE_SCHEDULE: Final = "mobile_schedule"
+LOCK_PATH_MOBILE_OVERRIDE: Final = "mobile_override"
 #: Fired once for each pending request (more time, an app) that appears.
 EVENT_REQUEST: Final = f"{DOMAIN}_request"
 #: Fired once when a pending request leaves the list (approved, denied, expired).
@@ -144,6 +153,8 @@ SERVICE_ADD_TIME_BONUS: Final = "add_time_bonus"
 SERVICE_CANCEL_TIME_BONUS: Final = "cancel_time_bonus"
 SERVICE_RESUME_APP: Final = "resume_app"
 SERVICE_PROBE_XBOX_TOKEN: Final = "probe_xbox_token"
+SERVICE_PROBE_XBOX_MOBILE_OVERRIDES: Final = "probe_xbox_mobile_overrides"
+SERVICE_TEST_XBOX_MOBILE_OVERRIDE: Final = "test_xbox_mobile_override"
 
 ALL_SERVICES: Final = [
     SERVICE_BLOCK_APP,
@@ -172,6 +183,8 @@ ALL_SERVICES: Final = [
     SERVICE_ADD_TIME_BONUS,
     SERVICE_CANCEL_TIME_BONUS,
     SERVICE_PROBE_XBOX_TOKEN,
+    SERVICE_PROBE_XBOX_MOBILE_OVERRIDES,
+    SERVICE_TEST_XBOX_MOBILE_OVERRIDE,
 ]
 
 # Platforms

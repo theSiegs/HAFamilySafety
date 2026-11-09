@@ -43,6 +43,19 @@ _XBOX_REPORT_SLACK_SECONDS = 30
 _XBOX_REPORT_NO_DATA_BACKOFF_SECONDS = (60 * 60, 6 * 60 * 60, 24 * 60 * 60)
 
 _BASE_URL = "https://mobileaggregator.family.microsoft.com/api"
+
+# Family Safety mobile device-limits override types, as pyfamilysafety sends
+# them to POST /v4/devicelimits/{child}/overrides (pantherale0/pyfamilysafety,
+# pyfamilysafety/enum.py OverrideType.__str__ and account.py override_device).
+# CONFIRMED by that library: a block-until and a cancel.
+MOBILE_OVERRIDE_BLOCK = "BlockUntil"
+MOBILE_OVERRIDE_CANCEL = "Cancel"
+# INFERRED, not in pyfamilysafety: the library models only block/cancel, so the
+# value for "allow / grant extra time now" is a best guess by analogy with the
+# allowUntil the web override reports. Change this one line after the live probe
+# tells us the real token.
+MOBILE_OVERRIDE_ALLOW = "AllowUntil"
+
 _APP_VERSION = "v 1.26.0.1001"
 _USER_AGENT = f"Family Safety-prod/({_APP_VERSION}) Android/33 google/Pixel 4 XL"
 _BROWSER_USER_AGENT = (
@@ -2254,6 +2267,136 @@ class FamilySafetyWebAPI:
             )
             self._mobile_schedule_cache.pop(str(child_id), None)
         return True
+
+    # ------------------------------------------------------------------
+    # Mobile device-limits overrides (/v4/devicelimits/{child}/overrides).
+    #
+    # The Family Safety mobile API's own "override a device's screen-time now"
+    # endpoint, as used by pyfamilysafety (pantherale0/pyfamilysafety,
+    # const.py ENDPOINTS "override_device_restriction"/"get_override_device_
+    # restrictions" -> {BASE_URL}/v4/devicelimits/{USER_ID}/overrides, api.py
+    # send_request with platform="ALL" -> Plat-Info: ALL, account.py
+    # override_device for the body). It runs on the same long-lived mobile
+    # token as the schedules, so it needs no Family web session.
+    #
+    # The POST body (account.py override_device):
+    #   {"target": "Xbox", "overrideType": "BlockUntil"|"Cancel",
+    #    "validUntil": "%Y-%m-%dT%H:%M:%S.000%z", "culture": ...}
+    # and the reply (and the GET) is the full override state, with a
+    # "lockablePlatforms" list of {appliesTo, overrides, devices}; a platform
+    # with a non-empty "overrides" list is blocked (account.py
+    # _update_device_blocked).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def mobile_override_valid_until(moment: datetime) -> str:
+        """Format a datetime as the overrides API wants it (e.g. ...000+0000).
+
+        pyfamilysafety uses ``%Y-%m-%dT%H:%M:%S.000%z`` but mislabels local time
+        as UTC (``helpers.standardise_datetime`` only replaces tzinfo); this
+        converts to real UTC first so the time Microsoft stores is the one meant.
+        """
+        return dt_util.as_utc(moment).strftime("%Y-%m-%dT%H:%M:%S.000%z")
+
+    async def get_mobile_device_overrides(self, child_id: str) -> dict:
+        """GET the child's device-limits overrides (all platforms), mobile token.
+
+        Returns Microsoft's object verbatim. Raises FamilySafetyWebAPIError when
+        the answer is not an object.
+        """
+        result = await self._request(
+            "GET",
+            f"/v4/devicelimits/{child_id}/overrides",
+            extra_headers={"Plat-Info": "ALL"},
+        )
+        if not isinstance(result, dict):
+            raise FamilySafetyWebAPIError("Mobile overrides response was not an object")
+        return result
+
+    async def set_mobile_device_override(
+        self,
+        child_id: str,
+        target: str,
+        override_type: str,
+        valid_until: datetime,
+        culture: str = "en-us",
+    ) -> dict:
+        """POST a device-limits override; return the full state Microsoft reads back.
+
+        ``target`` is a platform name ("Xbox", "Desktop", "Mobile"),
+        ``override_type`` one of the ``MOBILE_OVERRIDE_*`` constants. A cancel
+        ignores ``valid_until`` but the API still wants the field, so the caller
+        passes "now".
+        """
+        body = {
+            "target": target,
+            "overrideType": override_type,
+            "validUntil": self.mobile_override_valid_until(valid_until),
+            "culture": culture,
+        }
+        result = await self._request(
+            "POST",
+            f"/v4/devicelimits/{child_id}/overrides",
+            json_data=body,
+            extra_headers={"Plat-Info": "ALL"},
+        )
+        return result if isinstance(result, dict) else {}
+
+    @staticmethod
+    def summarize_mobile_overrides(
+        payload: object, target: str | None = None
+    ) -> dict[str, Any]:
+        """Non-secret summary of an overrides payload, for the probe.
+
+        ``{"platforms": {"Xbox": {"blocked": bool, "override_count": n,
+        "override_types": [...], "device_count": n, "valid_until_seconds": s}}}``.
+        Never includes device ids, tokens, gamertags or xuids -- devices become a
+        count only, and only an override's type and (parseable) seconds-until are
+        reported.
+        """
+        platforms: dict[str, Any] = {}
+        if isinstance(payload, dict):
+            lockable = payload.get("lockablePlatforms")
+            for item in lockable if isinstance(lockable, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                applies = str(item.get("appliesTo") or "")
+                if target is not None and applies.lower() != target.lower():
+                    continue
+                overrides = item.get("overrides")
+                overrides = overrides if isinstance(overrides, list) else []
+                devices = item.get("devices")
+                types: list[str] = []
+                valid_seconds: int | None = None
+                for ovr in overrides:
+                    if not isinstance(ovr, dict):
+                        continue
+                    kind = ovr.get("overrideType")
+                    if kind is not None:
+                        types.append(str(kind))
+                    seconds = FamilySafetyWebAPI._seconds_until_value(
+                        ovr.get("validUntil")
+                    )
+                    if seconds is not None:
+                        valid_seconds = seconds
+                platforms[applies or "unknown"] = {
+                    "blocked": len(overrides) > 0,
+                    "override_count": len(overrides),
+                    "override_types": sorted(set(types)),
+                    "device_count": len(devices) if isinstance(devices, list) else 0,
+                    "valid_until_seconds": valid_seconds,
+                }
+        return {
+            "platforms": platforms,
+            "lockable_platform_names": sorted(platforms),
+        }
+
+    @staticmethod
+    def _seconds_until_value(value: object) -> int | None:
+        parsed = dt_util.parse_datetime(str(value)) if value else None
+        if parsed is None:
+            return None
+        return int((dt_util.as_utc(parsed) - dt_util.utcnow()).total_seconds())
 
     async def set_mobile_screentime_allowance(
         self, child_id: str, day_of_week: int, hours: int, minutes: int

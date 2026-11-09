@@ -31,6 +31,8 @@ from .const import (
     DEFAULT_STRICT_MODE,
     CONF_XBOX_LOCK_MOBILE_FALLBACK,
     DEFAULT_XBOX_LOCK_MOBILE_FALLBACK,
+    CONF_XBOX_MOBILE_OVERRIDE,
+    DEFAULT_XBOX_MOBILE_OVERRIDE,
     CONF_APP_USAGE_SENSORS,
     DEFAULT_APP_USAGE_SENSORS,
     CONF_XBOX_FEATURES,
@@ -1526,6 +1528,13 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
                         default=self._config_entry.options.get(
                             CONF_XBOX_LOCK_MOBILE_FALLBACK,
                             DEFAULT_XBOX_LOCK_MOBILE_FALLBACK,
+                        ),
+                    ): cv.boolean,
+                    vol.Optional(
+                        CONF_XBOX_MOBILE_OVERRIDE,
+                        default=self._config_entry.options.get(
+                            CONF_XBOX_MOBILE_OVERRIDE,
+                            DEFAULT_XBOX_MOBILE_OVERRIDE,
                         ),
                     ): cv.boolean,
                     vol.Optional(
