@@ -2398,6 +2398,49 @@ class FamilySafetyWebAPI:
             return None
         return int((dt_util.as_utc(parsed) - dt_util.utcnow()).total_seconds())
 
+    @staticmethod
+    def override_shape(payload: object, target: str = "Xbox") -> dict[str, Any]:
+        """Key NAMES only from an overrides payload, for a diagnostic.
+
+        Returns the payload's top-level keys, the target platform entry's keys,
+        the union of its override entries' keys, its device count and the union
+        of its device entries' keys. **Names only** -- never a value, a device
+        id, a token or any identifier -- so the shape can be confirmed (ruling
+        out a missed bindable field) without exposing anything secret.
+        """
+        shape: dict[str, Any] = {
+            "top_level_keys": sorted(payload) if isinstance(payload, dict) else [],
+        }
+        if not isinstance(payload, dict):
+            return shape
+        lockable = payload.get("lockablePlatforms")
+        entry = None
+        for item in lockable if isinstance(lockable, list) else []:
+            if isinstance(item, dict) and str(item.get("appliesTo")).lower() == target.lower():
+                entry = item
+                break
+        if not isinstance(entry, dict):
+            shape["platform_entry_present"] = False
+            return shape
+        shape["platform_entry_present"] = True
+        shape["platform_entry_keys"] = sorted(entry)
+        overrides = entry.get("overrides")
+        shape["override_entry_keys"] = sorted({
+            str(k)
+            for ovr in (overrides if isinstance(overrides, list) else [])
+            if isinstance(ovr, dict)
+            for k in ovr
+        })
+        devices = entry.get("devices")
+        shape["device_count"] = len(devices) if isinstance(devices, list) else 0
+        shape["device_entry_keys"] = sorted({
+            str(k)
+            for dev in (devices if isinstance(devices, list) else [])
+            if isinstance(dev, dict)
+            for k in dev
+        })
+        return shape
+
     async def set_mobile_screentime_allowance(
         self, child_id: str, day_of_week: int, hours: int, minutes: int
     ) -> bool:

@@ -69,6 +69,7 @@ class FakeOverrideWeb:
     # that ships.
     summarize_mobile_overrides = staticmethod(FamilySafetyWebAPI.summarize_mobile_overrides)
     mobile_override_valid_until = staticmethod(FamilySafetyWebAPI.mobile_override_valid_until)
+    override_shape = staticmethod(FamilySafetyWebAPI.override_shape)
 
     def __init__(self, *, xbox: bool = True) -> None:
         self.has_web_cookies = True
@@ -355,6 +356,52 @@ async def test_probe_reads_each_child_without_secrets(coord, web):
 async def test_probe_needs_confirm_risk(coord):
     with pytest.raises(ServiceValidationError, match="confirm_risk"):
         await coord.async_probe_xbox_mobile_overrides(False)
+
+
+def test_override_shape_is_names_only():
+    payload = {
+        "lockablePlatforms": [
+            {"appliesTo": "Xbox",
+             "overrides": [{"overrideType": "BlockUntil", "validUntil": "2099-01-01T00:00:00.000+0000"}],
+             "devices": [{"deviceId": DEVICE_ID, "deviceName": "Console in the den"}]},
+        ]
+    }
+    shape = FamilySafetyWebAPI.override_shape(payload, "Xbox")
+    assert shape["platform_entry_present"] is True
+    assert shape["platform_entry_keys"] == ["appliesTo", "devices", "overrides"]
+    assert shape["override_entry_keys"] == ["overrideType", "validUntil"]
+    assert shape["device_count"] == 1
+    assert shape["device_entry_keys"] == ["deviceId", "deviceName"]
+    # Key names only -- no values: neither the id nor the name leaks.
+    text = json.dumps(shape)
+    assert DEVICE_ID not in text
+    assert "den" not in text.lower()
+
+
+def test_override_shape_on_this_family_has_no_devices():
+    # The shape the live probe showed: an Xbox platform with no device entries.
+    payload = {"lockablePlatforms": [
+        {"appliesTo": "Xbox", "overrides": [], "devices": []},
+    ]}
+    shape = FamilySafetyWebAPI.override_shape(payload, "Xbox")
+    assert shape["device_count"] == 0
+    assert shape["device_entry_keys"] == []
+
+
+async def test_probe_raw_shape_reports_key_names_only(coord, web):
+    result = await coord.async_probe_xbox_mobile_overrides(True, raw_shape=True)
+    alex = next(c for c in result["children"] if c["account_id"] == CHILD)
+    shape = alex["xbox_shape"]
+    assert shape["platform_entry_present"] is True
+    assert "appliesTo" in shape["platform_entry_keys"]
+    assert "devices" in shape["platform_entry_keys"]
+    # The fake's device entries carry a deviceId key; its value never leaks.
+    assert DEVICE_ID not in json.dumps(result)
+    # Without raw_shape the shape is absent.
+    plain = await coord.async_probe_xbox_mobile_overrides(True)
+    assert "xbox_shape" not in next(
+        c for c in plain["children"] if c["account_id"] == CHILD
+    )
 
 
 # Bounded self-test -----------------------------------------------------------

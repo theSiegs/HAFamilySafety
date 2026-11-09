@@ -337,7 +337,7 @@ class XboxMobileOverrideMixin:
     # ------------------------------------------------------------------
 
     async def async_probe_xbox_mobile_overrides(
-        self, confirm_risk: bool = False
+        self, confirm_risk: bool = False, raw_shape: bool = False
     ) -> dict[str, Any]:
         """Read every child's device-limits override state (GET only, no writes).
 
@@ -345,6 +345,13 @@ class XboxMobileOverrideMixin:
         each child, whether Xbox appears in device limits, whether it is blocked
         right now, and the override types/counts. This is what the HA session
         runs first to confirm the endpoint answers live before any write.
+
+        ``raw_shape`` adds, per child, the KEY NAMES present in the Xbox
+        lockablePlatforms entry (and in its override/device entries, if any) --
+        names only, no values and no ids -- so the exact shape can be confirmed
+        and a missed bindable field ruled out. (Confirmed live 2026-11: this
+        family's Xbox entry has no ``devices`` entries, so there is no device id
+        to target; the override is platform-level only.)
         """
         if not confirm_risk:
             raise ServiceValidationError(
@@ -368,6 +375,9 @@ class XboxMobileOverrideMixin:
                 entry["lockable_platforms"] = summary["lockable_platform_names"]
                 entry["xbox_present"] = self._xbox_present_in(summary)
                 entry["xbox"] = (summary.get("platforms") or {}).get("Xbox")
+                if raw_shape:
+                    # Key names only (no values, no ids) to confirm the shape.
+                    entry["xbox_shape"] = web.override_shape(payload, "Xbox")
             except Exception as err:  # noqa: BLE001 - reported per child, probe goes on
                 entry["overrides_read"] = False
                 entry["error"] = type(err).__name__

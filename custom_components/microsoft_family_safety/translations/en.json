@@ -123,6 +123,10 @@
           "name": "Config entry",
           "description": "The Microsoft Family Safety entry to use. Optional with a single entry."
         },
+        "raw_shape": {
+          "name": "Report the raw shape (key names only)",
+          "description": "When true, also report the key names present in each child's Xbox override entry (and its override/device entries), to confirm the shape. Names only: no values and no ids."
+        },
         "confirm_risk": {
           "name": "Confirm the risk",
           "description": "Must be true. Reads live state from Microsoft for every child."

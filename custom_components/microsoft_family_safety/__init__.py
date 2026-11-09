@@ -179,6 +179,7 @@ SERVICE_PROBE_XBOX_TOKEN_SCHEMA = vol.Schema({
 
 SERVICE_PROBE_XBOX_MOBILE_OVERRIDES_SCHEMA = vol.Schema({
     vol.Optional("entry_id"): cv.string,
+    vol.Optional("raw_shape", default=False): cv.boolean,
     vol.Optional("confirm_risk", default=False): cv.boolean,
 })
 
@@ -474,7 +475,7 @@ def _register_services(hass: HomeAssistant) -> None:
         """Administrators only: read-only GET of each child's override state."""
         await async_require_admin(hass, call)
         return await _entry_coordinator(call).async_probe_xbox_mobile_overrides(
-            call.data["confirm_risk"]
+            call.data["confirm_risk"], call.data["raw_shape"]
         )
 
     hass.services.async_register(
