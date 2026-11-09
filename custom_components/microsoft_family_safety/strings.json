@@ -89,7 +89,8 @@
           "xbox_xapprove": "Xbox lock and extra time through the Xbox Family Settings API (xapprove)",
           "xbox_xuids": "Xbox user ids (optional, child=xuid)",
           "xbox_sign_in": "Sign in to Xbox Family Settings (next page)",
-          "xbox_sign_out": "Sign out of Xbox Family Settings"
+          "xbox_sign_out": "Sign out of Xbox Family Settings",
+          "xbox_sign_in_app": "Sign in to Xbox Family Settings, app-style (next page)"
         },
         "data_description": {
           "platforms": "Windows, Mobile: one lock switch per ticked platform. The Xbox lock is not chosen here: it comes with Sign in to Xbox Family Settings and the xapprove option below, and the Xbox daily limits are always there. Nothing here needs the Microsoft web session.",
@@ -99,7 +100,8 @@
           "xbox_xapprove": "Off by default. Easiest: tick Sign in to Xbox Family Settings below; after the sign-in, Home Assistant checks it and offers to turn this on. When on (with that sign-in), the Xbox lock, unlock, the Xbox lock switch and Xbox extra time go through the Xbox Family Settings API; when that cannot be used, an Xbox lock falls back to today's Xbox schedule. A parent's own pause or extra time is never replaced. The Xbox never uses the Microsoft web session. The lock switch shows lock_path: xapprove or mobile_schedule.",
           "xbox_xuids": "Leave empty: each child's Xbox user id is looked up in your Xbox family. Only when that lookup fails (probe_xapprove says so), enter child=xuid pairs separated by commas, the child given by first name or account id, for example Alex=2533274800000000.",
           "xbox_sign_in": "Tick and submit to go to the sign-in page. The Xbox lock switch, the Xbox Override sensor and Xbox extra time need it. Use the same parent Microsoft account as for Family Safety. Tick it again to replace an earlier or expired sign-in. Unofficial use of the Xbox Family Settings app's sign-in: Microsoft can break or block it, and the Xbox lock then falls back to today's Xbox schedule. See the README.",
-          "xbox_sign_out": "Tick and submit to forget the Xbox Family Settings sign-in (its refresh token and key). The Xbox lock then works the way it did before the sign-in."
+          "xbox_sign_out": "Tick and submit to forget the Xbox Family Settings sign-in (its refresh token and key). The Xbox lock then works the way it did before the sign-in.",
+          "xbox_sign_in_app": "Try this when the sign-in above works but Xbox still refuses (probe_xapprove: every way 401). It signs in the way the Xbox Family Settings app does, with a computer's browser tools, and replaces the earlier Xbox sign-in while keeping its device key."
         }
       },
       "xbox_signin": {
@@ -112,23 +114,33 @@
           "redirect_url": "Copied from the Network tab (Copy URL), starting with https://login.live.com/oauth20_desktop.srf?code= . Spaces or quotes around it do no harm."
         }
       },
+      "xbox_signin_app": {
+        "title": "Sign in to Xbox Family Settings (app-style)",
+        "description": "This sign-in goes the way the Xbox Family Settings app does it, which may be what Xbox needs before it lets Home Assistant pause the Xbox. It keeps this entry's device key. Use the **parent** Microsoft account. Like the pasted-address sign-in, it needs a **computer** with Chrome, Edge or Firefox: the page you end on erases its own address, so the address is copied from the browser's network log.\n\n1. Open a new private or incognito window and press **F12**. Go to the **Network** tab and tick **Preserve log**.\n2. In that window, open [this sign-in link]({url}) (right-click it, Copy link address, paste it into the window).\n3. Sign in with the parent account and accept if Microsoft asks. You end on a blank page.\n4. In the Network tab, type **oauth20_desktop.srf** in the filter box, right-click the request and choose **Copy > Copy URL**. It starts with https://login.live.com/oauth20_desktop.srf?code= .\n5. Paste it below and submit right away: the code and this sign-in expire within minutes.\n\nHome Assistant then finishes the Xbox sign-in, reads your Xbox account the way the app's setup page does (it never creates or changes anything), and checks a child's Xbox settings. If you close this page, start again from Configure: the link is only good for this page.",
+        "data": {
+          "redirect_url": "The oauth20_desktop.srf address"
+        },
+        "data_description": {
+          "redirect_url": "Copied from the Network tab (Copy URL), starting with https://login.live.com/oauth20_desktop.srf?code= ."
+        }
+      },
       "xbox_signin_works": {
         "title": "Xbox control works",
-        "description": "Signed in. Home Assistant read a child's Xbox settings with this sign-in, so it can pause the Xbox and give extra time through the Xbox Family Settings API.\n\nLeave the box ticked and submit to use it. If it stops working later, the Xbox lock falls back to today's Xbox schedule and a Repairs issue says so.",
+        "description": "Signed in. Home Assistant read a child's Xbox settings with this sign-in, so it can pause the Xbox and give extra time through the Xbox Family Settings API.\n\nLeave the box ticked and submit to use it. If it stops working later, the Xbox lock falls back to today's Xbox schedule and a Repairs issue says so.{finish}",
         "data": {
           "xbox_xapprove": "Use the Xbox Family Settings API for the Xbox lock and extra time"
         }
       },
       "xbox_signin_refused": {
         "title": "Xbox refused this sign-in",
-        "description": "The sign-in was saved, but Xbox refused to show a child's Xbox settings with it ({reason}). Meanwhile an Xbox lock goes through today's Xbox schedule.\n\nLeave the box unticked and submit. Check that you signed in with the **parent** account; if not, open Configure and tick Sign in to Xbox Family Settings again. For details, run the action microsoft_family_safety.probe_xapprove.",
+        "description": "The sign-in was saved, but Xbox refused to show a child's Xbox settings with it ({reason}). Meanwhile an Xbox lock goes through today's Xbox schedule.\n\nLeave the box unticked and submit. Check that you signed in with the **parent** account; if not, open Configure and tick Sign in to Xbox Family Settings again. For details, run the action microsoft_family_safety.probe_xapprove.{finish}",
         "data": {
           "xbox_xapprove": "Use the Xbox Family Settings API for the Xbox lock and extra time"
         }
       },
       "xbox_signin_unchecked": {
         "title": "Signed in, not checked yet",
-        "description": "The sign-in was saved, but Home Assistant could not check it ({reason}).\n\nSubmit with the box as you want it. To be sure first, leave it unticked, run the action microsoft_family_safety.probe_xapprove and turn the option on in Configure when it answers working_method: sisu. If no child was found in your Xbox family, check that you signed in with the parent account, or enter the Xbox user ids in Configure.",
+        "description": "The sign-in was saved, but Home Assistant could not check it ({reason}).\n\nSubmit with the box as you want it. To be sure first, leave it unticked, run the action microsoft_family_safety.probe_xapprove and turn the option on in Configure when it answers working_method: sisu. If no child was found in your Xbox family, check that you signed in with the parent account, or enter the Xbox user ids in Configure.{finish}",
         "data": {
           "xbox_xapprove": "Use the Xbox Family Settings API for the Xbox lock and extra time"
         }
@@ -159,6 +171,9 @@
     },
     "progress": {
       "xbox_device_code": "Use the **parent** Microsoft account: the same one you sign in to Family Safety with, not a child's.\n\n1. On any phone or computer, go to **{url}**.\n2. Enter the code **{code}**.\n3. Sign in with the parent account and accept if Microsoft asks for permission.\n\nThis page goes on by itself once you have signed in (the code is valid for about 15 minutes). Keep it open meanwhile."
+    },
+    "abort": {
+      "xbox_app_signin_unavailable": "Xbox did not start the app-style sign-in ({detail}). Nothing was changed. Try again in a few minutes, or use the other sign-in."
     }
   },
   "services": {

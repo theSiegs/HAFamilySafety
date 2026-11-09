@@ -61,6 +61,8 @@ XAPPROVE_REFUSED_ISSUE: Final = "xapprove_refused"
 #: options-flow choice that starts it, and the issue when it needs redoing.
 XBOX_SIGNIN_STORAGE_KEY: Final = f"{DOMAIN}.xbox_signin"
 CONF_XBOX_SIGN_IN: Final = "xbox_sign_in"
+#: Options flow only: the app-style Xbox sign-in (sisu/authenticate first).
+CONF_XBOX_SIGN_IN_APP: Final = "xbox_sign_in_app"
 CONF_XBOX_SIGN_OUT: Final = "xbox_sign_out"
 CONF_XBOX_SIGNED_IN_AT: Final = "xbox_signed_in_at"
 XBOX_SIGNIN_EXPIRED_ISSUE: Final = "xbox_signin_expired"

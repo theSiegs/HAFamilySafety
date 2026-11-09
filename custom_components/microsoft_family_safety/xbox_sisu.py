@@ -421,6 +421,8 @@ class SisuProfile:
     #: app does, before the XSTS; ``reauth``: authorize once more after.
     webview: bool = False
     reauth: bool = False
+    #: Run sisu/authenticate first and send its X-SessionId as SessionId.
+    session: bool = False
 
 
 PLAIN_PROFILE = SisuProfile("")
@@ -446,6 +448,8 @@ SISU_PROFILES: dict[str, SisuProfile] = {
         PLAIN_PROFILE,
         SisuProfile("webview", webview=True),
         SisuProfile("webview_reauth", webview=True, reauth=True),
+        SisuProfile("session", session=True, webview=True),
+        SisuProfile("session_ucs", ucs=True, prompts=True, contract=None, session=True, webview=True),
         *_ucs_profiles(),
     ]
 }
@@ -467,6 +471,7 @@ async def async_sisu_authorize(
     profile: SisuProfile = PLAIN_PROFILE,
     ucs: tuple[str, str] | None = None,
     step: str | None = None,
+    session_id: str | None = None,
 ) -> XboxTokens:
     body: dict[str, Any] = {
         "AccessToken": f"t={msa_access_token}",
@@ -484,6 +489,8 @@ async def async_sisu_authorize(
         body["UcsWebToken"] = f"{prefix}{ucs[1]}"
     if profile.prompts:
         body["UserPrompts"] = []
+    if session_id:
+        body["SessionId"] = session_id
     step = step or sisu_step(profile)
     status, payload, headers = await _signed_post(
         session, key, SISU_AUTHORIZE_URL, body, step, facts, contract=profile.contract
@@ -505,6 +512,7 @@ async def async_sisu_authorize(
             "title_id": redact(_title_id(xti) or "") or None,
             "response_keys": sorted(str(k) for k in payload) if isinstance(payload, dict) else None,
             "web_page": page.facts if page else None,
+            "session_id_sent": bool(session_id),
         })
         if profile.ucs:
             facts[step]["ucs_sent"] = ucs is not None
@@ -529,20 +537,42 @@ async def async_sisu_authorize(
 
 
 SISU_AUTHENTICATE_URL = "https://sisu.xboxlive.com/authenticate"
+#: The Xbox Family Settings title id (seen live 2026-11-08 in SISU's
+#: TitleToken), for sisu/authenticate before SISU has given one.
+DEFAULT_TITLE_ID = "1618633878"
 
 
-async def async_sisu_authenticate_probe(
-    session: aiohttp.ClientSession, key: ProofKey, device_token: str, title_id: str | None
-) -> tuple[dict[str, Any], str | None]:
-    """probe_xapprove only: one signed sisu/authenticate as the app sends it,
-    to see what it answers: (facts, its session id). The facts are booleans
-    and names only, never the session id or the redirect URL."""
-    _verifier, challenge = new_pkce()
+@dataclass
+class SisuSession:
+    """What sisu/authenticate gave: its session id and the MSA sign-in link
+    (both secret-ish: never logged), and non-secret facts."""
+
+    session_id: str | None = field(repr=False)
+    msa_oauth_redirect: str | None = field(repr=False)
+    facts: dict[str, Any] = field(default_factory=dict)
+
+
+async def async_sisu_authenticate(
+    session: aiohttp.ClientSession,
+    key: ProofKey,
+    device_token: str,
+    title_id: str | None,
+    *,
+    challenge: str,
+    state: str,
+    redirect_uri: str = REDIRECT_URI,
+    step: str = "sisu_authenticate",
+    facts: dict | None = None,
+) -> SisuSession:
+    """sisu/authenticate as the app sends it (signed, contract 1): the
+    session id (``X-SessionId``) and the MSA sign-in link
+    (``MsaOauthRedirect``) for ``challenge`` and ``state``. Never raises for
+    an HTTP status: the facts say how it went."""
     body: dict[str, Any] = {"AppId": CLIENT_ID}
     if title_id:
         body["TitleId"] = title_id
     body.update({
-        "RedirectUri": REDIRECT_URI,
+        "RedirectUri": redirect_uri,
         "DeviceToken": device_token,
         "Sandbox": "RETAIL",
         "TokenType": "code",
@@ -551,27 +581,47 @@ async def async_sisu_authenticate_probe(
             "display": "android_phone",
             "code_challenge": challenge,
             "code_challenge_method": "S256",
-            "state": secrets.token_urlsafe(16),
+            "state": state,
             "prompt": "select_account",
         },
     })
-    facts: dict[str, Any] = {}
+    local: dict[str, Any] = {}
     status, payload, headers = await _signed_post(
-        session, key, SISU_AUTHENTICATE_URL, body, "sisu_authenticate", facts
+        session, key, SISU_AUTHENTICATE_URL, body, step, local
     )
-    result = dict(facts["sisu_authenticate"])
+    params = payload.get("MsaRequestParameters") if isinstance(payload, dict) else None
+    redirect = payload.get("MsaOauthRedirect") if isinstance(payload, dict) else None
+    result = dict(local[step])
     result.update({
         "title_id_sent": bool(title_id),
         "response_keys": sorted(str(k) for k in payload) if isinstance(payload, dict) else None,
         "session_id_received": bool(isinstance(payload, dict) and payload.get("SessionId")),
-        "msa_oauth_redirect_received": bool(isinstance(payload, dict) and payload.get("MsaOauthRedirect")),
+        "msa_oauth_redirect_received": bool(redirect),
+        "msa_oauth_redirect_query_keys": (
+            sorted(parse_qs(urlsplit(redirect).query)) if isinstance(redirect, str) else None
+        ),
+        "msa_request_parameters_keys": sorted(str(k) for k in params) if isinstance(params, dict) else None,
         "session_id_header": any(str(n).lower() == "x-sessionid" for n in headers),
         "response_header_names": sorted(str(n) for n in headers),
     })
+    _record(facts, step, result)
     sid = next((str(v) for n, v in headers.items() if str(n).lower() == "x-sessionid"), None)
     if sid is None and isinstance(payload, dict) and isinstance(payload.get("SessionId"), str):
         sid = payload["SessionId"]
-    return result, sid
+    return SisuSession(sid, redirect if isinstance(redirect, str) else None, result)
+
+
+async def async_sisu_authenticate_probe(
+    session: aiohttp.ClientSession, key: ProofKey, device_token: str, title_id: str | None
+) -> tuple[dict[str, Any], str | None]:
+    """probe_xapprove only: one sisu/authenticate as the app sends it, to see
+    what it answers: (facts, its session id). The facts are booleans and
+    names only, never the session id or the sign-in link."""
+    _verifier, challenge = new_pkce()
+    result = await async_sisu_authenticate(
+        session, key, device_token, title_id, challenge=challenge, state=secrets.token_urlsafe(16)
+    )
+    return result.facts, result.session_id
 
 
 class XstsVariantSkipped(XapproveError):
@@ -841,6 +891,42 @@ async def async_sisu_proxy(
     return status is not None and 200 <= status < 300
 
 
+async def async_replay_web_view(
+    session: aiohttp.ClientSession,
+    key: ProofKey,
+    tokens: XboxTokens,
+    page: WebPage,
+    authenticate_sid: str | None,
+    facts: dict | None,
+    name: str,
+    preferred: str | None = None,
+) -> str | None:
+    """Replay the web view's proxy reads for ``page`` (see ProxyWay): each way
+    in turn (``preferred`` first) until ReadAccount answers, then ReadProfile
+    the same way. The way that answered, or None. Read-only: nothing on the
+    account is created, reserved, set or accepted."""
+    ways = list(PROXY_WAYS)
+    if preferred:
+        ways.sort(key=lambda w: w.name != preferred)
+    for way in ways:
+        sid = page.sid if way.sid == "web_page" else authenticate_sid
+        if not sid or (way.auth == "sig" and not page.sig):
+            continue
+        auth = {"none": None, "xbl": tokens.header(), "sig": page.sig}[way.auth]
+        ok = await async_sisu_proxy(
+            session, key, sid, PROXY_READS[0], auth, way.signed,
+            f"sisu_proxy[{name}|{way.name}|{PROXY_READS[0]}]", facts,
+        )
+        if not ok:
+            continue
+        await async_sisu_proxy(
+            session, key, sid, PROXY_READS[1], auth, way.signed,
+            f"sisu_proxy[{name}|{way.name}|{PROXY_READS[1]}]", facts,
+        )
+        return way.name
+    return None
+
+
 async def async_web_page_probe(session: aiohttp.ClientSession, page: WebPage) -> dict[str, Any]:
     """probe_xapprove: GET the WebPage (read-only) and up to three of its
     scripts on the same host; report the status, content type, the script
@@ -1046,13 +1132,25 @@ class XboxSisuAuth:
                 (await self._async_msa(UCS_WEB_SCOPE)).access_token,
             )
         await self._async_device(session)
+        sisu_session: SisuSession | None = None
+        if profile.session:
+            _verifier, challenge = new_pkce()
+            sisu_session = await async_sisu_authenticate(
+                session, self.key, self._device[0], self.title_id or DEFAULT_TITLE_ID,
+                challenge=challenge, state=secrets.token_urlsafe(16),
+                step=f"sisu_authenticate[{profile.name}]", facts=self.token_facts,
+            )
         tokens = await async_sisu_authorize(
-            session, self.key, msa.access_token, self._device[0], self.token_facts, profile, ucs
+            session, self.key, msa.access_token, self._device[0], self.token_facts, profile, ucs,
+            session_id=sisu_session.session_id if sisu_session else None,
         )
         if tokens.title_id:
             self.title_id = tokens.title_id
         if profile.webview:
-            await self._async_web_view(session, profile, tokens)
+            await self._async_web_view(
+                session, profile, tokens,
+                sisu_session.session_id if sisu_session else self.authenticate_sid,
+            )
             if profile.reauth:
                 tokens = await async_sisu_authorize(
                     session, self.key, msa.access_token, self._device[0], self.token_facts, profile,
@@ -1060,10 +1158,15 @@ class XboxSisuAuth:
                 )
         return tokens
 
-    async def _async_web_view(self, session: aiohttp.ClientSession, profile: SisuProfile, tokens: XboxTokens) -> None:
-        """Replay the web view's proxy reads for SISU's WebPage (see ProxyWay):
-        each way in turn until ReadAccount answers, then ReadProfile the same
-        way. Read-only: nothing on the account is created or accepted."""
+    async def _async_web_view(
+        self,
+        session: aiohttp.ClientSession,
+        profile: SisuProfile,
+        tokens: XboxTokens,
+        authenticate_sid: str | None,
+    ) -> None:
+        """Replay the web view's proxy reads for SISU's WebPage, remembering
+        the way that answered (``proxy_way``)."""
         prefix = f"web_view[{profile.name}]"
         page = tokens.web_page
         if page is None:
@@ -1074,29 +1177,15 @@ class XboxSisuAuth:
         if self.proxy_way == "":
             _record(self.token_facts, prefix, {"skipped": "no proxy way answered before"})
             return
-        ways = list(PROXY_WAYS)
-        if self.proxy_way:
-            ways.sort(key=lambda w: w.name != self.proxy_way)
-        for way in ways:
-            sid = page.sid if way.sid == "web_page" else self.authenticate_sid
-            if not sid or (way.auth == "sig" and not page.sig):
-                continue
-            auth = {"none": None, "xbl": tokens.header(), "sig": page.sig}[way.auth]
-            ok = await async_sisu_proxy(
-                session, self.key, sid, PROXY_READS[0], auth, way.signed,
-                f"sisu_proxy[{profile.name}|{way.name}|{PROXY_READS[0]}]", self.token_facts,
-            )
-            if not ok:
-                continue
-            await async_sisu_proxy(
-                session, self.key, sid, PROXY_READS[1], auth, way.signed,
-                f"sisu_proxy[{profile.name}|{way.name}|{PROXY_READS[1]}]", self.token_facts,
-            )
-            self.proxy_way = way.name
-            _record(self.token_facts, prefix, {"proxy_way": way.name})
-            return
-        self.proxy_way = ""
-        _record(self.token_facts, prefix, {"proxy_way": None})
+        way = await async_replay_web_view(
+            session, self.key, tokens, page, authenticate_sid, self.token_facts, profile.name,
+            self.proxy_way,
+        )
+        if way is not None or page.sid:
+            # "" (no way answered) only after a real try on a page with a
+            # session: a bare page says nothing about the ways.
+            self.proxy_way = way or ""
+        _record(self.token_facts, prefix, {"proxy_way": way, "web_page_sid": bool(page.sid)})
 
     async def _async_sisu(self, force: bool, profile_name: str = "") -> XboxTokens:
         """SISU's tokens of a profile, renewed when they ran out. The caller
@@ -1310,3 +1399,166 @@ async def async_wait_for_device_code(
         if dt_util.utcnow() >= code.expires_at:
             raise DeviceCodeExpired("the code expired")
         await sleep(code.interval)
+
+
+# ----------------------------------------------------------------------
+# The app-style sign-in (options flow)
+# ----------------------------------------------------------------------
+#
+# As the app does it: sisu/authenticate (a session and the MSA sign-in link
+# for our PKCE) -> the user signs in -> code exchange -> the consent tokens
+# -> sisu/authorize with the SessionId -> the WebPage's proxy reads. The
+# RedirectUri is oauth20_desktop.srf, the only one seen to work with this
+# client: the page erases the code from its address after loading, so the
+# address is copied from the browser's network log (as in the pasted-address
+# sign-in).
+
+#: sisu/authorize ways tried after the app-style sign-in, in order: the app's
+#: (consent tokens raw, UserPrompts, no contract), consent tokens as t=,
+#: without consent tokens.
+APP_SIGNIN_PROFILES = [
+    SisuProfile("app", ucs=True, ucs_form="raw", prompts=True, contract=None, session=True),
+    SisuProfile("app_t", ucs=True, ucs_form="t", prompts=True, contract=None, session=True),
+    SisuProfile("app_no_ucs", prompts=True, contract=None, session=True),
+]
+
+
+@dataclass
+class AppSignInStart:
+    """An app-style sign-in waiting for the user. Memory only, never logged."""
+
+    url: str = field(repr=False)
+    verifier: str = field(repr=False)
+    state: str = field(repr=False)
+    redirect_uri: str
+    scope: str
+    session_id: str = field(repr=False)
+    credential: dict[str, Any] = field(repr=False)
+    device_token: str = field(repr=False)
+    device_not_after: datetime | None
+
+
+@dataclass
+class AppSignInResult:
+    """A finished app-style sign-in: the SignIn to save and check, the
+    WebPage (when it has a session; the user can finish it in a browser),
+    the proxy way that answered, and non-secret facts."""
+
+    sign_in: SignIn
+    web_page_url: str | None = field(repr=False)
+    proxy_way: str | None
+    facts: dict[str, Any]
+
+
+async def async_start_app_sign_in(
+    session: aiohttp.ClientSession, credential: dict[str, Any] | None, title_id: str | None
+) -> AppSignInStart:
+    """sisu/authenticate with a fresh PKCE: the link for the user. The stored
+    sign-in's ProofKey and device id are kept when there is one."""
+    if isinstance(credential, dict) and credential.get("proof_key") and credential.get("device_id"):
+        base = dict(credential)
+    else:
+        base = new_credential("", ProofKey.generate())
+    key = ProofKey.from_pem(base["proof_key"])
+    device, until = await async_device_token(session, key, base["device_id"])
+    verifier, challenge = new_pkce()
+    state = secrets.token_urlsafe(16)
+    started = await async_sisu_authenticate(
+        session, key, device, title_id or DEFAULT_TITLE_ID, challenge=challenge, state=state
+    )
+    if not started.msa_oauth_redirect or not started.session_id:
+        status = started.facts.get("status")
+        raise XapproveRefused("sisu_authenticate", status, started.facts.get("xerr"), "no sign-in link")
+    query = parse_qs(urlsplit(started.msa_oauth_redirect).query)
+    return AppSignInStart(
+        url=started.msa_oauth_redirect,
+        verifier=verifier,
+        state=(query.get("state") or [state])[0],
+        redirect_uri=(query.get("redirect_uri") or [REDIRECT_URI])[0],
+        scope=(query.get("scope") or [SCOPE])[0],
+        session_id=started.session_id,
+        credential=base,
+        device_token=device,
+        device_not_after=until,
+    )
+
+
+def app_code_from_redirect(url: str, start: AppSignInStart) -> str:
+    """The code in the pasted address of the app-style sign-in."""
+    target = urlsplit(start.redirect_uri)
+    text = re.sub(r"\s+", "", url or "").strip("\"'<>`")
+    if target.netloc.lower() != "login.live.com" and text.lower().startswith(
+        f"{target.scheme}://{target.netloc}".lower()
+    ):
+        parts = urlsplit(text)
+        query = parse_qs(parts.query)
+        query.update({k: v for k, v in parse_qs(parts.fragment).items() if k not in query})
+        if query.get("error"):
+            raise ValueError(f"signin_error:{query['error'][0]}")
+        if not query.get("code"):
+            raise ValueError("invalid_redirect")
+        pasted_state = query.get("state", [None])[0]
+        if pasted_state is not None and pasted_state != start.state:
+            raise ValueError("state_mismatch")
+        return query["code"][0]
+    return code_from_redirect(url, start.state)
+
+
+async def async_finish_app_sign_in(
+    session: aiohttp.ClientSession, start: AppSignInStart, pasted: str
+) -> AppSignInResult:
+    """The pasted address -> code exchange -> consent tokens -> sisu/authorize
+    with the SessionId -> the WebPage's proxy reads (read-only). Raises
+    ValueError (the address) or XapproveError (a step refused)."""
+    facts: dict[str, Any] = {}
+    code = app_code_from_redirect(pasted, start)
+    msa = await _msa_token(session, {
+        "client_id": CLIENT_ID,
+        "grant_type": "authorization_code",
+        "code": code,
+        "code_verifier": start.verifier,
+        "redirect_uri": start.redirect_uri,
+        "scope": start.scope,
+    }, "sisu_msa_code", facts)
+    if not msa.refresh_token:
+        raise XapproveError("sisu_msa_code: no refresh token in the answer")
+    ucs: tuple[str, str] | None = None
+    try:
+        ucs = (
+            (await async_refresh_msa(session, msa.refresh_token, UCS_CHECKIN_SCOPE, facts)).access_token,
+            (await async_refresh_msa(session, msa.refresh_token, UCS_WEB_SCOPE, facts)).access_token,
+        )
+    except XapproveError:
+        ucs = None
+    key = ProofKey.from_pem(start.credential["proof_key"])
+    tokens: XboxTokens | None = None
+    refused: XapproveError | None = None
+    for profile in APP_SIGNIN_PROFILES:
+        if profile.ucs and ucs is None:
+            continue
+        try:
+            tokens = await async_sisu_authorize(
+                session, key, msa.access_token, start.device_token, facts, profile, ucs,
+                session_id=start.session_id,
+            )
+        except XapproveRefused as err:
+            refused = refused or err
+            continue
+        break
+    if tokens is None:
+        raise refused or XapproveError("sisu_authorize: no way answered")
+    page = tokens.web_page
+    way: str | None = None
+    if page is not None and page.sid:
+        way = await async_replay_web_view(session, key, tokens, page, start.session_id, facts, "app")
+    credential = {
+        **start.credential,
+        "refresh_token": msa.refresh_token,
+        "signed_in": dt_util.utcnow().isoformat(),
+    }
+    return AppSignInResult(
+        SignIn(credential, tokens, start.device_token, start.device_not_after),
+        page.url if page is not None and page.sid else None,
+        way,
+        facts,
+    )

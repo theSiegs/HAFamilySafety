@@ -34,6 +34,7 @@ from custom_components.microsoft_family_safety.const import (
 
 from .test_platform_lock import CHILD
 from .xbox_fakes import (
+    FakeResponse,
     CHILD_XUID,
     CODE,
     PARENT_XUID,
@@ -586,3 +587,111 @@ async def test_an_expired_code_offers_a_new_one_or_the_address(hass, server, has
         assert "you chose" in pasted["description_placeholders"]["why"]
         hass.config_entries.options.async_abort(progress["flow_id"])
     assert f"{DOMAIN}.xbox_signin.{entry.entry_id}" not in hass_storage
+
+
+# The app-style sign-in --------------------------------------------------------------
+
+
+async def _to_the_app_sign_in(hass, entry):
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {**INIT_FORM, "xbox_sign_in_app": True},
+    )
+    return result
+
+
+def _app_landed(result, code: str = CODE) -> dict:
+    link = result["description_placeholders"]["url"]
+    query = parse_qs(urlsplit(link).query)
+    assert query["redirect_uri"] == ["https://login.live.com/oauth20_desktop.srf"]
+    return {"redirect_url": f"https://login.live.com/oauth20_desktop.srf?code={code}&state={query['state'][0]}"}
+
+
+async def test_the_app_style_sign_in_works(hass, server, hass_storage):
+    coord, entry = await make_rig(hass, server, {CONF_XBOX_XAPPROVE: False})
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coord
+    before = await coord._xbox_signin_store.async_load()
+    server.web_page = True
+    server.web_page_needs_session = True
+    # Xbox takes the tokens of a session whose web view was finished.
+    server.accepts = lambda h: "~sess" in h.get("Authorization", "") and any(
+        f"~s{n}" in h["Authorization"] for n in server.done_sessions
+    )
+    with patch(SETUP, return_value=True):
+        result = await _to_the_app_sign_in(hass, entry)
+        assert result["step_id"] == "xbox_signin_app"
+        assert result["description_placeholders"]["url"].startswith(
+            "https://login.live.com/oauth20_authorize.srf?"
+        )
+        authn = server.authenticate_bodies[-1]
+        assert authn["TitleId"] == "1618633878" and authn["TokenType"] == "code"
+        assert authn["RedirectUri"] == "https://login.live.com/oauth20_desktop.srf"
+        checked = await hass.config_entries.options.async_configure(
+            result["flow_id"], _app_landed(result),
+        )
+        assert checked["step_id"] == "xbox_signin_works", checked
+        assert checked["description_placeholders"]["finish"] == ""
+        done = await hass.config_entries.options.async_configure(
+            result["flow_id"], {CONF_XBOX_XAPPROVE: True},
+        )
+    assert done["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert entry.options[CONF_XBOX_XAPPROVE] is True and "xbox_sign_in_app" not in entry.options
+    # As the app: the session, the consent tokens raw, UserPrompts, no contract.
+    body = server.authorize_bodies[-1]
+    assert body["SessionId"] and body["UserPrompts"] == []
+    assert body["UcsCheckinToken"] == "ucs-checkin-SECRET"
+    assert server.authorize_contracts[-1] is None
+    assert server.proxy_calls == ["ReadAccount", "ReadProfile"]
+    # A new refresh token; the device key and device id are kept.
+    stored = hass_storage[f"{DOMAIN}.xbox_signin.{entry.entry_id}"]["data"]
+    assert stored["refresh_token"] != before["refresh_token"]
+    assert stored["proof_key"] == before["proof_key"] and stored["device_id"] == before["device_id"]
+    assert "sisu-refresh" not in json.dumps(dict(entry.options))
+
+
+async def test_the_app_style_sign_in_links_the_xbox_page_when_refused(hass, server, hass_storage):
+    coord, entry = await make_rig(hass, server, {CONF_XBOX_XAPPROVE: False})
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coord
+    server.web_page = True
+    server.web_page_needs_session = True
+    server.proxy_accepts = lambda h, sid: False
+    server.accepts = lambda h: False
+    with patch(SETUP, return_value=True):
+        result = await _to_the_app_sign_in(hass, entry)
+        checked = await hass.config_entries.options.async_configure(
+            result["flow_id"], _app_landed(result),
+        )
+    assert checked["step_id"] == "xbox_signin_refused"
+    finish = checked["description_placeholders"]["finish"]
+    assert "Finish Xbox setup" in finish and "/view/index.html?" in finish and "sid=websid-" in finish
+    # Never anything that changes the account.
+    assert set(server.proxy_calls) <= {"ReadAccount", "ReadProfile"}
+
+
+async def test_the_app_style_sign_in_errors(hass, server, hass_storage):
+    coord, entry = await make_rig(hass, server, {CONF_XBOX_XAPPROVE: False})
+    with patch(SETUP, return_value=True):
+        result = await _to_the_app_sign_in(hass, entry)
+        bad = await hass.config_entries.options.async_configure(
+            result["flow_id"], {"redirect_url": "https://login.live.com/oauth20_desktop.srf?code=x&state=nope"},
+        )
+        assert bad["errors"] == {"base": "state_mismatch"}
+        server.code_dead = True
+        expired = await hass.config_entries.options.async_configure(result["flow_id"], _app_landed(result))
+        assert expired["errors"] == {"base": "code_expired"}
+
+
+async def test_the_app_style_sign_in_aborts_without_a_link(hass, server, hass_storage):
+    coord, entry = await make_rig(hass, server, {CONF_XBOX_XAPPROVE: False})
+    real = server.request
+
+    def request(method, url, **kwargs):
+        if url == sisu.SISU_AUTHENTICATE_URL:
+            return FakeResponse(400, {"XErr": 2148916233})
+        return real(method, url, **kwargs)
+
+    server.request = request
+    with patch(SETUP, return_value=True):
+        result = await _to_the_app_sign_in(hass, entry)
+    assert result["type"] == data_entry_flow.FlowResultType.ABORT
+    assert result["reason"] == "xbox_app_signin_unavailable"

@@ -7,8 +7,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import hashlib
 import struct
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -55,7 +56,6 @@ UCS_TOKENS = {
 }
 #: sisu/authenticate's answer.
 SESSION_ID = "session-id-SECRET"
-OAUTH_REDIRECT = "https://login.live.com/oauth20_authorize.srf?redirect-SECRET"
 TITLE_ID = "1016898439"
 #: The web view: its page, the sig of its URL, its session ids.
 WEB_PAGE_BASE = "https://sisu.xboxlive.com/client/v68/00000000482c8f49/view/index.html"
@@ -214,6 +214,11 @@ class XboxServer:
             h.get("Authorization", "").startswith("XBL3.0") and "Signature" in h and sid.startswith("websid-")
         )
         self.proxy_calls: list[str] = []
+        #: As live: without a SessionId, authorize's WebPage is bare (no sid).
+        self.web_page_needs_session = False
+        #: The PKCE challenge of the last sisu/authenticate (the code
+        #: exchange's verifier must match it).
+        self.last_challenge: str | None = None
 
     def state(self) -> dict:
         overrides = []
@@ -267,6 +272,9 @@ class XboxServer:
             self.sisu_calls.append(f"token:{form['grant_type']}:{form['scope']}")
             if form["grant_type"] == "authorization_code":
                 assert form["redirect_uri"] == sisu.REDIRECT_URI and form["code_verifier"]
+                if self.last_challenge is not None:
+                    digest = hashlib.sha256(form["code_verifier"].encode()).digest()
+                    assert base64.urlsafe_b64encode(digest).rstrip(b"=").decode() == self.last_challenge
                 if form["code"] != CODE or self.code_dead:
                     return FakeResponse(400, {"error": "invalid_grant"})
             elif self.dead or form["refresh_token"] not in self.refresh_tokens:
@@ -330,8 +338,16 @@ class XboxServer:
             payload = json.loads(kwargs["data"])
             verify_signature(headers["Signature"], self.jwk, "POST", url, "", kwargs["data"])
             self.authenticate_bodies.append(payload)
+            query = payload["Query"]
+            self.last_challenge = query["code_challenge"]
+            link = "https://login.live.com/oauth20_authorize.srf?" + urlencode({
+                "client_id": sisu.CLIENT_ID, "redirect_uri": payload["RedirectUri"],
+                "response_type": "code", "scope": "service::user.auth.xboxlive.com::MBI_SSL",
+                "code_challenge": query["code_challenge"], "code_challenge_method": "S256",
+                "state": f"sisu-{query['state']}", "x": "redirect-SECRET",
+            })
             return FakeResponse(
-                200, {"MsaOauthRedirect": OAUTH_REDIRECT, "MsaRequestParameters": {}},
+                200, {"MsaOauthRedirect": link, "MsaRequestParameters": {"ru": "x", "cobrandid": "y"}},
                 {"X-SessionId": SESSION_ID},
             )
         if url == sisu.SISU_AUTHORIZE_URL:
@@ -349,8 +365,13 @@ class XboxServer:
             if not self.authorize_accepts(payload, headers):
                 return FakeResponse(400, {"XErr": 2148916233})
             shape = authorize_shape(payload, headers)
+            if "SessionId" in payload:
+                assert payload["SessionId"] == SESSION_ID
+                shape += "~sess"
             web_page = None
-            if self.web_page:
+            if self.web_page and self.web_page_needs_session and "SessionId" not in payload:
+                web_page = WEB_PAGE_BASE  # bare, as live
+            elif self.web_page:
                 self.sessions += 1
                 if self.done_sessions:
                     self.fresh_sessions.add(self.sessions)

@@ -42,6 +42,7 @@ from .const import (
     DEFAULT_XBOX_XAPPROVE,
     CONF_XBOX_XUIDS,
     CONF_XBOX_SIGN_IN,
+    CONF_XBOX_SIGN_IN_APP,
     CONF_XBOX_SIGN_OUT,
     CONF_XBOX_SIGNED_IN_AT,
     XBOX_SIGNIN_STORAGE_KEY,
@@ -1490,6 +1491,10 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
         self._xbox_code_failure = ""
         #: Why the pasted-address page is shown instead of the code (or "").
         self._xbox_paste_why = ""
+        #: The app-style sign-in waiting for the pasted address, and the
+        #: WebPage it ended on (shown when the check did not work).
+        self._xbox_app: xbox_sisu.AppSignInStart | None = None
+        self._xbox_web_page: str | None = None
 
     def _xbox_signin_store(self) -> Store:
         return Store(self.hass, 1, f"{XBOX_SIGNIN_STORAGE_KEY}.{self._config_entry.entry_id}")
@@ -1533,6 +1538,7 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             data = dict(user_input)
             sign_in = bool(data.pop(CONF_XBOX_SIGN_IN, False))
+            sign_in_app = bool(data.pop(CONF_XBOX_SIGN_IN_APP, False))
             sign_out = bool(data.pop(CONF_XBOX_SIGN_OUT, False))
             data[CONF_PLATFORMS] = _platforms(data.get(CONF_PLATFORMS))
             # Whether the entry keeps the Family web session (older entries) is
@@ -1555,6 +1561,9 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
                     self.hass, DOMAIN,
                     f"{XBOX_SIGNIN_EXPIRED_ISSUE}_{self._config_entry.entry_id}",
                 )
+            elif sign_in_app:
+                self._pending_data = data
+                return await self.async_step_xbox_signin_app()
             elif sign_in:
                 self._pending_data = data
                 # The code sign-in (microsoft.com/link) first; the pasted
@@ -1616,6 +1625,7 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
                         },
                     ): cv.string,
                     vol.Optional(CONF_XBOX_SIGN_IN, default=False): cv.boolean,
+                    vol.Optional(CONF_XBOX_SIGN_IN_APP, default=False): cv.boolean,
                     # Signing out is offered only when there is a sign-in.
                     **(
                         {vol.Optional(CONF_XBOX_SIGN_OUT, default=False): cv.boolean}
@@ -1678,6 +1688,62 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
             data_schema=vol.Schema({vol.Required("redirect_url"): cv.string}),
             errors=errors,
             description_placeholders={"url": url, "detail": detail, "why": why},
+        )
+
+    async def async_step_xbox_signin_app(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """The app-style sign-in: sisu/authenticate gives the link; the user
+        signs in and pastes the address; then code, consent tokens,
+        sisu/authorize with the session, the web view's reads, the check."""
+        session = async_get_clientsession(self.hass)
+        if self._xbox_app is None:
+            coordinator = (self.hass.data.get(DOMAIN) or {}).get(self._config_entry.entry_id)
+            sisu = getattr(coordinator, "_sisu", None)
+            try:
+                self._xbox_app = await xbox_sisu.async_start_app_sign_in(
+                    session,
+                    await self._xbox_signin_store().async_load(),
+                    getattr(sisu, "title_id", None),
+                )
+            except XapproveError as err:
+                return self.async_abort(
+                    reason="xbox_app_signin_unavailable",
+                    description_placeholders={"detail": str(err)[:200]},
+                )
+        start = self._xbox_app
+        errors: dict[str, str] = {}
+        detail = ""
+        if user_input is not None:
+            try:
+                result = await xbox_sisu.async_finish_app_sign_in(
+                    session, start, user_input.get("redirect_url", "")
+                )
+            except ValueError as err:
+                code, _, detail = str(err).partition(":")
+                errors["base"] = (
+                    code
+                    if code in (
+                        "invalid_redirect", "state_mismatch", "signin_error", "pasted_link",
+                        "removed_address",
+                    )
+                    else "invalid_redirect"
+                )
+            except XapproveError as err:
+                if isinstance(err, XapproveRefused) and err.step == "sisu_msa_code":
+                    errors["base"] = "code_expired"
+                else:
+                    errors["base"] = "xbox_signin_failed"
+                detail = str(err)[:200]
+            else:
+                self._xbox_app = None
+                self._xbox_web_page = result.web_page_url
+                return await self._async_finish_xbox_sign_in(result.sign_in)
+        return self.async_show_form(
+            step_id="xbox_signin_app",
+            data_schema=vol.Schema({vol.Required("redirect_url"): cv.string}),
+            errors=errors,
+            description_placeholders={"url": start.url, "detail": detail},
         )
 
     async def _async_finish_xbox_sign_in(self, sign_in: xbox_sisu.SignIn) -> FlowResult:
@@ -1810,7 +1876,22 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
             data_schema=vol.Schema(
                 {vol.Optional(CONF_XBOX_XAPPROVE, default=default): cv.boolean}
             ),
-            description_placeholders={"reason": self._xbox_check.get("reason") or "-"},
+            description_placeholders={
+                "reason": self._xbox_check.get("reason") or "-",
+                "finish": self._finish_xbox_setup(outcome),
+            },
+        )
+
+    def _finish_xbox_setup(self, outcome: str) -> str:
+        """The link to the Xbox page of the app-style sign-in, when the check
+        did not work: the page may ask for something Home Assistant never
+        does itself (a gamertag, consents)."""
+        if outcome == "works" or not self._xbox_web_page:
+            return ""
+        return (
+            "\n\n**Finish Xbox setup:** open [this Xbox page]("
+            f"{self._xbox_web_page}) in a browser now (it is only valid for a few minutes), "
+            "finish what it asks, then open Configure and run the app-style sign-in again."
         )
 
     async def async_step_xbox_signin_works(

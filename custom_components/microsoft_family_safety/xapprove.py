@@ -457,7 +457,7 @@ def _methods() -> list[AuthMethod]:
         *_pair("xsts", token="xsts", relying_party=RP_XBOXLIVE),
         *[
             AuthMethod(f"{profile}_xsts_signed", token="xsts", relying_party=RP_XBOXLIVE, sisu_profile=profile)
-            for profile in ("webview", "webview_reauth")
+            for profile in ("webview", "webview_reauth", "session", "session_ucs")
         ],
         *[
             AuthMethod(f"{profile}_xsts_signed", token="xsts", relying_party=RP_XBOXLIVE, sisu_profile=profile)

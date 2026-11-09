@@ -576,6 +576,7 @@ UCS_SCOPES = [
 ALL_NAMES = [
     "xsts_signed", "xsts_unsigned",
     "webview_xsts_signed", "webview_reauth_xsts_signed",
+    "session_xsts_signed", "session_ucs_xsts_signed",
     *[f"{p}_xsts_signed" for p in UCS],
     "ucs_raw_prompts_noc_sisu_signed", "ucs_t_prompts_noc_sisu_signed",
     "sisu_signed", "sisu_unsigned",
@@ -589,6 +590,7 @@ ALL_NAMES = [
 ALL_ATTEMPTS = [
     "xsts_signed@overrides", "xsts_signed@screentime", "xsts_unsigned@overrides",
     "webview_xsts_signed@overrides", "webview_reauth_xsts_signed@overrides",
+    "session_xsts_signed@overrides", "session_ucs_xsts_signed@overrides",
     *[f"{p}_xsts_signed@overrides" for p in UCS],
     "ucs_raw_prompts_noc_sisu_signed@overrides", "ucs_t_prompts_noc_sisu_signed@overrides",
     "sisu_signed@overrides", "sisu_signed@screentime", "sisu_unsigned@overrides",
@@ -631,14 +633,14 @@ def _accepts_only(name: str):
 def test_the_probe_attempts_most_app_like_first():
     assert [m.name for m in xapprove.PROBE_METHODS] == ALL_NAMES
     assert [f"{m.name}@{p}" for m, p in xapprove.PROBE_ATTEMPTS] == ALL_ATTEMPTS
-    assert len(ALL_ATTEMPTS) == 28
+    assert len(ALL_ATTEMPTS) == 30
     assert xapprove.DEFAULT_METHOD.name == "xsts_signed"
     for method in xapprove.PROBE_METHODS:
         assert method.app_like
         assert method.signed == method.name.endswith("_signed")
 
 
-@pytest.mark.parametrize("name", [n for n in ALL_NAMES if not n.startswith("webview")])
+@pytest.mark.parametrize("name", [n for n in ALL_NAMES if not n.startswith(("webview", "session"))])
 async def test_the_probe_finds_each_way_and_the_lock_uses_it(rig, server, name):
     server.accepts = _accepts_only(name)
     result = await rig.async_probe_xapprove(True)
@@ -747,9 +749,9 @@ async def test_without_a_sisu_device_token_that_variant_is_skipped(rig, server):
     assert steps["xsts_authorize[http://xboxlive.com|app]"]["status"] == 400
     assert result["xsts"]["http://xboxlive.com"] == {"variant": None, "xui_keys": None}
     # Every variant refused once: the unsigned attempt does not sweep again.
-    # (the plain profile, the two web view ones and the eight UCS ones,
-    # 5 sent variants each)
-    assert server.sisu_calls.count("xsts:http://xboxlive.com") == 55
+    # (the plain profile, the two web view ones, the two session ones and
+    # the eight UCS ones, 5 sent variants each)
+    assert server.sisu_calls.count("xsts:http://xboxlive.com") == 65
     first = result["overrides_attempts"][0]
     assert first["stage"] == "token" and first["xerr"] == 2148916279
     assert result["working_method"] == "sisu_signed"
@@ -967,7 +969,7 @@ async def test_no_proxy_way_answers(rig, server):
     result = await rig.async_probe_xapprove(True)
 
     assert result["proxy_way"] == ""
-    assert result["steps"]["web_view[webview]"] == {"proxy_way": None}
+    assert result["steps"]["web_view[webview]"] == {"proxy_way": None, "web_page_sid": True}
     # Not swept again for the second web view way.
     assert result["steps"]["web_view[webview_reauth]"] == {"skipped": "no proxy way answered before"}
     # The six page ways and the two with the authenticate session id.
@@ -995,3 +997,41 @@ def test_a_web_page_is_described_without_its_values():
     assert facts["sig_shape"] == {"length": 14, "base64_like": False, "dots": 2, "jwt_like": True}
     assert "abc" not in json.dumps(facts) and "eyJ" not in json.dumps(facts)
     assert xbox_sisu.parse_web_page(None) is None
+
+
+# A session from sisu/authenticate on a refresh-style authorize -------------------------
+
+
+async def test_a_session_gives_the_web_page_a_sid(rig, server):
+    server.web_page = True
+    server.web_page_needs_session = True
+    server.accepts = lambda h: (
+        "~sess" in h.get("Authorization", "") and _session_of(h) in server.done_sessions
+        and "Signature" in h
+    )
+    result = await rig.async_probe_xapprove(True)
+
+    steps = result["steps"]
+    # As live: without a session the WebPage is bare.
+    assert steps["sisu_authorize"]["web_page"]["sid_present"] is False
+    assert steps["sisu_authorize"]["web_page"]["query_keys"] == []
+    assert steps["web_view[webview]"]["web_page_sid"] is False
+    session = steps["sisu_authorize[session]"]
+    assert session["session_id_sent"] is True and session["web_page"]["sid_present"] is True
+    assert steps["sisu_authenticate[session]"]["session_id_header"] is True
+    assert steps["web_view[session]"] == {"proxy_way": "page_xbl_signed", "web_page_sid": True}
+    assert result["working_method"] == "session_xsts_signed"
+    _no_secrets(result)
+
+
+async def test_a_session_with_the_consent_tokens(rig, server):
+    server.web_page = True
+    server.web_page_needs_session = True
+    server.accepts = lambda h: (
+        "~ucs_raw_prompts_noc~sess" in h.get("Authorization", "")
+        and _session_of(h) in server.done_sessions and "Signature" in h
+    )
+    result = await rig.async_probe_xapprove(True)
+    assert result["working_method"] == "session_ucs_xsts_signed"
+    assert result["steps"]["sisu_authorize[session_ucs]"]["ucs_sent"] is True
+    _no_secrets(result)
