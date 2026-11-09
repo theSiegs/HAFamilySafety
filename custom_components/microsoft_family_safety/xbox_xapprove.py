@@ -74,6 +74,8 @@ from .xapprove import (
     DEFAULT_METHOD,
     OVERRIDE_ALLOW,
     OVERRIDE_BLOCK,
+    PATH_OVERRIDES,
+    PROBE_ATTEMPTS,
     PROBE_METHODS,
     AuthMethod,
     XapproveClient,
@@ -86,8 +88,9 @@ from .xapprove import (
     member_xuid,
     method_by_name,
     overrides_url,
+    screentime_url,
 )
-from .xbox_sisu import SignIn, XboxSignInExpired, XboxSisuAuth, xsts_step
+from .xbox_sisu import XSTS_VARIANTS_BY_NAME, SignIn, XboxSignInExpired, XboxSisuAuth
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -192,6 +195,9 @@ class XboxXapproveMixin:
         data = await self._xapprove_method_store.async_load()
         name = data.get("method") if isinstance(data, dict) else None
         self._xapprove_method = method_by_name(name) or DEFAULT_METHOD
+        variant = data.get("xsts_variant") if isinstance(data, dict) else None
+        if self._sisu is not None and variant in XSTS_VARIANTS_BY_NAME:
+            self._sisu.preferred_variant = variant
         if self._xapprove is not None:
             self._xapprove.method = self._xapprove_method
             self._xapprove.sisu = self._sisu
@@ -201,9 +207,17 @@ class XboxXapproveMixin:
         self._xapprove_method_loaded = True
         if self._xapprove is not None:
             self._xapprove.method = method
-        await self._xapprove_method_store.async_save(
-            {"method": method.name, "found": iso_utc(dt_util.utcnow())}
+        saved: dict[str, Any] = {"method": method.name, "found": iso_utc(dt_util.utcnow())}
+        variant = (
+            self._sisu.xsts_variants.get(method.relying_party)
+            if self._sisu is not None and method.token == "xsts" and method.relying_party
+            else None
         )
+        if variant:
+            # The variant of the XSTS step that worked, tried first from now on.
+            saved["xsts_variant"] = variant
+            self._sisu.preferred_variant = variant
+        await self._xapprove_method_store.async_save(saved)
 
     @property
     def xapprove_enabled(self) -> bool:
@@ -981,12 +995,20 @@ class XboxXapproveMixin:
             result["title_token_received"] = bool(tokens.title_token)
             result["sisu_xui_keys"] = list(tokens.xui_keys)
             await self._async_probe_family_and_read(client, tokens, result)
-            # The explicit XSTS step per relying party tried (claim names only).
-            result["xsts_xui_keys"] = {
-                method.relying_party: steps[xsts_step(method.relying_party)].get("display_claims_xui_keys")
-                for method in PROBE_METHODS
-                if method.token == "xsts" and isinstance(steps.get(xsts_step(method.relying_party)), dict)
-            }
+            # The explicit XSTS step per relying party tried: the variant that
+            # worked (None: every one was refused) and its claim names.
+            tried = [m.relying_party for m in PROBE_METHODS if m.token == "xsts" and m.relying_party]
+            xsts: dict[str, Any] = {}
+            for rp in dict.fromkeys(tried):
+                if not any(k.startswith(f"xsts_authorize[{rp}") for k in steps):
+                    continue
+                cached = self._sisu._xsts.get(rp)
+                xsts[rp] = {
+                    "variant": self._sisu.xsts_variants.get(rp) if cached else None,
+                    "xui_keys": list(cached.xui_keys) if cached else None,
+                }
+            result["xsts"] = xsts
+            result["xsts_xui_keys"] = {rp: v["xui_keys"] for rp, v in xsts.items()}
         self._sisu.token_facts = {}
         return result
 
@@ -1037,19 +1059,26 @@ class XboxXapproveMixin:
         result["children"] = resolved
         if first is None:
             return
-        url = overrides_url(first[1])
+        urls = {PATH_OVERRIDES: overrides_url(first[1])}
+        urls.update({p: screentime_url(first[1]) for _m, p in PROBE_ATTEMPTS if p != PATH_OVERRIDES})
         attempts: list[dict[str, Any]] = []
         working: AuthMethod | None = None
         state: dict[str, Any] | None = None
-        for method in PROBE_METHODS:
-            facts = await client.async_try(method, url)
-            state = facts.pop("state", None)
+        settings_ok: list[str] = []
+        for method, path in PROBE_ATTEMPTS:
+            facts = await client.async_try(method, urls[path], path)
+            found = facts.pop("state", None)
             attempts.append(facts)
             status = facts.get("status")
             if isinstance(status, int) and 200 <= status < 300:
-                working = method
+                if path != PATH_OVERRIDES:
+                    # The settings read alone is not what the integration uses.
+                    settings_ok.append(method.name)
+                    continue
+                working, state = method, found
                 break
         result["overrides_attempts"] = attempts
+        result["screentime_read_ok"] = settings_ok
         result["working_method"] = working.name if working else None
         read: dict[str, Any] = {"account_id": first[0]}
         if working is None:

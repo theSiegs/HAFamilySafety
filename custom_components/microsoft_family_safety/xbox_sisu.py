@@ -331,6 +331,8 @@ async def async_refresh_msa(
 async def _signed_post(
     session: aiohttp.ClientSession, key: ProofKey, url: str, body: dict, step: str, facts: dict | None,
     extra_headers: dict[str, str] | None = None,
+    *,
+    signed: bool = True,
 ) -> tuple[int, Any, dict[str, str]]:
     raw = json.dumps(body, separators=(",", ":")).encode()
     headers = {
@@ -338,8 +340,9 @@ async def _signed_post(
         "Accept": "application/json",
         "x-xbl-contract-version": "1",
         **(extra_headers or {}),
-        "Signature": key.sign("POST", url, "", raw),
     }
+    if signed:
+        headers["Signature"] = key.sign("POST", url, "", raw)
     status, payload, resp_headers = await _call(session, "POST", url, data=raw, headers=headers)
     _record(facts, step, {"status": status, "xerr": _xerr(payload, resp_headers)})
     return status, payload, resp_headers
@@ -391,11 +394,13 @@ async def async_sisu_authorize(
             "authorization_token_received": bool(isinstance(auth, dict) and auth.get("Token")),
             "user_token_received": bool(isinstance(payload, dict) and payload.get("UserToken")),
             "title_token_received": bool(isinstance(payload, dict) and payload.get("TitleToken")),
+            "device_token_received": bool(isinstance(payload, dict) and payload.get("DeviceToken")),
             "display_claims_xui_keys": sorted(str(k) for k in xui),
         })
     if status == 200 and isinstance(auth, dict) and isinstance(auth.get("Token"), str) and xui.get("uhs"):
         user = payload.get("UserToken") if isinstance(payload.get("UserToken"), dict) else {}
         title = payload.get("TitleToken") if isinstance(payload.get("TitleToken"), dict) else {}
+        device = payload.get("DeviceToken")
         xid = xui.get("xid")
         return XboxTokens(
             str(xui["uhs"]), auth["Token"], _not_after(auth),
@@ -404,6 +409,7 @@ async def async_sisu_authorize(
             title_token=str(title.get("Token") or ""),
             title_not_after=_not_after(title) if title else None,
             xui_keys=tuple(sorted(str(k) for k in xui)),
+            device_token=device if isinstance(device, str) else "",
         )
     if status and 400 <= status < 500:
         raise XapproveRefused("sisu_authorize", status, _xerr(payload, headers))
@@ -419,9 +425,48 @@ def _xui(token: Any) -> dict[str, Any]:
     return {}
 
 
-def xsts_step(relying_party: str) -> str:
+class XstsVariantSkipped(XapproveError):
+    """A variant of the XSTS step that could not be sent (nothing was asked)."""
+
+
+@dataclass(frozen=True)
+class XstsVariant:
+    """One way of asking the explicit XSTS step (probe_xapprove tries them).
+
+    ``claims``: send OptionalDisplayClaims; ``title``: send SISU's TitleToken;
+    ``sisu_device``: the DeviceToken from SISU's answer instead of the one
+    from device/authenticate; ``signed``: the Signature header;
+    ``charset``: ``application/json; charset=utf-8`` (else plain JSON).
+    """
+
+    name: str
+    claims: bool = True
+    title: bool = True
+    sisu_device: bool = False
+    signed: bool = True
+    charset: bool = True
+
+
+#: In order; the first that answers 200 is used (and remembered). Live
+#: 2026-11-08 ``app`` got 400 XErr 2148916279 (0x8015DC37) for
+#: http://xboxlive.com.
+XSTS_VARIANTS: list[XstsVariant] = [
+    XstsVariant("app"),
+    XstsVariant("no_claims", claims=False),
+    XstsVariant("no_title", title=False),
+    XstsVariant("sisu_device", sisu_device=True),
+    XstsVariant("unsigned", signed=False),
+    XstsVariant("plain_json", charset=False),
+    XstsVariant("bare", claims=False, title=False, charset=False),
+]
+XSTS_VARIANTS_BY_NAME = {v.name: v for v in XSTS_VARIANTS}
+
+
+def xsts_step(relying_party: str, variant: str = "app") -> str:
     """The name of the explicit XSTS step for one relying party (facts)."""
-    return f"xsts_authorize[{relying_party}]"
+    if variant == "app":
+        return f"xsts_authorize[{relying_party}]"
+    return f"xsts_authorize[{relying_party}|{variant}]"
 
 
 async def async_xsts_authorize(
@@ -431,31 +476,43 @@ async def async_xsts_authorize(
     device_token: str,
     relying_party: str = RP_XBOXLIVE,
     facts: dict | None = None,
+    variant: XstsVariant = XSTS_VARIANTS[0],
 ) -> XboxTokens:
     """The app's explicit XSTS step: ``xsts.auth.xboxlive.com/xsts/authorize``
     with SISU's user token, the device token and SISU's title token (when one
-    came), signed with the ProofKey, for ``relying_party``.
+    came), signed with the ProofKey, for ``relying_party``; ``variant``
+    leaves parts out or changes them.
 
     The parent xuid is kept from SISU when the answer carries no ``xid``.
     """
-    properties: dict[str, Any] = {"SandboxId": "RETAIL", "DeviceToken": device_token}
-    if sisu_tokens.title_token:
+    step = xsts_step(relying_party, variant.name)
+    device = sisu_tokens.device_token if variant.sisu_device else device_token
+    if not device:
+        _record(facts, step, {"skipped": "no DeviceToken in SISU's answer"})
+        raise XstsVariantSkipped(f"{step}: no DeviceToken from SISU")
+    properties: dict[str, Any] = {"SandboxId": "RETAIL", "DeviceToken": device}
+    title_sent = bool(variant.title and sisu_tokens.title_token)
+    if title_sent:
         properties["TitleToken"] = sisu_tokens.title_token
     properties["UserTokens"] = [sisu_tokens.user_token]
-    properties["OptionalDisplayClaims"] = list(OPTIONAL_DISPLAY_CLAIMS)
-    step = xsts_step(relying_party)
+    if variant.claims:
+        properties["OptionalDisplayClaims"] = list(OPTIONAL_DISPLAY_CLAIMS)
     status, payload, headers = await _signed_post(session, key, XSTS_AUTHORIZE_URL, {
         "RelyingParty": relying_party,
         "TokenType": "JWT",
         "Properties": properties,
     }, step, facts, {
-        "Content-Type": "application/json; charset=utf-8",
+        "Content-Type": "application/json; charset=utf-8" if variant.charset else "application/json",
         "User-Agent": XAL_USER_AGENT,
-    })
+    }, signed=variant.signed)
     xui = _xui(payload)
     if facts is not None and isinstance(facts.get(step), dict):
         facts[step].update({
-            "title_token_sent": bool(sisu_tokens.title_token),
+            "variant": variant.name,
+            "title_token_sent": title_sent,
+            "claims_sent": variant.claims,
+            "signed": variant.signed,
+            "device_token_from": "sisu" if variant.sisu_device else "device_authenticate",
             "token_received": bool(isinstance(payload, dict) and payload.get("Token")),
             "display_claims_xui_keys": sorted(str(k) for k in xui),
         })
@@ -508,6 +565,13 @@ class XboxSisuAuth:
         self._tokens: XboxTokens | None = None
         #: relying party -> the explicit XSTS step's token (memory only).
         self._xsts: dict[str, XboxTokens] = {}
+        #: relying party -> the XstsVariant name that worked.
+        self.xsts_variants: dict[str, str] = {}
+        #: relying party -> the refusal when every variant failed (until the
+        #: SISU tokens are renewed: no second sweep for nothing).
+        self._xsts_failed: dict[str, XapproveError] = {}
+        #: The variant tried first (probe_xapprove saves the one that worked).
+        self.preferred_variant: str | None = None
         self._access: dict[str, MsaTokens] = {}
         self._lock = asyncio.Lock()
         self.token_facts: dict[str, Any] = {}
@@ -515,6 +579,7 @@ class XboxSisuAuth:
     def forget_tokens(self) -> None:
         self._tokens = None
         self._xsts.clear()
+        self._xsts_failed.clear()
         self._access.clear()
 
     def seed(self, sign_in: SignIn) -> None:
@@ -522,6 +587,7 @@ class XboxSisuAuth:
         self._device = (sign_in.device_token, sign_in.device_not_after)
         self._tokens = sign_in.tokens
         self._xsts.clear()
+        self._xsts_failed.clear()
 
     async def _async_msa(self, scope: str = SCOPE) -> MsaTokens:
         cached = self._access.get(scope)
@@ -552,16 +618,38 @@ class XboxSisuAuth:
             if cached is not None and not force and _valid(cached.xsts_not_after):
                 return cached
             sisu_tokens = await self._async_sisu(force)
+            if not force and relying_party in self._xsts_failed:
+                raise self._xsts_failed[relying_party]
             session = self._session_getter()
             if self._device is None or not _valid(self._device[1]):
                 self._device = await async_device_token(
                     session, self.key, self._credential["device_id"], self.token_facts
                 )
-            tokens = await async_xsts_authorize(
-                session, self.key, sisu_tokens, self._device[0], relying_party, self.token_facts
-            )
-            self._xsts[relying_party] = tokens
-            return tokens
+            first: XapproveError | None = None
+            for variant in self._variant_order():
+                try:
+                    tokens = await async_xsts_authorize(
+                        session, self.key, sisu_tokens, self._device[0], relying_party,
+                        self.token_facts, variant,
+                    )
+                except XapproveRefused as err:
+                    first = first or err
+                    continue
+                except XstsVariantSkipped:
+                    continue
+                self._xsts[relying_party] = tokens
+                self.xsts_variants[relying_party] = variant.name
+                return tokens
+            error = first or XapproveError(f"{xsts_step(relying_party)}: no variant answered")
+            self._xsts_failed[relying_party] = error
+            raise error
+
+    def _variant_order(self) -> list[XstsVariant]:
+        """XSTS_VARIANTS, the preferred one (if any) first."""
+        preferred = XSTS_VARIANTS_BY_NAME.get(self.preferred_variant or "")
+        if preferred is None:
+            return list(XSTS_VARIANTS)
+        return [preferred] + [v for v in XSTS_VARIANTS if v is not preferred]
 
     async def _async_sisu(self, force: bool) -> XboxTokens:
         """SISU's tokens, renewed when they ran out. The caller holds the lock."""
@@ -569,6 +657,7 @@ class XboxSisuAuth:
             return self._tokens
         # New SISU tokens: the XSTS made from the old ones go too.
         self._xsts.clear()
+        self._xsts_failed.clear()
         session = self._session_getter()
         msa = await self._async_msa()
         if self._device is None or not _valid(self._device[1]):

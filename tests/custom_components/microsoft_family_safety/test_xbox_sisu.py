@@ -249,7 +249,7 @@ async def test_the_probe_with_the_xbox_sign_in(hass, server, hass_storage, caplo
     assert result["steps"]["device_authenticate"]["status"] == 200
     assert result["family"]["ok"] is True and result["family"]["adults"] == 1
     assert result["overrides_attempts"] == [
-        {"name": "xsts_signed", "stage": "xapprove", "status": 200, "xerr": None}
+        {"name": "xsts_signed", "path": "overrides", "stage": "xapprove", "status": 200, "xerr": None}
     ]
     assert result["working_method"] == "xsts_signed" and result["method_saved"] is True
     assert result["title_token_received"] is True

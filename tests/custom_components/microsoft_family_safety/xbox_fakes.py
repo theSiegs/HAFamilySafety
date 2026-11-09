@@ -45,6 +45,8 @@ DEVICE_TOKEN = "device-token-SECRET"
 SISU_XSTS = "sisu-xsts-SECRET"
 SISU_AUTH = f"XBL3.0 x=4343;{SISU_XSTS}"
 TITLE_TOKEN = "title-SECRET"
+#: The DeviceToken in SISU's answer (another than device/authenticate's).
+SISU_DEVICE_TOKEN = "sisu-device-token-SECRET"
 #: The explicit XSTS step's token per relying party.
 XSTS_TOKENS = {
     "http://xboxlive.com": "xsts-xboxlive-SECRET",
@@ -62,19 +64,28 @@ USER_CODE = "ABCD-1234"
 SECRETS = (
     PARENT_XUID, CHILD_XUID, GAMERTAG, CODE, SISU_ACCESS, DEVICE_TOKEN, SISU_XSTS,
     "sisu-refresh-", TITLE_TOKEN, "sisu-user-SECRET", DEVICE_CODE, *XSTS_TOKENS.values(),
+    SISU_DEVICE_TOKEN,
 )
 
 
 class FakeResponse:
-    def __init__(self, status: int, payload: Any = None, headers: dict | None = None) -> None:
+    def __init__(
+        self, status: int, payload: Any = None, headers: dict | None = None, text: str | None = None
+    ) -> None:
         self.status = status
         self._payload = payload
+        self._text = text
         self.headers = headers or {}
 
     async def json(self, content_type=None):
         if self._payload is None:
             raise ValueError("no json")
         return self._payload
+
+    async def text(self):
+        if self._text is not None:
+            return self._text
+        return json.dumps(self._payload) if self._payload is not None else ""
 
     async def __aenter__(self):
         return self
@@ -123,8 +134,17 @@ class XboxServer:
         self.xapprove_headers: list[dict] = []
         #: Relying party -> status the explicit XSTS step answers (default 200).
         self.xsts_status: dict[str, int] = {}
-        #: Whether SISU's answer carries a TitleToken.
+        #: Whether SISU's answer carries a TitleToken / its own DeviceToken.
         self.title_token = True
+        self.sisu_device_token = True
+        #: Which explicit XSTS requests answer 200 (else 400 XErr 0x8015DC37).
+        self.xsts_accepts = lambda headers, props: True
+        #: Which headers xapprove accepts on the screen-time settings (None:
+        #: the same as ``accepts``).
+        self.screentime_accepts = None
+        #: xapprove's refusal: headers and body text.
+        self.refusal_headers = {"WWW-Authenticate": "Token realm='xboxlive.com', error='token_required'"}
+        self.refusal_text: str | None = None
         self.refresh_tokens = {"sisu-refresh-1"}
         self.next_refresh = 2
         self.dead = False
@@ -219,7 +239,7 @@ class XboxServer:
             if self.sisu_authorize_status != 200:
                 return FakeResponse(self.sisu_authorize_status, None, {"x-err": "2148916236"})
             return FakeResponse(200, {
-                "DeviceToken": DEVICE_TOKEN,
+                **({"DeviceToken": SISU_DEVICE_TOKEN} if self.sisu_device_token else {}),
                 **({"TitleToken": {
                     "Token": TITLE_TOKEN,
                     "NotAfter": iso_utc(dt_util.utcnow() + timedelta(days=14)),
@@ -236,19 +256,27 @@ class XboxServer:
             payload = json.loads(kwargs["data"])
             rp = payload["RelyingParty"]
             self.sisu_calls.append(f"xsts:{rp}")
-            verify_signature(headers["Signature"], self.jwk, "POST", url, "", kwargs["data"])
+            if "Signature" in headers:
+                verify_signature(headers["Signature"], self.jwk, "POST", url, "", kwargs["data"])
             assert headers["x-xbl-contract-version"] == "1"
-            assert headers["Content-Type"] == "application/json; charset=utf-8"
+            assert headers["Content-Type"] in ("application/json; charset=utf-8", "application/json")
             assert headers["User-Agent"].startswith("XAL Android")
             assert payload["TokenType"] == "JWT"
             props = payload["Properties"]
-            assert props["SandboxId"] == "RETAIL" and props["DeviceToken"] == DEVICE_TOKEN
+            assert props["SandboxId"] == "RETAIL"
+            assert props["DeviceToken"] in (DEVICE_TOKEN, SISU_DEVICE_TOKEN)
             assert props["UserTokens"] == ["sisu-user-SECRET"]
-            assert props.get("TitleToken") == (TITLE_TOKEN if self.title_token else None)
-            assert {"mgt", "umg", "agg", "prv", "ugc"} <= set(props["OptionalDisplayClaims"])
+            if not self.title_token:
+                assert "TitleToken" not in props
+            elif "TitleToken" in props:
+                assert props["TitleToken"] == TITLE_TOKEN
+            if "OptionalDisplayClaims" in props:
+                assert {"mgt", "umg", "agg", "prv", "ugc"} <= set(props["OptionalDisplayClaims"])
             status = self.xsts_status.get(rp, 200)
             if status != 200 or rp not in XSTS_TOKENS:
                 return FakeResponse(status if status != 200 else 400, {"XErr": 2148916233})
+            if not self.xsts_accepts(headers, props):
+                return FakeResponse(400, {"XErr": 2148916279})
             return FakeResponse(200, {
                 "Token": XSTS_TOKENS[rp],
                 "NotAfter": iso_utc(dt_util.utcnow() + timedelta(hours=16)),
@@ -272,10 +300,14 @@ class XboxServer:
             self.xapprove_headers.append(dict(headers))
             if self.xapprove_status != 200:
                 return FakeResponse(self.xapprove_status, None, {"x-err": "2148916238"})
-            if not self.accepts(headers):
-                return FakeResponse(
-                    401, None, {"WWW-Authenticate": "Token realm='xboxlive.com', error='token_required'"}
-                )
+            accepts = self.accepts
+            if url.endswith("/settings/screentime") and self.screentime_accepts is not None:
+                accepts = self.screentime_accepts
+            if not accepts(headers):
+                return FakeResponse(401, None, dict(self.refusal_headers), self.refusal_text)
+            if url.endswith("/settings/screentime"):
+                assert method == "GET"
+                return FakeResponse(200, {"enabled": True})
             if url.endswith("/settings/screentime/overrides/create"):
                 assert method == "POST"
                 payload = json.loads(kwargs["data"])

@@ -28,6 +28,7 @@ import json as jsonlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import logging
+import re
 import secrets
 from typing import Any, Callable
 
@@ -385,6 +386,8 @@ class XboxTokens:
     title_not_after: datetime | None = None
     #: The names (only) of the XSTS's ``xui`` claims.
     xui_keys: tuple[str, ...] = ()
+    #: The DeviceToken in SISU's answer, if any (an XSTS step variant).
+    device_token: str = field(default="", repr=False)
 
     def header(self) -> str:
         return f"XBL3.0 x={self.uhs};{self.xsts}"
@@ -407,6 +410,7 @@ class AuthMethod:
     ``signed``: a ``Signature`` header made with the ProofKey.
     ``contract``: an ``x-xbl-contract-version`` header, or none (the app
     sends none). ``app_like``: the app's other headers (``app_headers``).
+    ``accept_language``: an ``Accept-Language`` header, or none.
     """
 
     name: str
@@ -416,38 +420,61 @@ class AuthMethod:
     msa_scope: str | None = None
     contract: str | None = None
     app_like: bool = True
+    accept_language: str | None = None
+
+
+def _pair(prefix: str, **kwargs: Any) -> list[AuthMethod]:
+    """A way signed, then the same unsigned."""
+    return [
+        AuthMethod(f"{prefix}_signed", signed=True, **kwargs),
+        AuthMethod(f"{prefix}_unsigned", signed=False, **kwargs),
+    ]
 
 
 def _methods() -> list[AuthMethod]:
-    found: list[AuthMethod] = []
-    for prefix, token, rp in (
-        ("xsts", "xsts", RP_XBOXLIVE),
-        ("xsts_xapprove", "xsts", RP_XAPPROVE),
-        ("xsts_xapprove_https", "xsts", RP_XAPPROVE_HTTPS),
-        ("sisu", "sisu", None),
-    ):
-        for signed in (True, False):
-            found.append(AuthMethod(
-                f"{prefix}_{'signed' if signed else 'unsigned'}", token=token,
-                relying_party=rp, signed=signed,
-            ))
-    for prefix, token in (("msa_wlid", "msa_wlid"), ("msa_xbl", "msa_xbl")):
-        for signed in (True, False):
-            found.append(AuthMethod(
-                f"{prefix}_{'signed' if signed else 'unsigned'}", token=token,
-                relying_party=None, signed=signed, msa_scope=XAPPROVE_SCOPE,
-            ))
-    return found
+    sisu: dict[str, Any] = {"token": "sisu", "relying_party": None}
+    msa: dict[str, Any] = {"relying_party": None, "msa_scope": XAPPROVE_SCOPE}
+    return [
+        *_pair("xsts", token="xsts", relying_party=RP_XBOXLIVE),
+        *_pair("xsts_xapprove", token="xsts", relying_party=RP_XAPPROVE),
+        *_pair("xsts_xapprove_https", token="xsts", relying_party=RP_XAPPROVE_HTTPS),
+        *_pair("sisu", **sisu),
+        *_pair("sisu_c1", contract="1", **sisu),
+        *_pair("sisu_c2", contract="2", **sisu),
+        *_pair("sisu_c3", contract="3", **sisu),
+        *_pair("sisu_lang", accept_language="en-US", **sisu),
+        *_pair("msa_wlid", token="msa_wlid", **msa),
+        *_pair("msa_xbl", token="msa_xbl", **msa),
+    ]
 
 
-#: Every way probe_xapprove tries, in order, the most app-like first: the
-#: XSTS from the explicit step per relying party, then SISU's own XSTS, then
-#: the xapprove-scope MSA token, each signed and unsigned, all with the
-#: app's headers. (Live 2026-11-08 the first read with SISU's own XSTS got
-#: 401; every token the Family Safety sign-in can produce got 401
-#: token_required.)
+#: Every way of signing xapprove requests, the most app-like first: the
+#: XSTS from the explicit step per relying party, SISU's own XSTS (also with
+#: contract versions 1-3 and Accept-Language), the xapprove-scope MSA token;
+#: each signed and unsigned. (Live 2026-11-08: SISU's XSTS 401 without
+#: WWW-Authenticate, the MSA token 401 token_required, the explicit XSTS step
+#: 400; every token of the Family Safety sign-in 401 token_required.)
 PROBE_METHODS: list[AuthMethod] = _methods()
 METHODS_BY_NAME: dict[str, AuthMethod] = {m.name: m for m in PROBE_METHODS}
+
+#: The paths probe_xapprove reads: the overrides (what the integration uses)
+#: and the screen-time settings (the app's first call).
+PATH_OVERRIDES = "overrides"
+PATH_SCREENTIME = "screentime"
+#: Ways also tried on the screen-time settings, right after the overrides.
+_SCREENTIME_TOO = frozenset({
+    "xsts_signed", "xsts_unsigned", "sisu_signed", "sisu_unsigned", "sisu_c1_signed", "sisu_c3_signed",
+})
+#: Every (way, path) probe_xapprove tries, in order. It stops at the first
+#: way that reads the overrides; a settings read alone is reported, not saved.
+PROBE_ATTEMPTS: list[tuple[AuthMethod, str]] = [
+    attempt
+    for method in PROBE_METHODS
+    for attempt in (
+        [(method, PATH_OVERRIDES), (method, PATH_SCREENTIME)]
+        if method.name in _SCREENTIME_TOO else [(method, PATH_OVERRIDES)]
+    )
+]
 #: The way the integration uses until probe_xapprove saves another.
 DEFAULT_METHOD = METHODS_BY_NAME["xsts_signed"]
 #: The Xbox family read (accounts.xboxlive.com): SISU's XSTS, signed.
@@ -469,8 +496,61 @@ def method_by_name(name: Any) -> AuthMethod | None:
 def _www_authenticate(headers: dict[str, str]) -> dict[str, str] | None:
     for name, value in headers.items():
         if str(name).lower() == "www-authenticate":
-            return {"name": str(name), "value": str(value)[:300]}
+            return {"name": str(name), "value": redact(str(value))[:300]}
     return None
+
+
+_JWT = re.compile(r"eyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*){1,2}")
+_LONG_TOKEN = re.compile(r"[A-Za-z0-9+/_=.-]{32,}")
+_LONG_NUMBER = re.compile(r"\d{12,}")
+
+
+def redact(text: str) -> str:
+    """Text with anything token-like or id-like taken out: JWTs, long
+    base64-ish strings, numbers of 12+ digits (xuids; an XErr has 10)."""
+    text = _JWT.sub("<jwt>", text)
+    text = _LONG_TOKEN.sub("<redacted>", text)
+    return _LONG_NUMBER.sub("<number>", text)
+
+
+def _reported_header(name: str) -> bool:
+    lower = name.lower()
+    return (
+        lower in ("x-err", "ms-cv", "www-authenticate", "x-xbl-debug", "content-type")
+        or "authenticate" in lower
+        or "error" in lower
+    )
+
+
+def response_facts(headers: dict[str, str], text: str | None) -> dict[str, Any]:
+    """probe_xapprove, a refused read: every header name, the values of the
+    error/auth/correlation headers and the start of the body, redacted."""
+    return {
+        "response_header_names": sorted({str(n) for n in headers}),
+        "response_headers": {
+            str(n): redact(str(v))[:300] for n, v in headers.items() if _reported_header(str(n))
+        },
+        "response_body": redact(text or "")[:300],
+    }
+
+
+async def _call_text(
+    session: aiohttp.ClientSession, method: str, url: str, **kwargs: Any
+) -> tuple[int, Any, dict[str, str], str]:
+    """Like _call, with the body text as well (probe_xapprove)."""
+    try:
+        async with session.request(method, url, timeout=_TIMEOUT, **kwargs) as resp:
+            try:
+                text = await resp.text()
+            except (ValueError, UnicodeDecodeError, aiohttp.ClientPayloadError):
+                text = ""
+            try:
+                payload = jsonlib.loads(text) if text else None
+            except ValueError:
+                payload = None
+            return resp.status, payload, dict(resp.headers), text
+    except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as err:
+        raise XapproveError(f"{type(err).__name__} on {URL(url).host}") from err
 
 
 # ----------------------------------------------------------------------
@@ -549,6 +629,8 @@ class XapproveClient:
             headers["Signature"] = sisu.sign(http_method, url, value, body)
         if method.contract:
             headers["x-xbl-contract-version"] = method.contract
+        if method.accept_language:
+            headers["Accept-Language"] = method.accept_language
         return headers
 
     async def _request(
@@ -586,12 +668,15 @@ class XapproveClient:
             return payload
         raise XapproveError(step)  # not reached
 
-    async def async_try(self, method: AuthMethod, url: str) -> dict[str, Any]:
+    async def async_try(self, method: AuthMethod, url: str, path: str | None = None) -> dict[str, Any]:
         """probe_xapprove: one read-only GET with ``method``, no retry; facts only.
 
-        ``state`` (the parsed overrides) is added on a 2xx answer.
+        ``state`` (the parsed overrides) is added on a 2xx answer; a refused
+        answer adds response_facts (redacted).
         """
         facts: dict[str, Any] = {"name": method.name}
+        if path is not None:
+            facts["path"] = path
         try:
             headers = await self.async_auth_headers(method, http_method="GET", url=url)
         except XapproveRefused as err:
@@ -602,7 +687,7 @@ class XapproveClient:
             return facts
         headers["Accept"] = "application/json"
         try:
-            status, payload, resp_headers = await _call(
+            status, payload, resp_headers, text = await _call_text(
                 self._session_getter(), "GET", url, headers=headers
             )
         except XapproveError as err:
@@ -613,7 +698,10 @@ class XapproveClient:
         if www is not None:
             facts["www_authenticate"] = www
         if 200 <= status < 300:
-            facts["state"] = parse_overrides(payload)
+            if path in (None, PATH_OVERRIDES):
+                facts["state"] = parse_overrides(payload)
+        else:
+            facts.update(response_facts(resp_headers, text))
         return facts
 
     # Reads ------------------------------------------------------------------
@@ -661,5 +749,10 @@ class XapproveClient:
         return await self.async_create(xuid, OVERRIDE_CANCEL, dt_util.utcnow())
 
 
+def screentime_url(xuid: str) -> str:
+    """The child's screen-time settings (the app's first xapprove call)."""
+    return f"{XAPPROVE_HOST}/api/v1/user/{xuid}/settings/screentime"
+
+
 def overrides_url(xuid: str) -> str:
-    return f"{XAPPROVE_HOST}/api/v1/user/{xuid}/settings/screentime/overrides"
+    return f"{screentime_url(xuid)}/overrides"
