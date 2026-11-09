@@ -1696,7 +1696,10 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
         if self._xbox_check.get("outcome") == "works":
             # The way probe_xapprove would have saved.
             await Store(self.hass, 1, f"{DOMAIN}.xapprove.{entry_id}").async_save(
-                {"method": "sisu", "found": dt_util.utcnow().isoformat()}
+                {
+                    "method": self._xbox_check.get("method") or "xsts_signed",
+                    "found": dt_util.utcnow().isoformat(),
+                }
             )
         return await self._async_step_xbox_signin_result()
 

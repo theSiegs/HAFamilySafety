@@ -71,11 +71,10 @@ from .screen_time import (
     parse_utc,
 )
 from .xapprove import (
-    METHODS_BY_NAME,
+    DEFAULT_METHOD,
     OVERRIDE_ALLOW,
     OVERRIDE_BLOCK,
     PROBE_METHODS,
-    SISU_METHOD,
     AuthMethod,
     XapproveClient,
     XapproveError,
@@ -85,9 +84,10 @@ from .xapprove import (
     match_children,
     member_roles,
     member_xuid,
+    method_by_name,
     overrides_url,
 )
-from .xbox_sisu import SignIn, XboxSignInExpired, XboxSisuAuth
+from .xbox_sisu import SignIn, XboxSignInExpired, XboxSisuAuth, xsts_step
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -145,7 +145,7 @@ class XboxXapproveMixin:
         self._xapprove_method_store: Store = Store(
             self.hass, 1, f"{DOMAIN}.xapprove.{entry.entry_id}"
         )
-        self._xapprove_method: AuthMethod = SISU_METHOD
+        self._xapprove_method: AuthMethod = DEFAULT_METHOD
         self._xapprove_method_loaded = False
         #: The Xbox Family Settings sign-in (options flow), if there is one.
         self._xbox_signin_store: Store = Store(
@@ -191,8 +191,7 @@ class XboxXapproveMixin:
                 _LOGGER.warning("The stored Xbox Family Settings sign-in is unreadable (%s)", type(err).__name__)
         data = await self._xapprove_method_store.async_load()
         name = data.get("method") if isinstance(data, dict) else None
-        method = METHODS_BY_NAME.get(name) if name else None
-        self._xapprove_method = method or SISU_METHOD
+        self._xapprove_method = method_by_name(name) or DEFAULT_METHOD
         if self._xapprove is not None:
             self._xapprove.method = self._xapprove_method
             self._xapprove.sisu = self._sisu
@@ -888,16 +887,17 @@ class XboxXapproveMixin:
 
         Read-only, on the new sign-in's tokens only (no Family token, no
         refresh): the Xbox family read when a child's Xbox user id is not
-        known yet, then one GET of that child's overrides signed the ``sisu``
-        way, as probe_xapprove's first attempt. ``outcome`` is ``works``,
-        ``refused`` (xapprove answered 401/403) or ``unchecked`` with a short
-        ``reason``. Never raises; nothing secret in the answer.
+        known yet, then one GET of that child's overrides made the default way
+        (xapprove.DEFAULT_METHOD), as probe_xapprove's first attempt.
+        ``outcome`` is ``works`` (``method`` names the way), ``refused``
+        (xapprove answered 401/403) or ``unchecked`` with a short ``reason``.
+        Never raises; nothing secret in the answer.
         """
         try:
             auth = XboxSisuAuth(lambda: async_get_clientsession(self.hass), sign_in.credential, _no_save)
             auth.seed(sign_in)
             client = XapproveClient(
-                lambda: async_get_clientsession(self.hass), method=SISU_METHOD, sisu=auth,
+                lambda: async_get_clientsession(self.hass), method=DEFAULT_METHOD, sisu=auth,
             )
             children = self._children()
             if not children:
@@ -919,13 +919,13 @@ class XboxXapproveMixin:
                 if not matched:
                     return {"outcome": "unchecked", "reason": "no child found in the Xbox family"}
                 xuid = next(iter(matched.values()))[0]
-            facts = await client.async_try(SISU_METHOD, overrides_url(xuid))
+            facts = await client.async_try(DEFAULT_METHOD, overrides_url(xuid))
         except Exception as err:  # noqa: BLE001 - the sign-in is kept either way
             _LOGGER.debug("Checking the new Xbox sign-in failed: %s", type(err).__name__)
             return {"outcome": "unchecked", "reason": type(err).__name__}
         status = facts.get("status")
         if isinstance(status, int) and 200 <= status < 300:
-            return {"outcome": "works", "reason": ""}
+            return {"outcome": "works", "reason": "", "method": DEFAULT_METHOD.name}
         if status in (401, 403):
             return {"outcome": "refused", "reason": f"HTTP {status}"}
         return {
@@ -966,6 +966,8 @@ class XboxXapproveMixin:
             return result
         session = async_get_clientsession(self.hass)
         client = XapproveClient(lambda: session, sisu=self._sisu)
+        # Fresh tokens, so that every step shows up in ``steps``.
+        self._sisu.forget_tokens()
         self._sisu.token_facts = steps
         try:
             tokens = await client.async_tokens()
@@ -976,7 +978,15 @@ class XboxXapproveMixin:
             if isinstance(err, XapproveRefused):
                 self._xapprove_mark_refused(err)
         else:
+            result["title_token_received"] = bool(tokens.title_token)
+            result["sisu_xui_keys"] = list(tokens.xui_keys)
             await self._async_probe_family_and_read(client, tokens, result)
+            # The explicit XSTS step per relying party tried (claim names only).
+            result["xsts_xui_keys"] = {
+                method.relying_party: steps[xsts_step(method.relying_party)].get("display_claims_xui_keys")
+                for method in PROBE_METHODS
+                if method.token == "xsts" and isinstance(steps.get(xsts_step(method.relying_party)), dict)
+            }
         self._sisu.token_facts = {}
         return result
 

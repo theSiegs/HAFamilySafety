@@ -4,8 +4,11 @@ The Xbox Family Settings app reads and writes a child's Xbox screen-time
 override on ``https://xapprove.xboxlive.com`` with an Xbox Live XSTS token
 (``Authorization: XBL3.0 x=<uhs>;<token>``) from its own sign-in. This client
 uses the integration's Xbox Family Settings sign-in for that (xbox_sisu.py):
-its XSTS, and its ProofKey to sign each request. (Every token the Family
-Safety sign-in can produce was refused, 401 token_required, live 2026-11-08.)
+by default the XSTS of its explicit XSTS step (SISU's user, device and title
+tokens, relying party http://xboxlive.com), the app's request headers, and
+its ProofKey to sign each request; probe_xapprove tries the other ways
+(``PROBE_METHODS``). (Every token the Family Safety sign-in can produce was
+refused, 401 token_required, live 2026-11-08; SISU's own XSTS got a 401 too.)
 
 The override model (captured from the Xbox Family Settings app, 2026-11-08):
 
@@ -20,10 +23,12 @@ Nothing secret is logged or returned: no token, gamertag or Xbox user id.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json as jsonlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import logging
+import secrets
 from typing import Any, Callable
 
 import aiohttp
@@ -334,24 +339,52 @@ def match_children(
 
 
 # ----------------------------------------------------------------------
-# ----------------------------------------------------------------------
 # Tokens and ways of signing a request
 # ----------------------------------------------------------------------
 
 #: An MSA scope for xapprove itself (tried by probe_xapprove).
 XAPPROVE_SCOPE = "service::xapprove.xboxlive.com::MBI_SSL"
 
+#: Relying parties for the explicit XSTS step (xsts.auth.xboxlive.com) that
+#: probe_xapprove tries. The app's capture shows http://xboxlive.com.
+RP_XBOXLIVE = "http://xboxlive.com"
+RP_XAPPROVE = "http://xapprove.xboxlive.com"
+RP_XAPPROVE_HTTPS = "https://xapprove.xboxlive.com/"
+
+#: Headers the Xbox Family Settings app sends to xapprove (capture,
+#: 2026-11): okhttp's user agent, a JSON content type, a correlation vector
+#: (``MS-CV``) and no ``x-xbl-contract-version``.
+APP_USER_AGENT = "okhttp/4.9.2"
+
+
+def new_ms_cv() -> str:
+    """A fresh correlation vector: 16 base64 characters and ``.1``."""
+    return base64.b64encode(secrets.token_bytes(12)).decode() + ".1"
+
+
+def app_headers() -> dict[str, str]:
+    return {
+        "User-Agent": APP_USER_AGENT,
+        "Content-Type": "application/json",
+        "MS-CV": new_ms_cv(),
+    }
+
 
 @dataclass
 class XboxTokens:
-    """An XSTS token for http://xboxlive.com and its claims. Never logged."""
+    """An XSTS token and its claims (plus SISU's other tokens). Never logged."""
 
     uhs: str
-    xsts: str
+    xsts: str = field(repr=False)
     xsts_not_after: datetime | None
-    user_token: str
+    user_token: str = field(repr=False)
     user_not_after: datetime | None
     parent_xuid: str | None = field(default=None, repr=False)
+    #: SISU's TitleToken (the Xbox Family Settings title), for the XSTS step.
+    title_token: str = field(default="", repr=False)
+    title_not_after: datetime | None = None
+    #: The names (only) of the XSTS's ``xui`` claims.
+    xui_keys: tuple[str, ...] = ()
 
     def header(self) -> str:
         return f"XBL3.0 x={self.uhs};{self.xsts}"
@@ -361,38 +394,76 @@ class XboxTokens:
 class AuthMethod:
     """How xapprove's Authorization header is made, from the Xbox sign-in.
 
-    ``scheme``:
+    ``token``:
 
-    * ``sisu``: ``XBL3.0 x=<uhs>;<xsts>`` with the XSTS of the Xbox Family
-      Settings sign-in (xbox_sisu.py), the request signed with its ProofKey
-      (``Signature`` header);
-    * ``sisu_unsigned``: the same without the signature;
-    * ``sisu_wlid``: ``WLID1.0 t=<token>``, an MSA token of the Xbox Family
-      Settings client for ``msa_scope``, signed.
+    * ``xsts``: ``XBL3.0 x=<uhs>;<xsts>`` with an XSTS from the explicit
+      ``xsts.auth.xboxlive.com/xsts/authorize`` step for ``relying_party``
+      (SISU's user, device and title tokens), as the app does;
+    * ``sisu``: the same with SISU's own ``AuthorizationToken``;
+    * ``msa_wlid``: ``WLID1.0 t=<token>``, an MSA token of the Xbox Family
+      Settings client for ``msa_scope``;
+    * ``msa_xbl``: ``XBL3.0 x=<uhs>;<token>`` with that MSA token.
 
-    ``contract``: an ``x-xbl-contract-version`` header, or none.
+    ``signed``: a ``Signature`` header made with the ProofKey.
+    ``contract``: an ``x-xbl-contract-version`` header, or none (the app
+    sends none). ``app_like``: the app's other headers (``app_headers``).
     """
 
     name: str
-    scheme: str = "sisu"
+    token: str = "xsts"
+    relying_party: str | None = RP_XBOXLIVE
+    signed: bool = True
     msa_scope: str | None = None
     contract: str | None = None
+    app_like: bool = True
 
 
-SISU_SCHEMES = frozenset({"sisu", "sisu_unsigned", "sisu_wlid"})
+def _methods() -> list[AuthMethod]:
+    found: list[AuthMethod] = []
+    for prefix, token, rp in (
+        ("xsts", "xsts", RP_XBOXLIVE),
+        ("xsts_xapprove", "xsts", RP_XAPPROVE),
+        ("xsts_xapprove_https", "xsts", RP_XAPPROVE_HTTPS),
+        ("sisu", "sisu", None),
+    ):
+        for signed in (True, False):
+            found.append(AuthMethod(
+                f"{prefix}_{'signed' if signed else 'unsigned'}", token=token,
+                relying_party=rp, signed=signed,
+            ))
+    for prefix, token in (("msa_wlid", "msa_wlid"), ("msa_xbl", "msa_xbl")):
+        for signed in (True, False):
+            found.append(AuthMethod(
+                f"{prefix}_{'signed' if signed else 'unsigned'}", token=token,
+                relying_party=None, signed=signed, msa_scope=XAPPROVE_SCOPE,
+            ))
+    return found
 
-#: Every way probe_xapprove tries, in order. (Live 2026-11-08, every token
-#: the Family Safety sign-in can produce got 401 token_required; those ways
-#: were removed.)
-PROBE_METHODS: list[AuthMethod] = [
-    AuthMethod("sisu"),
-    AuthMethod("sisu_unsigned", scheme="sisu_unsigned"),
-    AuthMethod("sisu_contract_1", contract="1"),
-    AuthMethod("sisu_xapprove_scope_wlid", scheme="sisu_wlid", msa_scope=XAPPROVE_SCOPE),
-]
+
+#: Every way probe_xapprove tries, in order, the most app-like first: the
+#: XSTS from the explicit step per relying party, then SISU's own XSTS, then
+#: the xapprove-scope MSA token, each signed and unsigned, all with the
+#: app's headers. (Live 2026-11-08 the first read with SISU's own XSTS got
+#: 401; every token the Family Safety sign-in can produce got 401
+#: token_required.)
+PROBE_METHODS: list[AuthMethod] = _methods()
 METHODS_BY_NAME: dict[str, AuthMethod] = {m.name: m for m in PROBE_METHODS}
-SISU_METHOD = METHODS_BY_NAME["sisu"]
-DEFAULT_METHOD = SISU_METHOD
+#: The way the integration uses until probe_xapprove saves another.
+DEFAULT_METHOD = METHODS_BY_NAME["xsts_signed"]
+#: The Xbox family read (accounts.xboxlive.com): SISU's XSTS, signed.
+FAMILY_METHOD = AuthMethod("family", token="sisu", relying_party=None, app_like=False)
+#: Names saved by earlier versions -> today's way.
+_LEGACY_NAMES = {
+    "sisu": "sisu_signed",
+    "sisu_xapprove_scope_wlid": "msa_wlid_signed",
+}
+
+
+def method_by_name(name: Any) -> AuthMethod | None:
+    """A saved way by name (earlier versions' names included); None if unknown."""
+    if not isinstance(name, str):
+        return None
+    return METHODS_BY_NAME.get(_LEGACY_NAMES.get(name, name))
 
 
 def _www_authenticate(headers: dict[str, str]) -> dict[str, str] | None:
@@ -444,7 +515,7 @@ class XapproveClient:
         return tokens.parent_xuid if tokens else None
 
     async def async_tokens(self, *, force: bool = False) -> XboxTokens:
-        """The sign-in's XSTS for http://xboxlive.com (family read, parent xuid)."""
+        """SISU's XSTS for http://xboxlive.com (family read, parent xuid)."""
         return await self._need_sisu().async_xsts(force=force)
 
     async def async_auth_headers(
@@ -456,17 +527,25 @@ class XapproveClient:
         url: str = "",
         body: bytes = b"",
     ) -> dict[str, str]:
-        """The Authorization header (and Signature, for a signed way) of one request."""
+        """The headers of one request made ``method``'s way: Authorization,
+        Signature for a signed way, the contract header, the app's headers."""
         method = method or self.method
         sisu = self._need_sisu()
-        if method.scheme == "sisu_wlid":
+        if method.token in ("msa_wlid", "msa_xbl"):
             if force:
                 sisu.forget_tokens()
-            value = f"WLID1.0 t={await sisu.async_access_token(method.msa_scope)}"
+            token = await sisu.async_access_token(method.msa_scope or XAPPROVE_SCOPE)
+            if method.token == "msa_wlid":
+                value = f"WLID1.0 t={token}"
+            else:
+                value = f"XBL3.0 x={(await sisu.async_xsts()).uhs};{token}"
+        elif method.token == "xsts":
+            value = (await sisu.async_title_xsts(method.relying_party or RP_XBOXLIVE, force=force)).header()
         else:
             value = (await sisu.async_xsts(force=force)).header()
-        headers = {"Authorization": value}
-        if method.scheme != "sisu_unsigned":
+        headers = app_headers() if method.app_like else {}
+        headers["Authorization"] = value
+        if method.signed:
             headers["Signature"] = sisu.sign(http_method, url, value, body)
         if method.contract:
             headers["x-xbl-contract-version"] = method.contract
@@ -478,13 +557,13 @@ class XapproveClient:
     ) -> Any:
         """One authorised request; a 401/403 is retried once with fresh tokens.
 
-        xapprove uses ``self.method``; the family read the signed XSTS.
+        xapprove uses ``self.method``; the family read SISU's XSTS, signed.
         """
         body = jsonlib.dumps(json, separators=(",", ":")).encode() if json is not None else b""
         for attempt in (0, 1):
             if step == "family":
                 headers = await self.async_auth_headers(
-                    SISU_METHOD, force=attempt == 1, http_method=method, url=url, body=body
+                    FAMILY_METHOD, force=attempt == 1, http_method=method, url=url, body=body
                 )
             else:
                 headers = await self.async_auth_headers(

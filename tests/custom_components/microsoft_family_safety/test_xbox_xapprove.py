@@ -40,6 +40,10 @@ from .xbox_fakes import (
     PATCH_SESSION,
     SECRETS,
     SISU_ACCESS,
+    SISU_AUTH,
+    XSTS_AUTH,
+    XSTS_TOKENS,
+    XSTS_XUI,
     XboxServer,
     hours as _hours,
     make_rig,
@@ -348,6 +352,7 @@ async def test_tokens_are_reused(rig, server):
     await rig.async_unlock_platform(CHILD, "Xbox")
     assert server.sisu_calls == [
         "token:refresh_token:service::user.auth.xboxlive.com::MBI_SSL", "device", "authorize",
+        "xsts:http://xboxlive.com",
     ]
     assert len(server.urls("https://accounts.xboxlive.com/")) == 1
 
@@ -483,12 +488,12 @@ async def test_probe_answers_without_secrets(rig, server, caplog):
     assert family["signed_in_parent_listed"] is True
     assert result["children"] == {CHILD: {"resolved": True, "via": "family_name"}}
     assert result["overrides_attempts"] == [
-        {"name": "sisu", "stage": "xapprove", "status": 200, "xerr": None}
+        {"name": "xsts_signed", "stage": "xapprove", "status": 200, "xerr": None}
     ]
     read = result["overrides_read"]
     assert read["ok"] is True and read["override_active"] is True
     assert read["type"] == "blockUntil" and read["raw_type"] == 2
-    assert result["working_method"] == "sisu" and result["method_saved"] is True
+    assert result["working_method"] == "xsts_signed" and result["method_saved"] is True
     assert server.creates == []  # the probe writes nothing
     assert rig.web_api.web_calls == []
     _no_secrets(result)
@@ -501,12 +506,12 @@ async def test_probe_tries_each_way_and_reports_the_refusal(rig, server):
     result = await rig.async_probe_xapprove(True)
 
     names = [a["name"] for a in result["overrides_attempts"]]
-    assert names == ["sisu", "sisu_unsigned", "sisu_contract_1", "sisu_xapprove_scope_wlid"]
+    assert names == ALL_NAMES[:ALL_NAMES.index("msa_wlid_signed") + 1]
     first = result["overrides_attempts"][0]
     assert first["status"] == 401
     assert first["www_authenticate"]["value"] == "Token realm='xboxlive.com', error='token_required'"
-    assert result["working_method"] == "sisu_xapprove_scope_wlid"
-    assert rig._xapprove_method.name == "sisu_xapprove_scope_wlid"
+    assert result["working_method"] == "msa_wlid_signed"
+    assert rig._xapprove_method.name == "msa_wlid_signed"
     _no_secrets(result)
 
 
@@ -548,4 +553,115 @@ async def test_the_saved_way_survives_a_restart(hass, rig, server):
     await rig.async_probe_xapprove(True)
     restarted = FamilySafetyDataUpdateCoordinator(hass, rig.entry)
     await restarted._async_load_xapprove_method()
-    assert restarted._xapprove_method.name == "sisu_xapprove_scope_wlid"
+    assert restarted._xapprove_method.name == "msa_wlid_signed"
+
+
+# The ways of signing xapprove (the explicit XSTS step, the app's headers) -------
+
+
+ALL_NAMES = [
+    "xsts_signed", "xsts_unsigned",
+    "xsts_xapprove_signed", "xsts_xapprove_unsigned",
+    "xsts_xapprove_https_signed", "xsts_xapprove_https_unsigned",
+    "sisu_signed", "sisu_unsigned",
+    "msa_wlid_signed", "msa_wlid_unsigned",
+    "msa_xbl_signed", "msa_xbl_unsigned",
+]
+
+
+def _auth_of(name: str) -> str:
+    """The Authorization header the fake server expects from a way."""
+    if name.startswith("xsts_xapprove_https"):
+        return f"XBL3.0 x=4343;{XSTS_TOKENS['https://xapprove.xboxlive.com/']}"
+    if name.startswith("xsts_xapprove"):
+        return f"XBL3.0 x=4343;{XSTS_TOKENS['http://xapprove.xboxlive.com']}"
+    if name.startswith("xsts"):
+        return XSTS_AUTH
+    if name.startswith("sisu"):
+        return SISU_AUTH
+    if name.startswith("msa_wlid"):
+        return f"WLID1.0 t={SISU_ACCESS}"
+    return f"XBL3.0 x=4343;{SISU_ACCESS}"
+
+
+def test_the_probe_methods_most_app_like_first():
+    assert [m.name for m in xapprove.PROBE_METHODS] == ALL_NAMES
+    assert xapprove.DEFAULT_METHOD.name == "xsts_signed"
+    for method in xapprove.PROBE_METHODS:
+        assert method.app_like and method.contract is None
+        assert method.signed == method.name.endswith("_signed")
+
+
+@pytest.mark.parametrize("name", ALL_NAMES)
+async def test_the_probe_finds_each_way_and_the_lock_uses_it(rig, server, name):
+    signed = name.endswith("_signed")
+    server.accepts = lambda h: h.get("Authorization") == _auth_of(name) and ("Signature" in h) == signed
+    result = await rig.async_probe_xapprove(True)
+
+    attempts = result["overrides_attempts"]
+    assert [a["name"] for a in attempts] == ALL_NAMES[:ALL_NAMES.index(name) + 1]
+    assert all(a["status"] == 401 and "www_authenticate" in a for a in attempts[:-1])
+    assert attempts[-1]["status"] == 200
+    assert result["working_method"] == name and result["method_saved"] is True
+    _no_secrets(result)
+
+    server.xapprove_headers.clear()
+    locked = await rig.async_lock_platform(CHILD, "Xbox", _hours(3))
+    assert locked["lock_path"] == "xapprove" and server.create_types() == [2]
+    sent = server.xapprove_headers[-1]
+    assert sent["User-Agent"] == "okhttp/4.9.2" and "MS-CV" in sent
+    assert "x-xbl-contract-version" not in sent
+    if name.startswith("msa_"):
+        assert any(c.endswith(xapprove.XAPPROVE_SCOPE) for c in server.sisu_calls)
+
+
+async def test_a_refused_relying_party_is_reported_and_the_next_tried(rig, server):
+    server.xsts_status["http://xapprove.xboxlive.com"] = 400
+    name = "xsts_xapprove_https_unsigned"
+    server.accepts = lambda h: h.get("Authorization") == _auth_of(name) and "Signature" not in h
+    result = await rig.async_probe_xapprove(True)
+
+    by_name = {a["name"]: a for a in result["overrides_attempts"]}
+    refused = by_name["xsts_xapprove_signed"]
+    assert refused["stage"] == "token" and refused["status"] == 400
+    assert refused["step"] == "xsts_authorize[http://xapprove.xboxlive.com]"
+    assert refused["xerr"] == 2148916233
+    assert result["working_method"] == name
+    keys = result["xsts_xui_keys"]
+    assert keys["http://xboxlive.com"] == sorted(XSTS_XUI)
+    assert keys["https://xapprove.xboxlive.com/"] == sorted(XSTS_XUI)
+    assert keys["http://xapprove.xboxlive.com"] == []
+    _no_secrets(result)
+
+
+async def test_without_a_title_token_the_xsts_step_goes_without(rig, server):
+    server.title_token = False
+    result = await rig.async_probe_xapprove(True)
+    assert result["title_token_received"] is False
+    assert result["steps"]["xsts_authorize[http://xboxlive.com]"]["title_token_sent"] is False
+    assert result["working_method"] == "xsts_signed"
+
+
+async def test_a_401_renews_the_title_bound_xsts(rig, server):
+    await rig.async_lock_platform(CHILD, "Xbox", _hours(3))
+    calls = list(server.sisu_calls)
+    accepted = server.accepts
+    answers = iter([False])
+    server.accepts = lambda h: next(answers, True) and accepted(h)
+    await rig.async_unlock_platform(CHILD, "Xbox")
+    # Once refused, SISU's tokens and the XSTS were got again.
+    assert server.sisu_calls[len(calls):] == ["authorize", "xsts:http://xboxlive.com"]
+    assert server.create_types() == [2, 100]
+
+
+@pytest.mark.parametrize(
+    ("saved", "loaded"),
+    [("sisu", "sisu_signed"), ("sisu_xapprove_scope_wlid", "msa_wlid_signed"),
+     ("sisu_contract_1", "xsts_signed"), ("msa_xbl_unsigned", "msa_xbl_unsigned")],
+)
+async def test_a_way_saved_by_an_earlier_version_still_loads(hass, rig, saved, loaded):
+    await rig._xapprove_method_store.async_save({"method": saved})
+    restarted = FamilySafetyDataUpdateCoordinator(hass, rig.entry)
+    await restarted._async_load_xapprove_method()
+    assert restarted._xapprove_method.name == loaded
+    assert restarted.xbox_signed_in  # the stored sign-in is still read

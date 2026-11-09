@@ -23,8 +23,13 @@ The flow:
    token and the ProofKey gives the user, title and device tokens and an
    XSTS token for ``http://xboxlive.com`` (``AuthorizationToken``) with the
    ``uhs`` claim: ``Authorization: XBL3.0 x=<uhs>;<xsts>``.
-5. When that XSTS runs out, the MSA token is refreshed (the new refresh token
-   replaces the old one) and step 4 runs again.
+5. As the app does next (capture, 2026-11): ``xsts.auth.xboxlive.com/xsts/
+   authorize``, signed, with SISU's user token, the device token and SISU's
+   title token, for a relying party (``http://xboxlive.com``; probe_xapprove
+   also tries xapprove's own), gives the title-bound XSTS sent to xapprove.
+6. When an XSTS runs out, the MSA token is refreshed (the new refresh token
+   replaces the old one) and steps 4 and 5 run again. Only the refresh
+   token, the ProofKey and a device id are stored.
 
 The ``Signature`` header (Xbox request signing, policy version 1): base64 of
 ``version (uint32 BE) | timestamp (uint64 BE, Windows FILETIME) | r | s``,
@@ -62,6 +67,7 @@ from homeassistant.util import dt as dt_util
 from .xapprove import (
     XapproveError,
     XapproveRefused,
+    RP_XBOXLIVE,
     XboxTokens,
     _call,
     _not_after,
@@ -79,10 +85,15 @@ AUTHORIZE_URL = "https://login.live.com/oauth20_authorize.srf"
 TOKEN_URL = "https://login.live.com/oauth20_token.srf"
 DEVICE_URL = "https://device.auth.xboxlive.com/device/authenticate"
 SISU_AUTHORIZE_URL = "https://sisu.xboxlive.com/authorize"
+XSTS_AUTHORIZE_URL = "https://xsts.auth.xboxlive.com/xsts/authorize"
 #: The device-code sign-in ("go to microsoft.com/link and enter ABCD-1234").
 DEVICE_CODE_URL = "https://login.live.com/oauth20_connect.srf"
 GRANT_DEVICE_CODE = "urn:ietf:params:oauth:grant-type:device_code"
 RELYING_PARTY = "http://xboxlive.com"
+#: The XAL user agent of the app's XSTS step (capture, 2026-11).
+XAL_USER_AGENT = "XAL Android 2026.05.20260812.001"
+#: The optional ``xui`` claims the app asks the XSTS step for.
+OPTIONAL_DISPLAY_CLAIMS = ["mgt", "umg", "agg", "prv", "ugc"]
 
 SIGNATURE_VERSION = 1
 SIGNATURE_MAX_BODY = 8192
@@ -318,13 +329,15 @@ async def async_refresh_msa(
 
 
 async def _signed_post(
-    session: aiohttp.ClientSession, key: ProofKey, url: str, body: dict, step: str, facts: dict | None
+    session: aiohttp.ClientSession, key: ProofKey, url: str, body: dict, step: str, facts: dict | None,
+    extra_headers: dict[str, str] | None = None,
 ) -> tuple[int, Any, dict[str, str]]:
     raw = json.dumps(body, separators=(",", ":")).encode()
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
         "x-xbl-contract-version": "1",
+        **(extra_headers or {}),
         "Signature": key.sign("POST", url, "", raw),
     }
     status, payload, resp_headers = await _call(session, "POST", url, data=raw, headers=headers)
@@ -372,11 +385,7 @@ async def async_sisu_authorize(
         "ProofKey": key.jwk(),
     }, "sisu_authorize", facts)
     auth = payload.get("AuthorizationToken") if isinstance(payload, dict) else None
-    xui: dict[str, Any] = {}
-    if isinstance(auth, dict):
-        items = (auth.get("DisplayClaims") or {}).get("xui")
-        if isinstance(items, list) and items and isinstance(items[0], dict):
-            xui = items[0]
+    xui = _xui(auth)
     if facts is not None and isinstance(facts.get("sisu_authorize"), dict):
         facts["sisu_authorize"].update({
             "authorization_token_received": bool(isinstance(auth, dict) and auth.get("Token")),
@@ -386,15 +395,81 @@ async def async_sisu_authorize(
         })
     if status == 200 and isinstance(auth, dict) and isinstance(auth.get("Token"), str) and xui.get("uhs"):
         user = payload.get("UserToken") if isinstance(payload.get("UserToken"), dict) else {}
+        title = payload.get("TitleToken") if isinstance(payload.get("TitleToken"), dict) else {}
         xid = xui.get("xid")
         return XboxTokens(
             str(xui["uhs"]), auth["Token"], _not_after(auth),
             str(user.get("Token") or ""), _not_after(user) if user else None,
             str(xid) if xid else None,
+            title_token=str(title.get("Token") or ""),
+            title_not_after=_not_after(title) if title else None,
+            xui_keys=tuple(sorted(str(k) for k in xui)),
         )
     if status and 400 <= status < 500:
         raise XapproveRefused("sisu_authorize", status, _xerr(payload, headers))
     raise XapproveError(f"sisu_authorize: HTTP {status}")
+
+
+def _xui(token: Any) -> dict[str, Any]:
+    """The first ``xui`` claim set of an XSTS answer ({} if none)."""
+    if isinstance(token, dict):
+        items = (token.get("DisplayClaims") or {}).get("xui")
+        if isinstance(items, list) and items and isinstance(items[0], dict):
+            return items[0]
+    return {}
+
+
+def xsts_step(relying_party: str) -> str:
+    """The name of the explicit XSTS step for one relying party (facts)."""
+    return f"xsts_authorize[{relying_party}]"
+
+
+async def async_xsts_authorize(
+    session: aiohttp.ClientSession,
+    key: ProofKey,
+    sisu_tokens: XboxTokens,
+    device_token: str,
+    relying_party: str = RP_XBOXLIVE,
+    facts: dict | None = None,
+) -> XboxTokens:
+    """The app's explicit XSTS step: ``xsts.auth.xboxlive.com/xsts/authorize``
+    with SISU's user token, the device token and SISU's title token (when one
+    came), signed with the ProofKey, for ``relying_party``.
+
+    The parent xuid is kept from SISU when the answer carries no ``xid``.
+    """
+    properties: dict[str, Any] = {"SandboxId": "RETAIL", "DeviceToken": device_token}
+    if sisu_tokens.title_token:
+        properties["TitleToken"] = sisu_tokens.title_token
+    properties["UserTokens"] = [sisu_tokens.user_token]
+    properties["OptionalDisplayClaims"] = list(OPTIONAL_DISPLAY_CLAIMS)
+    step = xsts_step(relying_party)
+    status, payload, headers = await _signed_post(session, key, XSTS_AUTHORIZE_URL, {
+        "RelyingParty": relying_party,
+        "TokenType": "JWT",
+        "Properties": properties,
+    }, step, facts, {
+        "Content-Type": "application/json; charset=utf-8",
+        "User-Agent": XAL_USER_AGENT,
+    })
+    xui = _xui(payload)
+    if facts is not None and isinstance(facts.get(step), dict):
+        facts[step].update({
+            "title_token_sent": bool(sisu_tokens.title_token),
+            "token_received": bool(isinstance(payload, dict) and payload.get("Token")),
+            "display_claims_xui_keys": sorted(str(k) for k in xui),
+        })
+    if status == 200 and isinstance(payload, dict) and isinstance(payload.get("Token"), str):
+        xid = xui.get("xid")
+        return XboxTokens(
+            str(xui.get("uhs") or sisu_tokens.uhs), payload["Token"], _not_after(payload),
+            sisu_tokens.user_token, sisu_tokens.user_not_after,
+            str(xid) if xid else sisu_tokens.parent_xuid,
+            xui_keys=tuple(sorted(str(k) for k in xui)),
+        )
+    if status and 400 <= status < 500:
+        raise XapproveRefused(step, status, _xerr(payload, headers))
+    raise XapproveError(f"{step}: HTTP {status}")
 
 
 # ----------------------------------------------------------------------
@@ -431,18 +506,22 @@ class XboxSisuAuth:
         self.key = ProofKey.from_pem(credential["proof_key"])
         self._device: tuple[str, datetime | None] | None = None
         self._tokens: XboxTokens | None = None
+        #: relying party -> the explicit XSTS step's token (memory only).
+        self._xsts: dict[str, XboxTokens] = {}
         self._access: dict[str, MsaTokens] = {}
         self._lock = asyncio.Lock()
         self.token_facts: dict[str, Any] = {}
 
     def forget_tokens(self) -> None:
         self._tokens = None
+        self._xsts.clear()
         self._access.clear()
 
     def seed(self, sign_in: SignIn) -> None:
         """Start from the tokens a fresh sign-in already got (no refresh needed)."""
         self._device = (sign_in.device_token, sign_in.device_not_after)
         self._tokens = sign_in.tokens
+        self._xsts.clear()
 
     async def _async_msa(self, scope: str = SCOPE) -> MsaTokens:
         cached = self._access.get(scope)
@@ -458,32 +537,61 @@ class XboxSisuAuth:
         return tokens
 
     async def async_xsts(self, *, force: bool = False) -> XboxTokens:
+        """SISU's own XSTS (its ``AuthorizationToken``, http://xboxlive.com)."""
         async with self._lock:
-            if self._tokens is not None and not force and _valid(self._tokens.xsts_not_after):
-                return self._tokens
+            return await self._async_sisu(force)
+
+    async def async_title_xsts(
+        self, relying_party: str = RP_XBOXLIVE, *, force: bool = False
+    ) -> XboxTokens:
+        """An XSTS from the explicit XSTS step (SISU's user, device and title
+        tokens) for ``relying_party``: how the Xbox Family Settings app gets
+        the token it sends to xapprove. ``force`` renews SISU's tokens too."""
+        async with self._lock:
+            cached = self._xsts.get(relying_party)
+            if cached is not None and not force and _valid(cached.xsts_not_after):
+                return cached
+            sisu_tokens = await self._async_sisu(force)
             session = self._session_getter()
-            msa = await self._async_msa()
             if self._device is None or not _valid(self._device[1]):
                 self._device = await async_device_token(
                     session, self.key, self._credential["device_id"], self.token_facts
                 )
-            try:
-                self._tokens = await async_sisu_authorize(
-                    session, self.key, msa.access_token, self._device[0], self.token_facts
-                )
-            except XapproveRefused:
-                # A device token or MSA token Microsoft no longer takes: once
-                # more from fresh ones before giving up.
-                self._device = None
-                self._access.pop(SCOPE, None)
-                msa = await self._async_msa()
-                self._device = await async_device_token(
-                    session, self.key, self._credential["device_id"], self.token_facts
-                )
-                self._tokens = await async_sisu_authorize(
-                    session, self.key, msa.access_token, self._device[0], self.token_facts
-                )
+            tokens = await async_xsts_authorize(
+                session, self.key, sisu_tokens, self._device[0], relying_party, self.token_facts
+            )
+            self._xsts[relying_party] = tokens
+            return tokens
+
+    async def _async_sisu(self, force: bool) -> XboxTokens:
+        """SISU's tokens, renewed when they ran out. The caller holds the lock."""
+        if self._tokens is not None and not force and _valid(self._tokens.xsts_not_after):
             return self._tokens
+        # New SISU tokens: the XSTS made from the old ones go too.
+        self._xsts.clear()
+        session = self._session_getter()
+        msa = await self._async_msa()
+        if self._device is None or not _valid(self._device[1]):
+            self._device = await async_device_token(
+                session, self.key, self._credential["device_id"], self.token_facts
+            )
+        try:
+            self._tokens = await async_sisu_authorize(
+                session, self.key, msa.access_token, self._device[0], self.token_facts
+            )
+        except XapproveRefused:
+            # A device token or MSA token Microsoft no longer takes: once
+            # more from fresh ones before giving up.
+            self._device = None
+            self._access.pop(SCOPE, None)
+            msa = await self._async_msa()
+            self._device = await async_device_token(
+                session, self.key, self._credential["device_id"], self.token_facts
+            )
+            self._tokens = await async_sisu_authorize(
+                session, self.key, msa.access_token, self._device[0], self.token_facts
+            )
+        return self._tokens
 
     async def async_access_token(self, scope: str) -> str:
         """An MSA access token of the app's client for another scope (probe)."""

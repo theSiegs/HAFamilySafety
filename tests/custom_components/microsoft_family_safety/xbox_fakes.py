@@ -44,11 +44,24 @@ SISU_ACCESS = "sisu-access-SECRET"
 DEVICE_TOKEN = "device-token-SECRET"
 SISU_XSTS = "sisu-xsts-SECRET"
 SISU_AUTH = f"XBL3.0 x=4343;{SISU_XSTS}"
+TITLE_TOKEN = "title-SECRET"
+#: The explicit XSTS step's token per relying party.
+XSTS_TOKENS = {
+    "http://xboxlive.com": "xsts-xboxlive-SECRET",
+    "http://xapprove.xboxlive.com": "xsts-xapprove-SECRET",
+    "https://xapprove.xboxlive.com/": "xsts-xapprove-https-SECRET",
+}
+#: What the app sends xapprove: the title-bound XSTS for http://xboxlive.com.
+XSTS_AUTH = f"XBL3.0 x=4343;{XSTS_TOKENS['http://xboxlive.com']}"
+XSTS_XUI = {
+    "gtg": "SamParent", "xid": PARENT_XUID, "uhs": "4343", "mgt": "SamParent",
+    "umg": "SamParent", "agg": "Adult", "usr": "234", "prv": "184 185", "ugc": "1",
+}
 DEVICE_CODE = "device-code-SECRET"
 USER_CODE = "ABCD-1234"
 SECRETS = (
     PARENT_XUID, CHILD_XUID, GAMERTAG, CODE, SISU_ACCESS, DEVICE_TOKEN, SISU_XSTS,
-    "sisu-refresh-", "title-SECRET", "sisu-user-SECRET", DEVICE_CODE,
+    "sisu-refresh-", TITLE_TOKEN, "sisu-user-SECRET", DEVICE_CODE, *XSTS_TOKENS.values(),
 )
 
 
@@ -103,8 +116,15 @@ class XboxServer:
         self.xapprove_status = 200
         self.family_status = 200
         self.create_ignored = False
-        #: Which request headers xapprove accepts: by default the signed SISU XSTS.
-        self.accepts = lambda h: h.get("Authorization") == SISU_AUTH and "Signature" in h
+        #: Which request headers xapprove accepts: by default the app's way,
+        #: the title-bound XSTS for http://xboxlive.com, signed.
+        self.accepts = lambda h: h.get("Authorization") == XSTS_AUTH and "Signature" in h
+        #: Every xapprove request's headers, in order.
+        self.xapprove_headers: list[dict] = []
+        #: Relying party -> status the explicit XSTS step answers (default 200).
+        self.xsts_status: dict[str, int] = {}
+        #: Whether SISU's answer carries a TitleToken.
+        self.title_token = True
         self.refresh_tokens = {"sisu-refresh-1"}
         self.next_refresh = 2
         self.dead = False
@@ -200,7 +220,10 @@ class XboxServer:
                 return FakeResponse(self.sisu_authorize_status, None, {"x-err": "2148916236"})
             return FakeResponse(200, {
                 "DeviceToken": DEVICE_TOKEN,
-                "TitleToken": {"Token": "title-SECRET"},
+                **({"TitleToken": {
+                    "Token": TITLE_TOKEN,
+                    "NotAfter": iso_utc(dt_util.utcnow() + timedelta(days=14)),
+                }} if self.title_token else {}),
                 "UserToken": {"Token": "sisu-user-SECRET",
                               "NotAfter": iso_utc(dt_util.utcnow() + timedelta(days=14))},
                 "AuthorizationToken": {
@@ -208,6 +231,28 @@ class XboxServer:
                     "NotAfter": iso_utc(dt_util.utcnow() + timedelta(hours=16)),
                     "DisplayClaims": {"xui": [{"uhs": "4343", "xid": PARENT_XUID, "gtg": "SamParent"}]},
                 },
+            })
+        if url == sisu.XSTS_AUTHORIZE_URL:
+            payload = json.loads(kwargs["data"])
+            rp = payload["RelyingParty"]
+            self.sisu_calls.append(f"xsts:{rp}")
+            verify_signature(headers["Signature"], self.jwk, "POST", url, "", kwargs["data"])
+            assert headers["x-xbl-contract-version"] == "1"
+            assert headers["Content-Type"] == "application/json; charset=utf-8"
+            assert headers["User-Agent"].startswith("XAL Android")
+            assert payload["TokenType"] == "JWT"
+            props = payload["Properties"]
+            assert props["SandboxId"] == "RETAIL" and props["DeviceToken"] == DEVICE_TOKEN
+            assert props["UserTokens"] == ["sisu-user-SECRET"]
+            assert props.get("TitleToken") == (TITLE_TOKEN if self.title_token else None)
+            assert {"mgt", "umg", "agg", "prv", "ugc"} <= set(props["OptionalDisplayClaims"])
+            status = self.xsts_status.get(rp, 200)
+            if status != 200 or rp not in XSTS_TOKENS:
+                return FakeResponse(status if status != 200 else 400, {"XErr": 2148916233})
+            return FakeResponse(200, {
+                "Token": XSTS_TOKENS[rp],
+                "NotAfter": iso_utc(dt_util.utcnow() + timedelta(hours=16)),
+                "DisplayClaims": {"xui": [dict(XSTS_XUI)]},
             })
         if "Signature" in headers and self.jwk is not None:
             verify_signature(headers["Signature"], self.jwk, method, url, headers["Authorization"], body)
@@ -224,6 +269,7 @@ class XboxServer:
             ]})
         if url.startswith(xapprove.XAPPROVE_HOST):
             assert f"/user/{CHILD_XUID}/" in url
+            self.xapprove_headers.append(dict(headers))
             if self.xapprove_status != 200:
                 return FakeResponse(self.xapprove_status, None, {"x-err": "2148916238"})
             if not self.accepts(headers):

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import struct
 import time
 from datetime import timedelta
@@ -41,6 +42,8 @@ from .xbox_fakes import (
     SECRETS,
     SISU_AUTH,
     USER_CODE,
+    XSTS_AUTH,
+    XSTS_XUI,
     XboxServer,
     hours as _hours,
     make_rig,
@@ -203,7 +206,17 @@ async def test_lock_uses_the_signed_xbox_sign_in(hass, server, hass_storage):
     # Every token request was the Xbox Family Settings client's (the fake
     # server asserts it); the Family web session was never used.
     assert coord.web_api.web_calls == []
-    assert coord.xbox_signed_in and coord._xapprove_method.name == "sisu"
+    assert coord.xbox_signed_in and coord._xapprove_method.name == "xsts_signed"
+    # The app's way: the title-bound XSTS, signed, the app's headers, no contract.
+    sent = server.xapprove_headers[0]
+    assert sent["Authorization"] == XSTS_AUTH and "Signature" in sent
+    assert sent["User-Agent"] == "okhttp/4.9.2" and sent["Content-Type"] == "application/json"
+    assert re.fullmatch(r"[A-Za-z0-9+/]{16}\.1", sent["MS-CV"])
+    assert "x-xbl-contract-version" not in sent
+    assert server.sisu_calls == [
+        "token:refresh_token:service::user.auth.xboxlive.com::MBI_SSL", "device", "authorize",
+        "xsts:http://xboxlive.com",
+    ]
 
 
 async def test_a_401_on_the_xbox_sign_in_falls_back(hass, server, hass_storage):
@@ -236,9 +249,14 @@ async def test_the_probe_with_the_xbox_sign_in(hass, server, hass_storage, caplo
     assert result["steps"]["device_authenticate"]["status"] == 200
     assert result["family"]["ok"] is True and result["family"]["adults"] == 1
     assert result["overrides_attempts"] == [
-        {"name": "sisu", "stage": "xapprove", "status": 200, "xerr": None}
+        {"name": "xsts_signed", "stage": "xapprove", "status": 200, "xerr": None}
     ]
-    assert result["working_method"] == "sisu" and result["method_saved"] is True
+    assert result["working_method"] == "xsts_signed" and result["method_saved"] is True
+    assert result["title_token_received"] is True
+    assert result["steps"]["sisu_authorize"]["title_token_received"] is True
+    xsts = result["steps"]["xsts_authorize[http://xboxlive.com]"]
+    assert xsts["status"] == 200 and xsts["title_token_sent"] is True
+    assert result["xsts_xui_keys"] == {"http://xboxlive.com": sorted(XSTS_XUI)}
     _no_secrets(result)
     ours = " | ".join(
         r.getMessage() for r in caplog.records if r.name.startswith("custom_components.")
@@ -346,7 +364,7 @@ async def test_the_flow_checks_the_sign_in_and_offers_xapprove(hass, server, has
     assert server.creates == [] and coord.web_api.web_calls == []
     assert [c for c in server.sisu_calls if c.startswith("token:refresh")] == []
     # The way that worked is saved, as probe_xapprove would have.
-    assert hass_storage[f"{DOMAIN}.xapprove.{entry.entry_id}"]["data"]["method"] == "sisu"
+    assert hass_storage[f"{DOMAIN}.xapprove.{entry.entry_id}"]["data"]["method"] == "xsts_signed"
     # The old "sign in again" issue is gone.
     assert ir.async_get(hass).async_get_issue(DOMAIN, f"xbox_signin_expired_{entry.entry_id}") is None
 
