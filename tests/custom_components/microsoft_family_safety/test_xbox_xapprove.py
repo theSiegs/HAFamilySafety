@@ -37,12 +37,15 @@ from custom_components.microsoft_family_safety.xbox_xapprove import parse_xuid_o
 
 from .test_platform_lock import CHILD
 from .xbox_fakes import (
+    FakeResponse,
     CHILD_XUID,
     PATCH_SESSION,
     SECRETS,
     SISU_ACCESS,
     SISU_AUTH,
     SISU_DEVICE_TOKEN,
+    TITLE_ID,
+    UCS_TOKENS,
     XSTS_AUTH,
     XSTS_TOKENS,
     XSTS_XUI,
@@ -560,10 +563,18 @@ async def test_the_saved_way_survives_a_restart(hass, rig, server):
 # The ways of signing xapprove (the explicit XSTS step, the app's headers) -------
 
 
+UCS = [
+    "ucs_raw_prompts_noc", "ucs_t_prompts_noc", "ucs_raw_noprompts_noc", "ucs_t_noprompts_noc",
+    "ucs_raw_prompts_c1", "ucs_t_prompts_c1", "ucs_raw_noprompts_c1", "ucs_t_noprompts_c1",
+]
+UCS_SCOPES = [
+    "https://consentservice.microsoft.com/checkin/UnifiedUserConsent.Read",
+    "https://consentservice.microsoft.com/web/UnifiedUserConsent.ReadWrite",
+]
 ALL_NAMES = [
     "xsts_signed", "xsts_unsigned",
-    "xsts_xapprove_signed", "xsts_xapprove_unsigned",
-    "xsts_xapprove_https_signed", "xsts_xapprove_https_unsigned",
+    *[f"{p}_xsts_signed" for p in UCS],
+    "ucs_raw_prompts_noc_sisu_signed", "ucs_t_prompts_noc_sisu_signed",
     "sisu_signed", "sisu_unsigned",
     "sisu_c1_signed", "sisu_c1_unsigned",
     "sisu_c2_signed", "sisu_c2_unsigned",
@@ -574,17 +585,13 @@ ALL_NAMES = [
 ]
 #: Every probe attempt, "way@path", in order.
 ALL_ATTEMPTS = [
-    "xsts_signed@overrides", "xsts_signed@screentime",
-    "xsts_unsigned@overrides", "xsts_unsigned@screentime",
-    "xsts_xapprove_signed@overrides", "xsts_xapprove_unsigned@overrides",
-    "xsts_xapprove_https_signed@overrides", "xsts_xapprove_https_unsigned@overrides",
-    "sisu_signed@overrides", "sisu_signed@screentime",
-    "sisu_unsigned@overrides", "sisu_unsigned@screentime",
-    "sisu_c1_signed@overrides", "sisu_c1_signed@screentime",
-    "sisu_c1_unsigned@overrides",
+    "xsts_signed@overrides", "xsts_signed@screentime", "xsts_unsigned@overrides",
+    *[f"{p}_xsts_signed@overrides" for p in UCS],
+    "ucs_raw_prompts_noc_sisu_signed@overrides", "ucs_t_prompts_noc_sisu_signed@overrides",
+    "sisu_signed@overrides", "sisu_signed@screentime", "sisu_unsigned@overrides",
+    "sisu_c1_signed@overrides", "sisu_c1_unsigned@overrides",
     "sisu_c2_signed@overrides", "sisu_c2_unsigned@overrides",
-    "sisu_c3_signed@overrides", "sisu_c3_signed@screentime",
-    "sisu_c3_unsigned@overrides",
+    "sisu_c3_signed@overrides", "sisu_c3_unsigned@overrides",
     "sisu_lang_signed@overrides", "sisu_lang_unsigned@overrides",
     "msa_wlid_signed@overrides", "msa_wlid_unsigned@overrides",
     "msa_xbl_signed@overrides", "msa_xbl_unsigned@overrides",
@@ -596,15 +603,14 @@ def _attempted(result) -> list[str]:
 
 
 def _auth_of(name: str) -> str:
-    """The Authorization header the fake server expects from a way."""
-    if name.startswith("xsts_xapprove_https"):
-        return f"XBL3.0 x=4343;{XSTS_TOKENS['https://xapprove.xboxlive.com/']}"
-    if name.startswith("xsts_xapprove"):
-        return f"XBL3.0 x=4343;{XSTS_TOKENS['http://xapprove.xboxlive.com']}"
-    if name.startswith("xsts"):
-        return XSTS_AUTH
-    if name.startswith("sisu"):
-        return SISU_AUTH
+    """The Authorization header the fake server expects from a way (the fake
+    marks the tokens of a sisu/authorize with the consent tokens)."""
+    profile = xapprove.METHODS_BY_NAME[name].sisu_profile
+    shape = f"~{profile}" if profile else ""
+    if "xsts" in name:
+        return f"{XSTS_AUTH}{shape}"
+    if "sisu" in name:
+        return f"{SISU_AUTH}{shape}"
     if name.startswith("msa_wlid"):
         return f"WLID1.0 t={SISU_ACCESS}"
     return f"XBL3.0 x=4343;{SISU_ACCESS}"
@@ -623,7 +629,7 @@ def _accepts_only(name: str):
 def test_the_probe_attempts_most_app_like_first():
     assert [m.name for m in xapprove.PROBE_METHODS] == ALL_NAMES
     assert [f"{m.name}@{p}" for m, p in xapprove.PROBE_ATTEMPTS] == ALL_ATTEMPTS
-    assert len(ALL_ATTEMPTS) <= 30
+    assert len(ALL_ATTEMPTS) == 28
     assert xapprove.DEFAULT_METHOD.name == "xsts_signed"
     for method in xapprove.PROBE_METHODS:
         assert method.app_like
@@ -690,17 +696,15 @@ async def test_a_refusal_is_described_without_secrets(rig, server):
 
 
 async def test_xsts_variants_until_one_answers(hass, rig, server):
-    # As live: the app's request is refused (0x8015DC37); without the
-    # optional claims it works.
+    # As live: with the optional claims the request is refused (0x8015DC37);
+    # without them (the default now) it works at once.
     server.xsts_accepts = lambda headers, props: "OptionalDisplayClaims" not in props
     result = await rig.async_probe_xapprove(True)
 
     steps = result["steps"]
-    app = steps["xsts_authorize[http://xboxlive.com]"]
-    assert app["status"] == 400 and app["xerr"] == 2148916279 and app["claims_sent"] is True
     worked = steps["xsts_authorize[http://xboxlive.com|no_claims]"]
     assert worked["status"] == 200 and worked["claims_sent"] is False
-    assert "xsts_authorize[http://xboxlive.com|no_title]" not in steps
+    assert "xsts_authorize[http://xboxlive.com|app]" not in steps
     assert result["xsts"]["http://xboxlive.com"] == {"variant": "no_claims", "xui_keys": sorted(XSTS_XUI)}
     assert result["working_method"] == "xsts_signed"
     # The variant is saved with the way and tried first after a restart.
@@ -716,6 +720,7 @@ async def test_xsts_variants_until_one_answers(hass, rig, server):
     ("variant", "accepts"),
     [
         ("no_title", lambda h, p: "TitleToken" not in p),
+        ("app", lambda h, p: "OptionalDisplayClaims" in p),
         ("sisu_device", lambda h, p: p["DeviceToken"] == SISU_DEVICE_TOKEN),
         ("unsigned", lambda h, p: "Signature" not in h),
         ("plain_json", lambda h, p: h["Content-Type"] == "application/json"),
@@ -737,39 +742,21 @@ async def test_without_a_sisu_device_token_that_variant_is_skipped(rig, server):
     assert steps["xsts_authorize[http://xboxlive.com|sisu_device]"] == {
         "skipped": "no DeviceToken in SISU's answer"
     }
-    assert steps["xsts_authorize[http://xboxlive.com|bare]"]["status"] == 400
+    assert steps["xsts_authorize[http://xboxlive.com|app]"]["status"] == 400
     assert result["xsts"]["http://xboxlive.com"] == {"variant": None, "xui_keys": None}
     # Every variant refused once: the unsigned attempt does not sweep again.
-    assert server.sisu_calls.count("xsts:http://xboxlive.com") == 6
+    # (the plain profile and the eight UCS ones, 5 sent variants each)
+    assert server.sisu_calls.count("xsts:http://xboxlive.com") == 45
     first = result["overrides_attempts"][0]
     assert first["stage"] == "token" and first["xerr"] == 2148916279
     assert result["working_method"] == "sisu_signed"
-
-
-async def test_a_refused_relying_party_is_reported_and_the_next_tried(rig, server):
-    server.xsts_status["http://xapprove.xboxlive.com"] = 400
-    name = "xsts_xapprove_https_unsigned"
-    server.accepts = _accepts_only(name)
-    result = await rig.async_probe_xapprove(True)
-
-    by_name = {a["name"]: a for a in result["overrides_attempts"]}
-    refused = by_name["xsts_xapprove_signed"]
-    assert refused["stage"] == "token" and refused["status"] == 400
-    assert refused["step"] == "xsts_authorize[http://xapprove.xboxlive.com]"
-    assert refused["xerr"] == 2148916233
-    assert result["working_method"] == name
-    keys = result["xsts_xui_keys"]
-    assert keys["http://xboxlive.com"] == sorted(XSTS_XUI)
-    assert keys["https://xapprove.xboxlive.com/"] == sorted(XSTS_XUI)
-    assert keys["http://xapprove.xboxlive.com"] is None
-    _no_secrets(result)
 
 
 async def test_without_a_title_token_the_xsts_step_goes_without(rig, server):
     server.title_token = False
     result = await rig.async_probe_xapprove(True)
     assert result["title_token_received"] is False
-    assert result["steps"]["xsts_authorize[http://xboxlive.com]"]["title_token_sent"] is False
+    assert result["steps"]["xsts_authorize[http://xboxlive.com|no_claims]"]["title_token_sent"] is False
     assert result["working_method"] == "xsts_signed"
 
 
@@ -796,3 +783,100 @@ async def test_a_way_saved_by_an_earlier_version_still_loads(hass, rig, saved, l
     await restarted._async_load_xapprove_method()
     assert restarted._xapprove_method.name == loaded
     assert restarted.xbox_signed_in  # the stored sign-in is still read
+
+
+# The consent service tokens, the title id, sisu/authenticate ---------------------
+
+
+@pytest.mark.parametrize("profile", UCS)
+async def test_each_ucs_authorize_is_tried_and_saved(hass, rig, server, profile):
+    name = f"{profile}_xsts_signed"
+    server.accepts = _accepts_only(name)
+    result = await rig.async_probe_xapprove(True)
+
+    assert result["working_method"] == name and result["method_saved"] is True
+    # The consent tokens were fetched with the stored refresh token.
+    assert f"token:refresh_token:{UCS_SCOPES[0]}" in server.sisu_calls
+    assert f"token:refresh_token:{UCS_SCOPES[1]}" in server.sisu_calls
+    step = result["steps"][f"sisu_authorize[{profile}]"]
+    assert step["status"] == 200 and step["ucs_sent"] is True
+    assert result["xsts"][f"{profile}|http://xboxlive.com"]["variant"] == "no_claims"
+    _no_secrets(result)
+    # The default from now on, also after a restart, and a lock uses it.
+    restarted = FamilySafetyDataUpdateCoordinator(hass, rig.entry)
+    await restarted._async_load_xapprove_method()
+    assert restarted._xapprove_method.name == name
+    locked = await rig.async_lock_platform(CHILD, "Xbox", _hours(3))
+    assert locked["lock_path"] == "xapprove"
+
+
+async def test_the_app_like_ucs_authorize_sends_no_contract(rig, server):
+    server.accepts = _accepts_only("ucs_raw_prompts_noc_xsts_signed")
+    await rig.async_probe_xapprove(True)
+    ucs = [
+        (b, c) for b, c in zip(server.authorize_bodies, server.authorize_contracts)
+        if "UcsCheckinToken" in b
+    ]
+    body, contract = ucs[0]
+    assert contract is None and body["UserPrompts"] == []
+    assert body["UcsCheckinToken"] == UCS_TOKENS[UCS_SCOPES[0]]
+    assert body["UcsWebToken"] == UCS_TOKENS[UCS_SCOPES[1]]
+    # The plain authorize keeps contract 1 and sends no consent tokens.
+    assert server.authorize_contracts[0] == "1"
+    assert "UcsCheckinToken" not in server.authorize_bodies[0]
+
+
+async def test_a_refused_consent_token_is_not_an_expired_sign_in(hass, rig, server):
+    real = server.request
+
+    def request(method, url, **kwargs):
+        data = kwargs.get("data")
+        if isinstance(data, dict) and data.get("scope") in UCS_TOKENS:
+            server.sisu_calls.append(f"token:refresh_token:{data['scope']}")
+            return FakeResponse(400, {"error": "invalid_grant"})
+        return real(method, url, **kwargs)
+
+    server.request = request
+    server.accepts = _accepts_only("sisu_signed")
+    result = await rig.async_probe_xapprove(True)
+    refused = {a["name"]: a for a in result["overrides_attempts"]}[f"{UCS[0]}_xsts_signed"]
+    assert refused["stage"] == "token" and refused["error"] == "invalid_grant"
+    assert result["working_method"] == "sisu_signed"
+    assert ir.async_get(hass).async_get_issue(DOMAIN, f"xbox_signin_expired_{rig.entry.entry_id}") is None
+    stored = await rig._xbox_signin_store.async_load()
+    assert stored["refresh_token"].startswith("sisu-refresh-")
+
+
+async def test_another_scopes_refresh_token_is_not_stored(rig, server):
+    server.accepts = _accepts_only("msa_wlid_signed")
+    result = await rig.async_probe_xapprove(True)
+    assert result["working_method"] == "msa_wlid_signed"
+    stored = await rig._xbox_signin_store.async_load()
+    assert stored["refresh_token"].startswith("sisu-refresh-")
+
+
+async def test_title_id_and_sisu_authenticate_are_reported(rig, server):
+    result = await rig.async_probe_xapprove(True)
+    assert result["title_id"] == TITLE_ID
+    assert result["steps"]["sisu_authorize"]["title_id"] == TITLE_ID
+    assert result["steps"]["sisu_authorize"]["title_xti_keys"] == ["tid"]
+    assert result["steps"]["device_authenticate"]["xdi_keys"] == ["dcs", "did"]
+    auth = result["sisu_authenticate"]
+    assert auth["status"] == 200 and auth["title_id_sent"] is True
+    assert auth["msa_oauth_redirect_received"] is True
+    assert auth["session_id_received"] is False and auth["session_id_header"] is True
+    assert auth["response_keys"] == ["MsaOauthRedirect", "MsaRequestParameters"]
+    body = server.authenticate_bodies[0]
+    assert body["TitleId"] == TITLE_ID and body["TokenType"] == "code"
+    assert body["Offers"] == ["service::user.auth.xboxlive.com::MBI_SSL"]
+    assert body["RedirectUri"] == "https://login.live.com/oauth20_desktop.srf"
+    query = body["Query"]
+    assert query["code_challenge_method"] == "S256" and query["display"] == "android_phone"
+    assert query["prompt"] == "select_account" and query["state"] and query["code_challenge"]
+    assert body["DeviceToken"] and body["Sandbox"] == "RETAIL"
+    _no_secrets(result)
+
+
+async def test_xapprove_asks_for_gzip(rig, server):
+    await rig.async_lock_platform(CHILD, "Xbox", _hours(3))
+    assert server.xapprove_headers[-1]["Accept-Encoding"] == "gzip"

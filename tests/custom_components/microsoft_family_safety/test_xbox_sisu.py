@@ -254,7 +254,7 @@ async def test_the_probe_with_the_xbox_sign_in(hass, server, hass_storage, caplo
     assert result["working_method"] == "xsts_signed" and result["method_saved"] is True
     assert result["title_token_received"] is True
     assert result["steps"]["sisu_authorize"]["title_token_received"] is True
-    xsts = result["steps"]["xsts_authorize[http://xboxlive.com]"]
+    xsts = result["steps"]["xsts_authorize[http://xboxlive.com|no_claims]"]
     assert xsts["status"] == 200 and xsts["title_token_sent"] is True
     assert result["xsts_xui_keys"] == {"http://xboxlive.com": sorted(XSTS_XUI)}
     _no_secrets(result)

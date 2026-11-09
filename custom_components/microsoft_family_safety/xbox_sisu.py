@@ -72,6 +72,7 @@ from .xapprove import (
     _call,
     _not_after,
     _valid,
+    redact,
     _xerr,
 )
 
@@ -333,12 +334,13 @@ async def _signed_post(
     extra_headers: dict[str, str] | None = None,
     *,
     signed: bool = True,
+    contract: str | None = "1",
 ) -> tuple[int, Any, dict[str, str]]:
     raw = json.dumps(body, separators=(",", ":")).encode()
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "x-xbl-contract-version": "1",
+        **({"x-xbl-contract-version": contract} if contract else {}),
         **(extra_headers or {}),
     }
     if signed:
@@ -346,6 +348,27 @@ async def _signed_post(
     status, payload, resp_headers = await _call(session, "POST", url, data=raw, headers=headers)
     _record(facts, step, {"status": status, "xerr": _xerr(payload, resp_headers)})
     return status, payload, resp_headers
+
+
+def _claims(token: Any, name: str) -> dict[str, Any]:
+    """The first ``name`` claim set (xui, xti, xdi) of a token answer ({} if none)."""
+    if isinstance(token, dict):
+        items = (token.get("DisplayClaims") or {}).get(name)
+        if isinstance(items, list) and items and isinstance(items[0], dict):
+            return items[0]
+        if isinstance(items, dict):
+            return items
+    return {}
+
+
+def _xui(token: Any) -> dict[str, Any]:
+    """The first ``xui`` claim set of an XSTS answer ({} if none)."""
+    return _claims(token, "xui")
+
+
+def _title_id(claims: dict[str, Any]) -> str | None:
+    tid = claims.get("tid")
+    return str(tid) if isinstance(tid, (str, int)) and not isinstance(tid, bool) and str(tid) else None
 
 
 async def async_device_token(
@@ -363,11 +386,63 @@ async def async_device_token(
             "ProofKey": key.jwk(),
         },
     }, "device_authenticate", facts)
+    xdi = _claims(payload, "xdi")
+    if facts is not None and isinstance(facts.get("device_authenticate"), dict):
+        # Claim names only, and the title id if there is one (an id, not a secret).
+        facts["device_authenticate"].update({
+            "xdi_keys": sorted(str(k) for k in xdi),
+            "xdi_tid": redact(_title_id(xdi) or "") or None,
+        })
     if status == 200 and isinstance(payload, dict) and isinstance(payload.get("Token"), str):
         return payload["Token"], _not_after(payload)
     if status and 400 <= status < 500:
         raise XapproveRefused("device_authenticate", status, _xerr(payload, headers))
     raise XapproveError(f"device_authenticate: HTTP {status}")
+
+
+@dataclass(frozen=True)
+class SisuProfile:
+    """How sisu/authorize is asked (probe_xapprove tries several).
+
+    ``ucs``: send the consent service tokens (UcsCheckinToken, UcsWebToken)
+    the app gets before authorize, ``ucs_form`` ``raw`` or ``t`` (``t=<token>``);
+    ``prompts``: ``UserPrompts: []``; ``contract``: the
+    ``x-xbl-contract-version`` header (the app sent none; the plain profile
+    keeps the 1 that has always worked).
+    """
+
+    name: str
+    ucs: bool = False
+    ucs_form: str = "raw"
+    prompts: bool = False
+    contract: str | None = "1"
+
+
+PLAIN_PROFILE = SisuProfile("")
+
+
+def _ucs_profiles() -> list[SisuProfile]:
+    found = []
+    for contract in (None, "1"):
+        for prompts in (True, False):
+            for form in ("raw", "t"):
+                found.append(SisuProfile(
+                    f"ucs_{form}_{'prompts' if prompts else 'noprompts'}_{'c1' if contract else 'noc'}",
+                    ucs=True, ucs_form=form, prompts=prompts, contract=contract,
+                ))
+    return found
+
+
+#: The plain profile, then the UCS ones, the app's (no contract, UserPrompts)
+#: first.
+SISU_PROFILES: dict[str, SisuProfile] = {p.name: p for p in [PLAIN_PROFILE, *_ucs_profiles()]}
+#: The consent service scopes the app asks for before sisu/authorize.
+UCS_CHECKIN_SCOPE = "https://consentservice.microsoft.com/checkin/UnifiedUserConsent.Read"
+UCS_WEB_SCOPE = "https://consentservice.microsoft.com/web/UnifiedUserConsent.ReadWrite"
+
+
+def sisu_step(profile: SisuProfile) -> str:
+    return "sisu_authorize" if not profile.name else f"sisu_authorize[{profile.name}]"
 
 
 async def async_sisu_authorize(
@@ -376,8 +451,10 @@ async def async_sisu_authorize(
     msa_access_token: str,
     device_token: str,
     facts: dict | None = None,
+    profile: SisuProfile = PLAIN_PROFILE,
+    ucs: tuple[str, str] | None = None,
 ) -> XboxTokens:
-    status, payload, headers = await _signed_post(session, key, SISU_AUTHORIZE_URL, {
+    body: dict[str, Any] = {
         "AccessToken": f"t={msa_access_token}",
         "AppId": CLIENT_ID,
         "DeviceToken": device_token,
@@ -386,20 +463,37 @@ async def async_sisu_authorize(
         "RelyingParty": RELYING_PARTY,
         "UseModernGamertag": True,
         "ProofKey": key.jwk(),
-    }, "sisu_authorize", facts)
+    }
+    if profile.ucs and ucs is not None:
+        prefix = "t=" if profile.ucs_form == "t" else ""
+        body["UcsCheckinToken"] = f"{prefix}{ucs[0]}"
+        body["UcsWebToken"] = f"{prefix}{ucs[1]}"
+    if profile.prompts:
+        body["UserPrompts"] = []
+    step = sisu_step(profile)
+    status, payload, headers = await _signed_post(
+        session, key, SISU_AUTHORIZE_URL, body, step, facts, contract=profile.contract
+    )
     auth = payload.get("AuthorizationToken") if isinstance(payload, dict) else None
     xui = _xui(auth)
-    if facts is not None and isinstance(facts.get("sisu_authorize"), dict):
-        facts["sisu_authorize"].update({
+    title = payload.get("TitleToken") if isinstance(payload, dict) and isinstance(payload.get("TitleToken"), dict) else {}
+    xti = _claims(title, "xti")
+    if facts is not None and isinstance(facts.get(step), dict):
+        facts[step].update({
             "authorization_token_received": bool(isinstance(auth, dict) and auth.get("Token")),
             "user_token_received": bool(isinstance(payload, dict) and payload.get("UserToken")),
-            "title_token_received": bool(isinstance(payload, dict) and payload.get("TitleToken")),
+            "title_token_received": bool(title.get("Token")),
             "device_token_received": bool(isinstance(payload, dict) and payload.get("DeviceToken")),
             "display_claims_xui_keys": sorted(str(k) for k in xui),
+            # The title's claims: names, and the title id (an id, not a secret).
+            "title_xti_keys": sorted(str(k) for k in xti),
+            "title_id": redact(_title_id(xti) or "") or None,
+            "response_keys": sorted(str(k) for k in payload) if isinstance(payload, dict) else None,
         })
+        if profile.ucs:
+            facts[step]["ucs_sent"] = ucs is not None
     if status == 200 and isinstance(auth, dict) and isinstance(auth.get("Token"), str) and xui.get("uhs"):
         user = payload.get("UserToken") if isinstance(payload.get("UserToken"), dict) else {}
-        title = payload.get("TitleToken") if isinstance(payload.get("TitleToken"), dict) else {}
         device = payload.get("DeviceToken")
         xid = xui.get("xid")
         return XboxTokens(
@@ -410,19 +504,54 @@ async def async_sisu_authorize(
             title_not_after=_not_after(title) if title else None,
             xui_keys=tuple(sorted(str(k) for k in xui)),
             device_token=device if isinstance(device, str) else "",
+            title_id=_title_id(xti),
         )
     if status and 400 <= status < 500:
-        raise XapproveRefused("sisu_authorize", status, _xerr(payload, headers))
-    raise XapproveError(f"sisu_authorize: HTTP {status}")
+        raise XapproveRefused(step, status, _xerr(payload, headers))
+    raise XapproveError(f"{step}: HTTP {status}")
 
 
-def _xui(token: Any) -> dict[str, Any]:
-    """The first ``xui`` claim set of an XSTS answer ({} if none)."""
-    if isinstance(token, dict):
-        items = (token.get("DisplayClaims") or {}).get("xui")
-        if isinstance(items, list) and items and isinstance(items[0], dict):
-            return items[0]
-    return {}
+SISU_AUTHENTICATE_URL = "https://sisu.xboxlive.com/authenticate"
+
+
+async def async_sisu_authenticate_probe(
+    session: aiohttp.ClientSession, key: ProofKey, device_token: str, title_id: str | None
+) -> dict[str, Any]:
+    """probe_xapprove only: one signed sisu/authenticate as the app sends it,
+    to see what it answers. Booleans and names only: never the session id or
+    the redirect URL. Nothing is kept."""
+    _verifier, challenge = new_pkce()
+    body: dict[str, Any] = {"AppId": CLIENT_ID}
+    if title_id:
+        body["TitleId"] = title_id
+    body.update({
+        "RedirectUri": REDIRECT_URI,
+        "DeviceToken": device_token,
+        "Sandbox": "RETAIL",
+        "TokenType": "code",
+        "Offers": [SCOPE],
+        "Query": {
+            "display": "android_phone",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": secrets.token_urlsafe(16),
+            "prompt": "select_account",
+        },
+    })
+    facts: dict[str, Any] = {}
+    status, payload, headers = await _signed_post(
+        session, key, SISU_AUTHENTICATE_URL, body, "sisu_authenticate", facts
+    )
+    result = dict(facts["sisu_authenticate"])
+    result.update({
+        "title_id_sent": bool(title_id),
+        "response_keys": sorted(str(k) for k in payload) if isinstance(payload, dict) else None,
+        "session_id_received": bool(isinstance(payload, dict) and payload.get("SessionId")),
+        "msa_oauth_redirect_received": bool(isinstance(payload, dict) and payload.get("MsaOauthRedirect")),
+        "session_id_header": any(str(n).lower() == "x-sessionid" for n in headers),
+        "response_header_names": sorted(str(n) for n in headers),
+    })
+    return result
 
 
 class XstsVariantSkipped(XapproveError):
@@ -448,25 +577,30 @@ class XstsVariant:
 
 
 #: In order; the first that answers 200 is used (and remembered). Live
-#: 2026-11-08 ``app`` got 400 XErr 2148916279 (0x8015DC37) for
-#: http://xboxlive.com.
+#: 2026-11-08 the app's request with OptionalDisplayClaims got 400 XErr
+#: 2148916279 (0x8015DC37) for http://xboxlive.com and ``no_claims`` got 200:
+#: it is the default, and every other variant leaves the claims out too
+#: except ``app``.
 XSTS_VARIANTS: list[XstsVariant] = [
-    XstsVariant("app"),
     XstsVariant("no_claims", claims=False),
-    XstsVariant("no_title", title=False),
-    XstsVariant("sisu_device", sisu_device=True),
-    XstsVariant("unsigned", signed=False),
-    XstsVariant("plain_json", charset=False),
-    XstsVariant("bare", claims=False, title=False, charset=False),
+    XstsVariant("no_title", claims=False, title=False),
+    XstsVariant("sisu_device", claims=False, sisu_device=True),
+    XstsVariant("unsigned", claims=False, signed=False),
+    XstsVariant("plain_json", claims=False, charset=False),
+    XstsVariant("app"),
 ]
 XSTS_VARIANTS_BY_NAME = {v.name: v for v in XSTS_VARIANTS}
 
 
-def xsts_step(relying_party: str, variant: str = "app") -> str:
-    """The name of the explicit XSTS step for one relying party (facts)."""
-    if variant == "app":
-        return f"xsts_authorize[{relying_party}]"
-    return f"xsts_authorize[{relying_party}|{variant}]"
+def xsts_key(relying_party: str, profile: str = "") -> str:
+    """The cache key of an explicit XSTS: the relying party, after the SISU
+    profile when there is one."""
+    return f"{profile}|{relying_party}" if profile else relying_party
+
+
+def xsts_step(relying_party: str, variant: str = "no_claims", profile: str = "") -> str:
+    """The name of the explicit XSTS step (facts)."""
+    return f"xsts_authorize[{xsts_key(relying_party, profile)}|{variant}]"
 
 
 async def async_xsts_authorize(
@@ -477,6 +611,7 @@ async def async_xsts_authorize(
     relying_party: str = RP_XBOXLIVE,
     facts: dict | None = None,
     variant: XstsVariant = XSTS_VARIANTS[0],
+    profile: str = "",
 ) -> XboxTokens:
     """The app's explicit XSTS step: ``xsts.auth.xboxlive.com/xsts/authorize``
     with SISU's user token, the device token and SISU's title token (when one
@@ -485,7 +620,7 @@ async def async_xsts_authorize(
 
     The parent xuid is kept from SISU when the answer carries no ``xid``.
     """
-    step = xsts_step(relying_party, variant.name)
+    step = xsts_step(relying_party, variant.name, profile)
     device = sisu_tokens.device_token if variant.sisu_device else device_token
     if not device:
         _record(facts, step, {"skipped": "no DeviceToken in SISU's answer"})
@@ -548,7 +683,9 @@ class XboxSisuAuth:
     """The Xbox Family Settings sign-in of one entry: XSTS on demand, signing.
 
     ``save`` is awaited with the credential whenever Microsoft rotates the
-    refresh token. Tokens other than the refresh token live in memory only.
+    refresh token of the main scope. Tokens other than the refresh token
+    live in memory only. SISU tokens are kept per SisuProfile (the plain one
+    serves the family read and the parent xuid).
     """
 
     def __init__(
@@ -562,22 +699,34 @@ class XboxSisuAuth:
         self._save = save
         self.key = ProofKey.from_pem(credential["proof_key"])
         self._device: tuple[str, datetime | None] | None = None
-        self._tokens: XboxTokens | None = None
-        #: relying party -> the explicit XSTS step's token (memory only).
+        #: SisuProfile name -> SISU's tokens ("" = the plain profile).
+        self._sisu_tokens: dict[str, XboxTokens] = {}
+        #: xsts_key -> the explicit XSTS step's token (memory only).
         self._xsts: dict[str, XboxTokens] = {}
-        #: relying party -> the XstsVariant name that worked.
+        #: xsts_key -> the XstsVariant name that worked.
         self.xsts_variants: dict[str, str] = {}
-        #: relying party -> the refusal when every variant failed (until the
+        #: xsts_key -> the refusal when every variant failed (until those
         #: SISU tokens are renewed: no second sweep for nothing).
         self._xsts_failed: dict[str, XapproveError] = {}
         #: The variant tried first (probe_xapprove saves the one that worked).
         self.preferred_variant: str | None = None
+        #: The title id from SISU's TitleToken (xti tid), when one came.
+        self.title_id: str | None = None
         self._access: dict[str, MsaTokens] = {}
         self._lock = asyncio.Lock()
         self.token_facts: dict[str, Any] = {}
 
+    @property
+    def _tokens(self) -> XboxTokens | None:
+        """The plain profile's SISU tokens."""
+        return self._sisu_tokens.get("")
+
+    @property
+    def device_token(self) -> str | None:
+        return self._device[0] if self._device else None
+
     def forget_tokens(self) -> None:
-        self._tokens = None
+        self._sisu_tokens.clear()
         self._xsts.clear()
         self._xsts_failed.clear()
         self._access.clear()
@@ -585,7 +734,7 @@ class XboxSisuAuth:
     def seed(self, sign_in: SignIn) -> None:
         """Start from the tokens a fresh sign-in already got (no refresh needed)."""
         self._device = (sign_in.device_token, sign_in.device_not_after)
-        self._tokens = sign_in.tokens
+        self._sisu_tokens = {"": sign_in.tokens}
         self._xsts.clear()
         self._xsts_failed.clear()
 
@@ -593,55 +742,64 @@ class XboxSisuAuth:
         cached = self._access.get(scope)
         if cached is not None and _valid(cached.expires_at):
             return cached
-        tokens = await async_refresh_msa(
-            self._session_getter(), self._credential["refresh_token"], scope, self.token_facts
-        )
-        if tokens.refresh_token and tokens.refresh_token != self._credential["refresh_token"]:
+        try:
+            tokens = await async_refresh_msa(
+                self._session_getter(), self._credential["refresh_token"], scope, self.token_facts
+            )
+        except XboxSignInExpired as err:
+            if scope == SCOPE:
+                raise
+            # Another scope refused: not a sign-in that ran out.
+            raise XapproveRefused(err.step, err.status, err.xerr, err.error) from err
+        # Only the main scope's refresh token replaces the stored one.
+        if (
+            scope == SCOPE
+            and tokens.refresh_token
+            and tokens.refresh_token != self._credential["refresh_token"]
+        ):
             self._credential["refresh_token"] = tokens.refresh_token
             await self._save(dict(self._credential))
         self._access[scope] = tokens
         return tokens
 
-    async def async_xsts(self, *, force: bool = False) -> XboxTokens:
+    async def async_xsts(self, *, force: bool = False, profile: str = "") -> XboxTokens:
         """SISU's own XSTS (its ``AuthorizationToken``, http://xboxlive.com)."""
         async with self._lock:
-            return await self._async_sisu(force)
+            return await self._async_sisu(force, profile)
 
     async def async_title_xsts(
-        self, relying_party: str = RP_XBOXLIVE, *, force: bool = False
+        self, relying_party: str = RP_XBOXLIVE, *, force: bool = False, profile: str = ""
     ) -> XboxTokens:
         """An XSTS from the explicit XSTS step (SISU's user, device and title
         tokens) for ``relying_party``: how the Xbox Family Settings app gets
         the token it sends to xapprove. ``force`` renews SISU's tokens too."""
+        key = xsts_key(relying_party, profile)
         async with self._lock:
-            cached = self._xsts.get(relying_party)
+            cached = self._xsts.get(key)
             if cached is not None and not force and _valid(cached.xsts_not_after):
                 return cached
-            sisu_tokens = await self._async_sisu(force)
-            if not force and relying_party in self._xsts_failed:
-                raise self._xsts_failed[relying_party]
+            sisu_tokens = await self._async_sisu(force, profile)
+            if not force and key in self._xsts_failed:
+                raise self._xsts_failed[key]
             session = self._session_getter()
-            if self._device is None or not _valid(self._device[1]):
-                self._device = await async_device_token(
-                    session, self.key, self._credential["device_id"], self.token_facts
-                )
+            await self._async_device(session)
             first: XapproveError | None = None
             for variant in self._variant_order():
                 try:
                     tokens = await async_xsts_authorize(
                         session, self.key, sisu_tokens, self._device[0], relying_party,
-                        self.token_facts, variant,
+                        self.token_facts, variant, profile,
                     )
                 except XapproveRefused as err:
                     first = first or err
                     continue
                 except XstsVariantSkipped:
                     continue
-                self._xsts[relying_party] = tokens
-                self.xsts_variants[relying_party] = variant.name
+                self._xsts[key] = tokens
+                self.xsts_variants[key] = variant.name
                 return tokens
-            error = first or XapproveError(f"{xsts_step(relying_party)}: no variant answered")
-            self._xsts_failed[relying_party] = error
+            error = first or XapproveError(f"{xsts_step(relying_party, profile=profile)}: no variant answered")
+            self._xsts_failed[key] = error
             raise error
 
     def _variant_order(self) -> list[XstsVariant]:
@@ -651,41 +809,68 @@ class XboxSisuAuth:
             return list(XSTS_VARIANTS)
         return [preferred] + [v for v in XSTS_VARIANTS if v is not preferred]
 
-    async def _async_sisu(self, force: bool) -> XboxTokens:
-        """SISU's tokens, renewed when they ran out. The caller holds the lock."""
-        if self._tokens is not None and not force and _valid(self._tokens.xsts_not_after):
-            return self._tokens
-        # New SISU tokens: the XSTS made from the old ones go too.
-        self._xsts.clear()
-        self._xsts_failed.clear()
-        session = self._session_getter()
-        msa = await self._async_msa()
+    async def _async_device(self, session: aiohttp.ClientSession) -> None:
         if self._device is None or not _valid(self._device[1]):
             self._device = await async_device_token(
                 session, self.key, self._credential["device_id"], self.token_facts
             )
-        try:
-            self._tokens = await async_sisu_authorize(
-                session, self.key, msa.access_token, self._device[0], self.token_facts
+
+    def _drop_xsts(self, profile: str) -> None:
+        """New SISU tokens of a profile: the XSTS made from the old ones go."""
+        for key in [k for k in self._xsts if (k.split("|", 1)[0] if "|" in k else "") == profile]:
+            del self._xsts[key]
+        for key in [k for k in self._xsts_failed if (k.split("|", 1)[0] if "|" in k else "") == profile]:
+            del self._xsts_failed[key]
+
+    async def _async_authorize(self, session: aiohttp.ClientSession, profile: SisuProfile) -> XboxTokens:
+        msa = await self._async_msa()
+        ucs: tuple[str, str] | None = None
+        if profile.ucs:
+            ucs = (
+                (await self._async_msa(UCS_CHECKIN_SCOPE)).access_token,
+                (await self._async_msa(UCS_WEB_SCOPE)).access_token,
             )
+        await self._async_device(session)
+        tokens = await async_sisu_authorize(
+            session, self.key, msa.access_token, self._device[0], self.token_facts, profile, ucs
+        )
+        if tokens.title_id:
+            self.title_id = tokens.title_id
+        return tokens
+
+    async def _async_sisu(self, force: bool, profile_name: str = "") -> XboxTokens:
+        """SISU's tokens of a profile, renewed when they ran out. The caller
+        holds the lock."""
+        profile = SISU_PROFILES.get(profile_name, PLAIN_PROFILE)
+        cached = self._sisu_tokens.get(profile.name)
+        if cached is not None and not force and _valid(cached.xsts_not_after):
+            return cached
+        self._drop_xsts(profile.name)
+        session = self._session_getter()
+        try:
+            tokens = await self._async_authorize(session, profile)
         except XapproveRefused:
+            if profile.name:
+                raise
             # A device token or MSA token Microsoft no longer takes: once
             # more from fresh ones before giving up.
             self._device = None
             self._access.pop(SCOPE, None)
-            msa = await self._async_msa()
-            self._device = await async_device_token(
-                session, self.key, self._credential["device_id"], self.token_facts
-            )
-            self._tokens = await async_sisu_authorize(
-                session, self.key, msa.access_token, self._device[0], self.token_facts
-            )
-        return self._tokens
+            tokens = await self._async_authorize(session, profile)
+        self._sisu_tokens[profile.name] = tokens
+        return tokens
 
     async def async_access_token(self, scope: str) -> str:
         """An MSA access token of the app's client for another scope (probe)."""
         async with self._lock:
             return (await self._async_msa(scope)).access_token
+
+    async def async_authenticate_probe(self) -> dict[str, Any]:
+        """probe_xapprove: one diagnostic sisu/authenticate (see there)."""
+        async with self._lock:
+            session = self._session_getter()
+            await self._async_device(session)
+            return await async_sisu_authenticate_probe(session, self.key, self._device[0], self.title_id)
 
     def sign(self, method: str, url: str, authorization: str, body: bytes) -> str:
         return self.key.sign(method, url, authorization, body)

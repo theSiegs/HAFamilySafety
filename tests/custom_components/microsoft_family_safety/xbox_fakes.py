@@ -47,6 +47,15 @@ SISU_AUTH = f"XBL3.0 x=4343;{SISU_XSTS}"
 TITLE_TOKEN = "title-SECRET"
 #: The DeviceToken in SISU's answer (another than device/authenticate's).
 SISU_DEVICE_TOKEN = "sisu-device-token-SECRET"
+#: The consent service access tokens (no refresh token comes with them).
+UCS_TOKENS = {
+    sisu.UCS_CHECKIN_SCOPE: "ucs-checkin-SECRET",
+    sisu.UCS_WEB_SCOPE: "ucs-web-SECRET",
+}
+#: sisu/authenticate's answer.
+SESSION_ID = "session-id-SECRET"
+OAUTH_REDIRECT = "https://login.live.com/oauth20_authorize.srf?redirect-SECRET"
+TITLE_ID = "1016898439"
 #: The explicit XSTS step's token per relying party.
 XSTS_TOKENS = {
     "http://xboxlive.com": "xsts-xboxlive-SECRET",
@@ -64,7 +73,7 @@ USER_CODE = "ABCD-1234"
 SECRETS = (
     PARENT_XUID, CHILD_XUID, GAMERTAG, CODE, SISU_ACCESS, DEVICE_TOKEN, SISU_XSTS,
     "sisu-refresh-", TITLE_TOKEN, "sisu-user-SECRET", DEVICE_CODE, *XSTS_TOKENS.values(),
-    SISU_DEVICE_TOKEN,
+    SISU_DEVICE_TOKEN, *UCS_TOKENS.values(), SESSION_ID, "redirect-SECRET", "other-scope-refresh-SECRET",
 )
 
 
@@ -92,6 +101,22 @@ class FakeResponse:
 
     async def __aexit__(self, *exc):
         return False
+
+
+def authorize_shape(payload: dict, headers: dict) -> str:
+    """"" for a plain sisu/authorize, else ``~ucs:<form>:<prompts>:<contract>``,
+    put after the tokens it gives so that a test can tell them apart."""
+    if "UcsCheckinToken" not in payload:
+        assert "UcsWebToken" not in payload
+        return ""
+    checkin, web = payload["UcsCheckinToken"], payload["UcsWebToken"]
+    form = "t" if checkin.startswith("t=") else "raw"
+    prefix = "t=" if form == "t" else ""
+    assert checkin == f"{prefix}{UCS_TOKENS[sisu.UCS_CHECKIN_SCOPE]}"
+    assert web == f"{prefix}{UCS_TOKENS[sisu.UCS_WEB_SCOPE]}"
+    prompts = "prompts" if payload.get("UserPrompts") == [] else "noprompts"
+    contract = "c1" if headers.get("x-xbl-contract-version") == "1" else "noc"
+    return f"~ucs_{form}_{prompts}_{contract}"
 
 
 def verify_signature(header: str, jwk: dict, method: str, url: str, auth: str, body: bytes) -> int:
@@ -157,6 +182,13 @@ class XboxServer:
         self.device_code_error = "unsupported_response_type"
         #: Answers to the device-code polls, in order: "ok" or an error code.
         self.device_polls: list[str] = ["ok"]
+        #: Every sisu/authorize body and its contract header.
+        self.authorize_bodies: list[dict] = []
+        self.authorize_contracts: list[str | None] = []
+        #: Which sisu/authorize requests answer 200 (else 400).
+        self.authorize_accepts = lambda payload, headers: True
+        #: Every sisu/authenticate body.
+        self.authenticate_bodies: list[dict] = []
 
     def state(self) -> dict:
         overrides = []
@@ -214,6 +246,18 @@ class XboxServer:
                     return FakeResponse(400, {"error": "invalid_grant"})
             elif self.dead or form["refresh_token"] not in self.refresh_tokens:
                 return FakeResponse(400, {"error": "invalid_grant"})
+            if form["scope"] in UCS_TOKENS:
+                return FakeResponse(200, {
+                    "token_type": "bearer", "expires_in": 3600, "scope": form["scope"],
+                    "access_token": UCS_TOKENS[form["scope"]], "user_id": "abc",
+                })
+            if form["scope"] != sisu.SCOPE:
+                # As live for another scope: no rotation of the stored token
+                # is expected; a new one may still come back.
+                return FakeResponse(200, {
+                    "token_type": "bearer", "expires_in": 3600, "scope": form["scope"],
+                    "access_token": SISU_ACCESS, "refresh_token": "other-scope-refresh-SECRET",
+                })
             return FakeResponse(200, {
                 "token_type": "bearer", "expires_in": 3600, "scope": form["scope"],
                 "access_token": SISU_ACCESS, "refresh_token": self._rotate(),
@@ -227,7 +271,17 @@ class XboxServer:
             assert payload["Properties"]["Id"].startswith("{")
             return FakeResponse(200, {
                 "Token": DEVICE_TOKEN, "NotAfter": iso_utc(dt_util.utcnow() + timedelta(days=14)),
+                "DisplayClaims": {"xdi": {"did": "F700000000000001", "dcs": "0"}},
             })
+        if url == sisu.SISU_AUTHENTICATE_URL:
+            self.sisu_calls.append("authenticate")
+            payload = json.loads(kwargs["data"])
+            verify_signature(headers["Signature"], self.jwk, "POST", url, "", kwargs["data"])
+            self.authenticate_bodies.append(payload)
+            return FakeResponse(
+                200, {"MsaOauthRedirect": OAUTH_REDIRECT, "MsaRequestParameters": {}},
+                {"X-SessionId": SESSION_ID},
+            )
         if url == sisu.SISU_AUTHORIZE_URL:
             self.sisu_calls.append("authorize")
             payload = json.loads(kwargs["data"])
@@ -236,18 +290,24 @@ class XboxServer:
             assert payload["AccessToken"] == f"t={SISU_ACCESS}"
             assert payload["DeviceToken"] == DEVICE_TOKEN
             assert payload["AppId"] == sisu.CLIENT_ID and payload["RelyingParty"] == "http://xboxlive.com"
+            self.authorize_bodies.append(payload)
+            self.authorize_contracts.append(headers.get("x-xbl-contract-version"))
             if self.sisu_authorize_status != 200:
                 return FakeResponse(self.sisu_authorize_status, None, {"x-err": "2148916236"})
+            if not self.authorize_accepts(payload, headers):
+                return FakeResponse(400, {"XErr": 2148916233})
+            shape = authorize_shape(payload, headers)
             return FakeResponse(200, {
                 **({"DeviceToken": SISU_DEVICE_TOKEN} if self.sisu_device_token else {}),
                 **({"TitleToken": {
                     "Token": TITLE_TOKEN,
                     "NotAfter": iso_utc(dt_util.utcnow() + timedelta(days=14)),
+                    "DisplayClaims": {"xti": {"tid": TITLE_ID}},
                 }} if self.title_token else {}),
-                "UserToken": {"Token": "sisu-user-SECRET",
+                "UserToken": {"Token": f"sisu-user-SECRET{shape}",
                               "NotAfter": iso_utc(dt_util.utcnow() + timedelta(days=14))},
                 "AuthorizationToken": {
-                    "Token": SISU_XSTS,
+                    "Token": f"{SISU_XSTS}{shape}",
                     "NotAfter": iso_utc(dt_util.utcnow() + timedelta(hours=16)),
                     "DisplayClaims": {"xui": [{"uhs": "4343", "xid": PARENT_XUID, "gtg": "SamParent"}]},
                 },
@@ -265,7 +325,8 @@ class XboxServer:
             props = payload["Properties"]
             assert props["SandboxId"] == "RETAIL"
             assert props["DeviceToken"] in (DEVICE_TOKEN, SISU_DEVICE_TOKEN)
-            assert props["UserTokens"] == ["sisu-user-SECRET"]
+            assert len(props["UserTokens"]) == 1 and props["UserTokens"][0].startswith("sisu-user-SECRET")
+            shape = props["UserTokens"][0][len("sisu-user-SECRET"):]
             if not self.title_token:
                 assert "TitleToken" not in props
             elif "TitleToken" in props:
@@ -278,7 +339,7 @@ class XboxServer:
             if not self.xsts_accepts(headers, props):
                 return FakeResponse(400, {"XErr": 2148916279})
             return FakeResponse(200, {
-                "Token": XSTS_TOKENS[rp],
+                "Token": f"{XSTS_TOKENS[rp]}{shape}",
                 "NotAfter": iso_utc(dt_util.utcnow() + timedelta(hours=16)),
                 "DisplayClaims": {"xui": [dict(XSTS_XUI)]},
             })

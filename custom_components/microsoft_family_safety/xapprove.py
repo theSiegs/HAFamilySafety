@@ -368,6 +368,8 @@ def app_headers() -> dict[str, str]:
         "User-Agent": APP_USER_AGENT,
         "Content-Type": "application/json",
         "MS-CV": new_ms_cv(),
+        # okhttp asks for gzip by itself; aiohttp decodes it.
+        "Accept-Encoding": "gzip",
     }
 
 
@@ -388,6 +390,8 @@ class XboxTokens:
     xui_keys: tuple[str, ...] = ()
     #: The DeviceToken in SISU's answer, if any (an XSTS step variant).
     device_token: str = field(default="", repr=False)
+    #: The title id (TitleToken xti ``tid``), if SISU's answer had one.
+    title_id: str | None = None
 
     def header(self) -> str:
         return f"XBL3.0 x={self.uhs};{self.xsts}"
@@ -411,6 +415,8 @@ class AuthMethod:
     ``contract``: an ``x-xbl-contract-version`` header, or none (the app
     sends none). ``app_like``: the app's other headers (``app_headers``).
     ``accept_language``: an ``Accept-Language`` header, or none.
+    ``sisu_profile``: the xbox_sisu.SisuProfile the tokens come from ("" =
+    the plain one; ``ucs_*`` = sisu/authorize with the consent tokens).
     """
 
     name: str
@@ -421,6 +427,17 @@ class AuthMethod:
     contract: str | None = None
     app_like: bool = True
     accept_language: str | None = None
+    sisu_profile: str = ""
+
+
+#: The SISU profiles with the consent service tokens (xbox_sisu.SISU_PROFILES),
+#: the app's (no contract on authorize, UserPrompts) first.
+UCS_PROFILES = [
+    f"ucs_{form}_{prompts}_{contract}"
+    for contract in ("noc", "c1")
+    for prompts in ("prompts", "noprompts")
+    for form in ("raw", "t")
+]
 
 
 def _pair(prefix: str, **kwargs: Any) -> list[AuthMethod]:
@@ -436,8 +453,14 @@ def _methods() -> list[AuthMethod]:
     msa: dict[str, Any] = {"relying_party": None, "msa_scope": XAPPROVE_SCOPE}
     return [
         *_pair("xsts", token="xsts", relying_party=RP_XBOXLIVE),
-        *_pair("xsts_xapprove", token="xsts", relying_party=RP_XAPPROVE),
-        *_pair("xsts_xapprove_https", token="xsts", relying_party=RP_XAPPROVE_HTTPS),
+        *[
+            AuthMethod(f"{profile}_xsts_signed", token="xsts", relying_party=RP_XBOXLIVE, sisu_profile=profile)
+            for profile in UCS_PROFILES
+        ],
+        *[
+            AuthMethod(f"{profile}_sisu_signed", sisu_profile=profile, **sisu)
+            for profile in UCS_PROFILES[:2]
+        ],
         *_pair("sisu", **sisu),
         *_pair("sisu_c1", contract="1", **sisu),
         *_pair("sisu_c2", contract="2", **sisu),
@@ -449,11 +472,13 @@ def _methods() -> list[AuthMethod]:
 
 
 #: Every way of signing xapprove requests, the most app-like first: the
-#: XSTS from the explicit step per relying party, SISU's own XSTS (also with
-#: contract versions 1-3 and Accept-Language), the xapprove-scope MSA token;
-#: each signed and unsigned. (Live 2026-11-08: SISU's XSTS 401 without
-#: WWW-Authenticate, the MSA token 401 token_required, the explicit XSTS step
-#: 400; every token of the Family Safety sign-in 401 token_required.)
+#: XSTS from the explicit step (no OptionalDisplayClaims), then the same
+#: from a sisu/authorize with the consent service tokens (UCS), SISU's own
+#: XSTS (also with contract versions 1-3 and Accept-Language), the
+#: xapprove-scope MSA token. Live 2026-11-08: every XSTS or SISU token got
+#: 401 with an empty body and no WWW-Authenticate (accepted as a token, not
+#: authorized), the MSA token 401 token_required; the XSTS step for
+#: xapprove's own relying parties 400 in every variant (dropped).
 PROBE_METHODS: list[AuthMethod] = _methods()
 METHODS_BY_NAME: dict[str, AuthMethod] = {m.name: m for m in PROBE_METHODS}
 
@@ -462,9 +487,7 @@ METHODS_BY_NAME: dict[str, AuthMethod] = {m.name: m for m in PROBE_METHODS}
 PATH_OVERRIDES = "overrides"
 PATH_SCREENTIME = "screentime"
 #: Ways also tried on the screen-time settings, right after the overrides.
-_SCREENTIME_TOO = frozenset({
-    "xsts_signed", "xsts_unsigned", "sisu_signed", "sisu_unsigned", "sisu_c1_signed", "sisu_c3_signed",
-})
+_SCREENTIME_TOO = frozenset({"xsts_signed", "sisu_signed"})
 #: Every (way, path) probe_xapprove tries, in order. It stops at the first
 #: way that reads the overrides; a settings read alone is reported, not saved.
 PROBE_ATTEMPTS: list[tuple[AuthMethod, str]] = [
@@ -620,9 +643,11 @@ class XapproveClient:
             else:
                 value = f"XBL3.0 x={(await sisu.async_xsts()).uhs};{token}"
         elif method.token == "xsts":
-            value = (await sisu.async_title_xsts(method.relying_party or RP_XBOXLIVE, force=force)).header()
+            value = (await sisu.async_title_xsts(
+                method.relying_party or RP_XBOXLIVE, force=force, profile=method.sisu_profile,
+            )).header()
         else:
-            value = (await sisu.async_xsts(force=force)).header()
+            value = (await sisu.async_xsts(force=force, profile=method.sisu_profile)).header()
         headers = app_headers() if method.app_like else {}
         headers["Authorization"] = value
         if method.signed:

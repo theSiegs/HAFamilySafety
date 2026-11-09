@@ -76,7 +76,6 @@ from .xapprove import (
     OVERRIDE_BLOCK,
     PATH_OVERRIDES,
     PROBE_ATTEMPTS,
-    PROBE_METHODS,
     AuthMethod,
     XapproveClient,
     XapproveError,
@@ -88,9 +87,10 @@ from .xapprove import (
     member_xuid,
     method_by_name,
     overrides_url,
+    redact,
     screentime_url,
 )
-from .xbox_sisu import XSTS_VARIANTS_BY_NAME, SignIn, XboxSignInExpired, XboxSisuAuth
+from .xbox_sisu import XSTS_VARIANTS_BY_NAME, SignIn, XboxSignInExpired, XboxSisuAuth, xsts_key
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -209,7 +209,7 @@ class XboxXapproveMixin:
             self._xapprove.method = method
         saved: dict[str, Any] = {"method": method.name, "found": iso_utc(dt_util.utcnow())}
         variant = (
-            self._sisu.xsts_variants.get(method.relying_party)
+            self._sisu.xsts_variants.get(xsts_key(method.relying_party, method.sisu_profile))
             if self._sisu is not None and method.token == "xsts" and method.relying_party
             else None
         )
@@ -951,7 +951,7 @@ class XboxXapproveMixin:
         """probe_xapprove: the Xbox sign-in's token steps, the child lookup,
         and read-only overrides GETs.
 
-        The GET is tried with each way of signing it in xapprove.PROBE_METHODS
+        The GET is tried with each way of signing it in xapprove.PROBE_ATTEMPTS
         until one answers 2xx; that one is saved and used from then on. Uses
         the Xbox Family Settings sign-in only (never the Family Safety one).
         Answers with non-secret facts only: no token, xuid or gamertag.
@@ -993,18 +993,24 @@ class XboxXapproveMixin:
                 self._xapprove_mark_refused(err)
         else:
             result["title_token_received"] = bool(tokens.title_token)
+            result["title_id"] = redact(tokens.title_id or "") or None
             result["sisu_xui_keys"] = list(tokens.xui_keys)
+            # What sisu/authenticate answers (booleans and names only).
+            try:
+                result["sisu_authenticate"] = await self._sisu.async_authenticate_probe()
+            except XapproveError as err:
+                result["sisu_authenticate"] = {"error": str(err)}
             await self._async_probe_family_and_read(client, tokens, result)
-            # The explicit XSTS step per relying party tried: the variant that
-            # worked (None: every one was refused) and its claim names.
-            tried = [m.relying_party for m in PROBE_METHODS if m.token == "xsts" and m.relying_party]
+            # The explicit XSTS step per [profile|]relying party tried: the
+            # variant that worked (None: every one was refused), claim names.
             xsts: dict[str, Any] = {}
-            for rp in dict.fromkeys(tried):
-                if not any(k.startswith(f"xsts_authorize[{rp}") for k in steps):
+            for name in steps:
+                if not name.startswith("xsts_authorize[") or not name.endswith("]"):
                     continue
-                cached = self._sisu._xsts.get(rp)
-                xsts[rp] = {
-                    "variant": self._sisu.xsts_variants.get(rp) if cached else None,
+                key = name[len("xsts_authorize["):-1].rsplit("|", 1)[0]
+                cached = self._sisu._xsts.get(key)
+                xsts[key] = {
+                    "variant": self._sisu.xsts_variants.get(key) if cached else None,
                     "xui_keys": list(cached.xui_keys) if cached else None,
                 }
             result["xsts"] = xsts
