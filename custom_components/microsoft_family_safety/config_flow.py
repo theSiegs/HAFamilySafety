@@ -1642,7 +1642,12 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
         self._xbox_proxy = None
         self._xbox_link_task = None
         if redirect_url and self._xbox_verifier:
-            api = XboxFamilyAPI(self.hass, self._config_entry.entry_id)
+            # As the manual step: through the running coordinator's instance, so
+            # the new token is used at once
+            coordinator = self.hass.data.get(DOMAIN, {}).get(self._config_entry.entry_id)
+            api = getattr(coordinator, "xbox_family", None) or XboxFamilyAPI(
+                self.hass, self._config_entry.entry_id
+            )
             try:
                 await api.async_link_from_redirect(
                     redirect_url, self._xbox_verifier, "proxy"
@@ -1652,6 +1657,8 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
                     "Xbox Family Settings link via the proxy failed: %s", err
                 )
                 return await self.async_step_xbox_link_manual()
+            if coordinator is not None:
+                coordinator.async_xbox_linked()
             return self.async_create_entry(title="", data=self._pending_options)
         return await self.async_step_xbox_link_manual()
 

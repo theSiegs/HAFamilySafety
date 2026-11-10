@@ -354,7 +354,8 @@ async def test_manual_link_is_used_without_a_reload(hass, coordinator):
         result["flow_id"],
         {"update_interval": 300, "platforms": ["Windows", "Xbox"], "xbox_link": True},
     )
-    assert result["step_id"] == "xbox_link"
+    # No sign-in proxy here: the link falls back to pasting the redirect
+    assert result["step_id"] == "xbox_link_manual"
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
         {"redirect_url": "https://login.live.com/oauth20_desktop.srf?code=abc"},
