@@ -194,3 +194,33 @@ async def test_a_refusal_that_outlasts_the_token_reset_asks_for_a_sign_in(hass) 
         api._web_csrf = None
 
     coord._request_reauth.assert_called_once_with("family_context_auth_required")
+
+
+async def test_xbox_on_xapprove_needs_no_family_signin(hass) -> None:
+    """With Xbox on the Xbox Family Settings sign-in (xapprove), a degraded
+    Family web context no longer asks for an interactive reauth."""
+    coord = _coordinator(hass, xbox_features=True)
+    coord.xbox_family = SimpleNamespace(usable=True, linked=True)
+
+    for _ in range(3):
+        await coord._async_track_family_context()
+
+    coord._request_reauth.assert_not_called()
+
+
+async def test_xapprove_clears_a_standing_family_reauth(hass) -> None:
+    """A family-context reauth raised before the Xbox link became usable is
+    cleared once xapprove is usable, so the standing prompt goes away."""
+    coord = _coordinator(hass, xbox_features=True)
+    coord.xbox_family = SimpleNamespace(usable=True, linked=True)
+    coord._dismiss_auth_notification = AsyncMock()
+    coord._reauth_requested = True
+    coord._reauth_reason = "family_context_auth_required"
+
+    for _ in range(2):
+        await coord._async_track_family_context()
+
+    coord._request_reauth.assert_not_called()
+    assert coord._reauth_requested is False
+    assert coord._reauth_reason is None
+    coord._dismiss_auth_notification.assert_awaited()

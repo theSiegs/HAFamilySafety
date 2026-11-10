@@ -2968,20 +2968,28 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._family_auth_required_polls += 1
         if not self._family_context_dead_end:
             return
-        if getattr(self.web_api, "mobile_schedule_ok", False) and not self.xbox_features:
-            # Schedules run on the mobile API; the expired web context only
-            # affects web-only extras, so a daily reauth prompt is not worth it.
-            # With the Xbox features on it is: Xbox play time and the Xbox
-            # lock exist only on the web session, and without a prompt they
-            # stay unknown with no sign that anything is wrong.
+        xbox_on_xapprove = self.xbox_features and self.xbox_family.usable
+        if (
+            getattr(self.web_api, "mobile_schedule_ok", False) and not self.xbox_features
+        ) or xbox_on_xapprove:
+            # The expired web/Family context only gated Xbox play time and the
+            # Xbox lock. With Xbox on the Xbox Family Settings sign-in (xapprove)
+            # and schedules on the mobile API, a reauth prompt for the web
+            # session is not worth it.
             if self._family_auth_required_polls == _FAMILY_AUTH_REQUIRED_POLLS:
                 _LOGGER.info(
-                    "Family web context needs an interactive sign-in; schedules keep "
-                    "working through the mobile API%s, so no reauthentication is requested",
-                    " and Xbox through the Xbox Family Settings sign-in"
-                    if self.xbox_features and self.xbox_family.linked
-                    else "",
+                    "Family web context needs an interactive sign-in; %s, so no "
+                    "reauthentication is requested",
+                    "Xbox runs on the Xbox Family Settings sign-in"
+                    if xbox_on_xapprove
+                    else "schedules keep working through the mobile API",
                 )
+            # Clear a family-context reauth raised on an earlier poll (before the
+            # Xbox link became usable) so the standing prompt goes away.
+            if self._reauth_reason == "family_context_auth_required":
+                self._reauth_requested = False
+                self._reauth_reason = None
+                await self._dismiss_auth_notification()
             return
         await self._create_auth_notification()
         self._request_reauth("family_context_auth_required")
