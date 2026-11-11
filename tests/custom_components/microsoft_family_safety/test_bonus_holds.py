@@ -244,3 +244,54 @@ async def test_extra_time_records_survive_a_restart(hass, xbox, mobile):
     again = _make(hass, coord.entry, xbox, mobile)
     await again._async_load_platform_holds()
     assert again._time_bonuses == saved
+
+
+# --- The Allowed Now sensor shows the same hold attributes as the lock switch -------
+
+HOLD_ATTRS = ("hold", "override", "override_until", "allow_until", "platform", "user_id")
+
+
+def _both(coord, platform):
+    from custom_components.microsoft_family_safety.binary_sensor import (
+        FamilySafetyAllowedNowSensor,
+    )
+    from custom_components.microsoft_family_safety.switch import (
+        FamilySafetyPlatformLockSwitch,
+    )
+
+    allowed = FamilySafetyAllowedNowSensor(coord, coord.entry, CHILD, platform)
+    lock = FamilySafetyPlatformLockSwitch(coord, coord.entry, CHILD, "Alex", platform)
+    return allowed.extra_state_attributes, lock.extra_state_attributes
+
+
+@pytest.mark.parametrize("step", ["nothing", "our_lock", "our_bonus", "parent_lock"])
+async def test_allowed_now_has_the_lock_switch_hold_attributes(hass, xbox, mobile, step):
+    coord = _coordinator(hass, xbox, mobile)
+    if step == "our_lock":
+        await coord.async_lock_platform(CHILD, "Xbox", _minutes(120))
+    elif step == "our_bonus":
+        await _locked_then_bonus(coord, xbox)
+    elif step == "parent_lock":
+        xbox.overrides = [_xbox(OVERRIDE_BLOCK, _minutes(60))]
+    _polled(coord, xbox)
+
+    allowed, lock = _both(coord, "Xbox")
+    for name in HOLD_ATTRS:
+        assert allowed[name] == lock[name], name
+    expected = {
+        "nothing": "none", "our_lock": "ours", "our_bonus": "bonus_ours", "parent_lock": "parent",
+    }[step]
+    assert allowed["hold"] == expected
+    assert allowed["user_id"] == CHILD
+
+
+async def test_allowed_now_hold_attributes_for_windows(hass, xbox, mobile):
+    coord = _coordinator(hass, xbox, mobile)
+    await coord.async_lock_platform(CHILD, "Windows", _minutes(120))
+    coord.data["accounts"][CHILD]["blocked_platforms"] = ["Windows"]
+
+    allowed, lock = _both(coord, "Windows")
+    for name in HOLD_ATTRS:
+        assert allowed[name] == lock[name], name
+    assert allowed["hold"] == "ours"
+    assert allowed["override"] == "blockUntil"
