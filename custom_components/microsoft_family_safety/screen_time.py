@@ -27,6 +27,7 @@ from typing import Any
 
 from homeassistant.util import dt as dt_util
 
+from .mobile_overrides import mobile_platform_name
 from .xbox_family_api import OVERRIDE_ALLOW, OVERRIDE_BLOCK, OVERRIDE_REVOKE
 
 BLOCK_UNTIL = "blockUntil"
@@ -118,16 +119,20 @@ def parse_mobile_override(
 ) -> dict[str, Any] | None:
     """The override in force for ``platform`` in the mobile API's answer.
 
-    ``GET /v1/devicelimits/{id}/overrides`` answers
+    ``GET /v4/devicelimits/{id}/overrides`` answers
     ``{"lockablePlatforms": [{"appliesTo": "Windows", "overrides": [...]}]}``;
-    a platform with an empty ``overrides`` list has nothing in force.
+    a platform with an empty ``overrides`` list has nothing in force. Windows
+    may be listed as "Desktop" (see mobile_overrides.mobile_platform_name).
     """
     now = now or dt_util.utcnow()
     if not isinstance(payload, dict) or not isinstance(payload.get("lockablePlatforms"), list):
         return None
     entries: list[dict[str, Any] | None] = []
     for item in payload["lockablePlatforms"]:
-        if not isinstance(item, dict) or str(item.get("appliesTo", "")).lower() != platform.lower():
+        if (
+            not isinstance(item, dict)
+            or mobile_platform_name(item.get("appliesTo")).lower() != platform.lower()
+        ):
             continue
         for raw in item.get("overrides") or []:
             if not isinstance(raw, dict):

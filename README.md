@@ -948,7 +948,7 @@ Be aware of the following before enabling native authentication:
 - **Renewal depends on the refresh tokens.** The integration renews and stores Microsoft's token rotations by itself. It cannot recover from a revoked login (password change, security review); Home Assistant will prompt you then.
 - **A browser is required to sign in.** Microsoft's OAuth sign-in is interactive (password, MFA). There is no headless sign-in.
 - **Entity IDs changed** — see [Breaking changes](#breaking-changes).
-- **Per-platform lock is unreliable** — Microsoft removed the `override_device` endpoint. Account Lock is the recommended replacement, but it locks all platforms at once.
+- **Per-platform lock can answer an error** — Microsoft's Windows/Mobile override endpoint sometimes answers HTTP 500. The integration reads the overrides back after each lock or unlock and only reports an error when the change really did not apply.
 
 ---
 
@@ -956,7 +956,7 @@ Be aware of the following before enabling native authentication:
 
 ### Mobile API — `mobileaggregator.family.microsoft.com`
 
-**Authentication:** OAuth token of the Family Safety app (client `000000000004893A`), refreshed from the stored refresh token. The roster, devices, usage, applications, device overrides and requests go through `pyfamilysafety`; the integration adds:
+**Authentication:** OAuth token of the Family Safety app (client `000000000004893A`), refreshed from the stored refresh token. The roster, devices, usage, applications and requests go through `pyfamilysafety`; the integration adds:
 
 | Method | Endpoint | Description | Used by |
 |--------|----------|-------------|---------|
@@ -967,6 +967,10 @@ Be aware of the following before enabling native authentication:
 | PATCH | `/v3/AppLimits/policies/{childId}/{appId}` | Per-app time limits | app time limit services |
 | GET | `/v1/activityreport/webactivity/{childId}` | Websites visited in Edge (`allowStatus=true`, 403 when there is no data) | `sensor.websites_visited` |
 | GET | `/v1/activityreport/searchactivity/{childId}` | Bing searches | `sensor.websites_visited` attributes |
+| GET | `/v4/devicelimits/{childId}/overrides` (`Plat-Info: ALL`) | Active device overrides, read fresh on every poll and around every lock/unlock; the platform name to send is its `appliesTo` (Windows can be listed as `Desktop`) | `switch.lock`, `lock_platform` / `unlock_platform` |
+| POST | `/v4/devicelimits/{childId}/overrides` (`Plat-Info: ALL`) | Lock (`BlockUntil`) or unlock (`Cancel`) Windows/Mobile; body `{target, overrideType, validUntil, culture}` | `lock_platform`, `unlock_platform` |
+
+> Microsoft sometimes answers HTTP 500 to a lock or unlock it applied anyway, and has failed a cancel without applying it. `lock_platform` / `unlock_platform` therefore read the overrides again after every write and succeed only when that read shows the platform locked (lock) or not locked (unlock).
 
 ### Xbox Family Settings — `xapprove.xboxlive.com`
 

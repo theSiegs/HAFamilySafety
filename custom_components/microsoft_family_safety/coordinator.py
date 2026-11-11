@@ -14,8 +14,7 @@ from pyfamilysafety import FamilySafety
 from pyfamilysafety.account import Account
 from pyfamilysafety.application import Application
 from pyfamilysafety.device import Device
-from pyfamilysafety.enum import OverrideTarget, OverrideType
-from pyfamilysafety.exceptions import AggregatorException, HttpException
+from pyfamilysafety.exceptions import HttpException
 
 from homeassistant.components import persistent_notification
 from homeassistant.config_entries import ConfigEntry
@@ -29,7 +28,13 @@ from homeassistant.util import dt as dt_util
 
 from ._pyfamilysafety_compat import apply_patches, is_stale_roster_error
 from . import site_sync
-from .api_client import FamilySafetyWebAPI
+from .api_client import FamilySafetyWebAPI, FamilySafetyWebAPIError
+from .mobile_overrides import (
+    MOBILE_OVERRIDE_BLOCK,
+    MOBILE_OVERRIDE_CANCEL,
+    mobile_blocked_platforms,
+    mobile_platform_entry,
+)
 from .app_pause import AppPauser
 from .app_usage import EVENT_APP_USAGE, AppUsageGrowthTracker
 from .screen_time import (
@@ -754,25 +759,77 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         account: Account,
         account_id: str,
         platform: str,
-        override: OverrideType,
+        override_type: str,
         until: datetime | None = None,
     ) -> None:
-        """Send a mobile override; judge a Microsoft 500 by the state it leaves."""
-        try:
-            await account.override_device(
-                OverrideTarget.from_pretty(platform), override, until
+        """Lock (BlockUntil) or unlock (Cancel) a platform on the mobile API.
+
+        The target name is read from Microsoft's own list first ("Windows" is
+        also listed as "Desktop"). Microsoft has answered HTTP 500 both to
+        overrides it applied anyway and to a cancel it did not apply, so the
+        outcome is decided by a fresh read of the overrides after the write,
+        never by the write's answer or the last poll.
+        """
+        if self.web_api is None:
+            raise HomeAssistantError(
+                f"Cannot change {platform}: the Family Safety mobile API is not connected yet."
             )
-        except AggregatorException as err:
-            # Seen on 2026-11-05: HTTP 500 "aggregator error", override applied anyway.
-            await self.async_refresh()
-            blocked = (self.account_data(account_id) or {}).get("blocked_platforms", [])
-            if (platform in blocked) != (override == OverrideType.UNTIL):
+        child = str(account_id)
+        lock = override_type == MOBILE_OVERRIDE_BLOCK
+        verb = "lock" if lock else "unlock"
+        try:
+            entry = mobile_platform_entry(
+                await self.web_api.get_mobile_device_overrides(child), platform
+            )
+        except FamilySafetyWebAPIError as err:
+            raise HomeAssistantError(
+                f"Could not read the {platform} overrides, so nothing was sent: {err}"
+            ) from err
+        if entry is None:
+            raise HomeAssistantError(
+                f"Microsoft lists no {platform} device limits for this child, "
+                f"so there is nothing to {verb}."
+            )
+        write_error: FamilySafetyWebAPIError | None = None
+        try:
+            await self.web_api.set_mobile_device_override(
+                child, str(entry.get("appliesTo")), override_type, until or dt_util.utcnow()
+            )
+        except FamilySafetyWebAPIError as err:
+            write_error = err
+        try:
+            blocked = mobile_blocked_platforms(
+                await self.web_api.get_mobile_device_overrides(child)
+            )
+        except FamilySafetyWebAPIError as err:
+            if write_error is not None:
                 raise HomeAssistantError(
-                    f"Microsoft answered an error and {platform} has not changed yet; "
-                    "check its state after the next update before trying again."
-                ) from err
-            _LOGGER.info("Microsoft answered 500 but the %s override was applied", platform)
+                    f"Microsoft answered an error to the {platform} {verb} ({write_error}) "
+                    f"and the overrides could not be read back ({err}); check its "
+                    "state before trying again."
+                ) from write_error
+            _LOGGER.warning(
+                "%s %s accepted, but the overrides could not be read back: %s",
+                platform, verb, err,
+            )
+            await self.async_request_refresh()
             return
+        account.blocked_platforms = blocked
+        if any(p.lower() == platform.lower() for p in blocked) != lock:
+            await self.async_request_refresh()
+            answer = (
+                f"answered an error ({write_error})" if write_error else "accepted it"
+            )
+            state = "still lists a lock" if not lock else "lists no lock"
+            raise HomeAssistantError(
+                f"Could not {verb} {platform}: Microsoft {answer}, but its "
+                f"overrides {state}. Check the Family Safety app before trying again."
+            ) from write_error
+        if write_error is not None:
+            _LOGGER.info(
+                "Microsoft answered an error but the %s %s was applied: %s",
+                platform, verb, write_error,
+            )
         await self.async_request_refresh()
 
     # ------------------------------------------------------------------
@@ -889,15 +946,14 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     return None
                 return parse_xbox_override(await self.xbox_family.async_get_overrides(xuid))
             account = self._accounts.get(self._roster_id(account_id))
-            if self.api is None or account is None:
+            if self.web_api is None or account is None:
                 return None
-            response = await self.api.api.send_request(
-                "get_override_device_restrictions", USER_ID=account.user_id
-            )
+            # Read fresh from the mobile API every time, never from the last poll.
+            response = await self.web_api.get_mobile_device_overrides(str(account.user_id))
         except Exception as err:  # noqa: BLE001 - a failed read is "unknown"
             _LOGGER.debug("Could not read the %s override of %s: %r", platform, account_id, err)
             return None
-        return parse_mobile_override((response or {}).get("json"), platform)
+        return parse_mobile_override(response, platform)
 
     async def _async_read_platform_override_retry(
         self, account_id: Any, platform: str
@@ -922,16 +978,11 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self._async_write_xbox_override(account_id, block, until)
         else:
             account = self._accounts[self._roster_id(account_id)]
-            if block:
-                # pyfamilysafety formats the value with a literal "Z": give it real UTC.
-                await self._override_platform_mobile(
-                    account, account_id, platform, OverrideType.UNTIL,
-                    dt_util.as_utc(until).replace(tzinfo=None),
-                )
-            else:
-                await self._override_platform_mobile(
-                    account, account_id, platform, OverrideType.CANCEL
-                )
+            await self._override_platform_mobile(
+                account, account_id, platform,
+                MOBILE_OVERRIDE_BLOCK if block else MOBILE_OVERRIDE_CANCEL,
+                until if block else None,
+            )
         if block:
             self._platform_override_until[key] = dt_util.as_utc(until)
         else:

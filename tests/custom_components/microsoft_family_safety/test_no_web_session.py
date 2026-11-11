@@ -109,10 +109,24 @@ class _Response:
         return None
 
 
+#: The Windows overrides on the mobile API; a POST replaces them.
+_WINDOWS_OVERRIDES: list[dict] = []
+
+
 def _answer(method: str, url: URL, body: object) -> _Response | None:
     """Microsoft as the mobile client and the Xbox Family Settings client see it."""
     host, path = url.host or "", url.path
     if host == "mobileaggregator.family.microsoft.com":
+        if path.startswith("/api/v4/devicelimits/") and path.endswith("/overrides"):
+            if method == "POST" and isinstance(body, dict):
+                _WINDOWS_OVERRIDES[:] = (
+                    [] if body.get("overrideType") == "Cancel"
+                    else [{"overrideType": body.get("overrideType"),
+                           "validUntil": body.get("validUntil")}]
+                )
+            return _Response(200, {"lockablePlatforms": [
+                {"appliesTo": "Desktop", "overrides": list(_WINDOWS_OVERRIDES), "devices": []},
+            ]})
         if method == "GET" and path.startswith("/api/v4/devicelimits/schedules/"):
             return _Response(200, MOBILE_SCHEDULES)
         if method == "GET" and path.startswith("/api/v1/WebRestrictions/"):
@@ -163,6 +177,7 @@ def transport():
     """
     seen: list[tuple[str, URL]] = []
     refused: list[tuple[str, URL]] = []
+    _WINDOWS_OVERRIDES.clear()
 
     async def aiohttp_request(self, method, url, *args, **kwargs):
         target = URL(str(url))

@@ -286,11 +286,9 @@ async def test_xbox_lock_without_the_xbox_sign_in_fails_and_never_uses_the_mobil
     # The mobile API accepts an Xbox override the console ignores: no fallback.
     coordinator.xbox_family.linked = False
     coordinator.xbox_family.usable = False
-    account = coordinator._accounts[CHILD]
-    account.override_device = AsyncMock()
     with pytest.raises(HomeAssistantError, match="not linked"):
         await coordinator.async_lock_platform(CHILD, "Xbox")
-    account.override_device.assert_not_called()
+    coordinator.web_api.set_mobile_device_override.assert_not_called()
     coordinator.xbox_family.async_create_override.assert_not_called()
 
 

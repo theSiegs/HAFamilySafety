@@ -96,7 +96,7 @@ class FakeXbox:
 
 
 class FakeMobile:
-    """The mobile API's /v1/devicelimits/{id}/overrides for one child."""
+    """The mobile API's /v4/devicelimits/{id}/overrides for one child."""
 
     def __init__(self) -> None:
         self.platforms: dict[str, list[dict]] = {"Windows": [], "Mobile": [], "Xbox": []}
@@ -111,31 +111,30 @@ class FakeMobile:
             ]
         }
 
-    async def send_request(self, endpoint, body=None, headers=None, platform=None, **kwargs):
-        assert endpoint == "get_override_device_restrictions"
-        assert kwargs["USER_ID"] == CHILD
+    async def get_mobile_device_overrides(self, child_id):
+        assert child_id == CHILD
         self.reads += 1
-        return {"status": 200, "json": self.state()}
+        return self.state()
 
-    async def override_device(self, target, override, valid_until=None):
-        """pyfamilysafety Account.override_device."""
-        name = str(target)
-        if str(override) == "Cancel":
-            self.platforms[name] = []
-            self.writes.append((name, "Cancel"))
+    async def set_mobile_device_override(self, child_id, target, override_type, valid_until):
+        assert child_id == CHILD
+        if override_type == "Cancel":
+            self.platforms[target] = []
+            self.writes.append((target, "Cancel"))
         else:
-            until = iso_utc(valid_until.replace(tzinfo=dt_util.UTC))
-            self.platforms[name] = [{"overrideType": "BlockUntil", "validUntil": until}]
-            self.writes.append((name, until))
+            assert override_type == "BlockUntil"
+            until = iso_utc(valid_until)
+            self.platforms[target] = [{"overrideType": "BlockUntil", "validUntil": until}]
+            self.writes.append((target, until))
+        return self.state()
 
 
 def _make(hass, entry, xbox: FakeXbox, mobile: FakeMobile) -> FamilySafetyDataUpdateCoordinator:
     coord = FamilySafetyDataUpdateCoordinator(hass, entry)
     coord.xbox_family = xbox
-    coord.api = SimpleNamespace(api=mobile)
+    coord.web_api = mobile
     coord._accounts[CHILD] = SimpleNamespace(
         user_id=CHILD, first_name="Alex", surname="Rivera", blocked_platforms=[],
-        override_device=mobile.override_device,
     )
     coord.async_request_refresh = AsyncMock()
     coord.data = {"accounts": {CHILD: {"blocked_platforms": []}}, "devices": {}}
@@ -307,7 +306,7 @@ async def test_xbox_without_the_xapprove_link_is_refused_without_the_web(coordin
     """No Xbox Family Settings link: refused, never sent through the web session."""
     xbox.linked = False
     xbox.usable = False
-    web = _web_session(coordinator)
+    web = _web_session(coordinator, coordinator.web_api)
 
     with pytest.raises(HomeAssistantError, match="Xbox Family Settings"):
         await coordinator.async_lock_platform(CHILD, "Xbox", _hours(2))
@@ -320,10 +319,15 @@ async def test_xbox_without_the_xapprove_link_is_refused_without_the_web(coordin
     assert xbox.writes == []
 
 
-def _web_session(coordinator) -> MagicMock:
-    """A live Family web session, to prove the lock paths never use it."""
+def _web_session(coordinator, mobile: FakeMobile) -> MagicMock:
+    """A live Family web session, to prove the lock paths never use it.
+
+    The client keeps its mobile-API overrides calls; any other call is recorded.
+    """
     web = MagicMock(has_web_cookies=True, family_context_state="ready")
     web.set_platform_time_override = AsyncMock(return_value=True)
+    web.get_mobile_device_overrides = mobile.get_mobile_device_overrides
+    web.set_mobile_device_override = mobile.set_mobile_device_override
     coordinator.web_api = web
     coordinator._has_web_credentials = True
     return web
@@ -338,7 +342,7 @@ async def test_no_write_goes_through_the_web_session(hass, platform):
     entry.add_to_hass(hass)
     xbox, mobile = FakeXbox(), FakeMobile()
     coord = _make(hass, entry, xbox, mobile)
-    web = _web_session(coord)
+    web = _web_session(coord, mobile)
     writes = xbox.writes if platform == "Xbox" else mobile.writes
     parent = _hours(1)
     if platform == "Xbox":
@@ -386,15 +390,30 @@ async def test_windows_prior_comes_from_the_mobile_api(coordinator, mobile):
     assert coordinator.platform_hold(CHILD, "Windows") is None
 
 
+async def test_windows_listed_as_desktop(coordinator, mobile):
+    """Microsoft may list Windows as "Desktop": read and written under that name."""
+    parent_until = _hours(1)
+    mobile.platforms = {
+        "Desktop": [{"overrideType": "BlockUntil", "validUntil": iso_utc(parent_until)}],
+        "Xbox": [],
+    }
+    result = await coordinator.async_lock_platform(CHILD, "Windows", _hours(3))
+    assert result["prior"]["type"] == "blockUntil"
+    assert mobile.writes[-1][0] == "Desktop"
+    assert coordinator._accounts[CHILD].blocked_platforms == ["Windows"]
+
+    await coordinator.async_unlock_platform(CHILD, "Windows")
+    assert mobile.writes[-1] == ("Desktop", iso_utc(parent_until))
+
+
 async def test_reads_never_touch_the_web_session(coordinator, mobile):
-    web = MagicMock(has_web_cookies=False)
-    coordinator.web_api = web
+    web = _web_session(coordinator, mobile)
     await coordinator.async_lock_platform(CHILD, "Mobile", _hours(2))
     await coordinator.async_unlock_platform(CHILD, "Mobile")
-    assert mobile.reads == 2
+    # Each: the hold's read, then the write's target read and read-back.
+    assert mobile.reads == 6
     assert [name for name, _ in mobile.writes] == ["Mobile", "Mobile"]
-    web.get_device_overrides.assert_not_called()
-    web.get_xbox_screentime_policy.assert_not_called()
+    assert web.method_calls == []
 
 
 def test_override_parsers():
