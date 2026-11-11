@@ -1,6 +1,7 @@
 """Config flow for Microsoft Family Safety integration."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from ipaddress import ip_address
 from typing import Any
@@ -22,26 +23,23 @@ from homeassistant.helpers.selector import (
     SelectSelectorConfig,
     SelectSelectorMode,
 )
+from homeassistant.util import dt as dt_util
 
-from ._httpx_web_adapter import apply_httpx_web_transport_patch
-from ._httpx_web_tuning import apply_httpx_web_tuning_patch
 from .const import (
     CONF_ALLOWED_USERS,
     CONF_XBOX_FEATURES,
     CONF_XBOX_LINK,
+    CONF_XBOX_REFRESH_TOKEN,
     DEFAULT_XBOX_FEATURES,
+    LEGACY_WEB_AUTH_KEYS,
     AVAILABLE_PLATFORMS,
     CONF_ALLOW_INSECURE_HTTP_AUTH,
-    CONF_API_KEY,
     CONF_AUTH_USER_ID,
-    CONF_AUTH_URL,
     CONF_PLATFORMS,
     CONF_REDIRECT_URL,
     CONF_REFRESH_TOKEN,
+    CONF_SIGNED_IN_AT,
     CONF_UPDATE_INTERVAL,
-    CONF_WEB_COOKIES,
-    CONF_WEB_FAMILY_REFERER,
-    CONF_WEB_FAMILY_TOKEN,
     DEFAULT_PLATFORMS,
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
@@ -138,8 +136,8 @@ async def _allowed_users_selector(
 def _wants_xbox(platforms: Any) -> bool:
     """Ticking Xbox among the monitored platforms turns the Xbox features on.
 
-    Those (Xbox play time, Xbox lock) need the Family web session; without
-    Xbox the entry runs on the mobile token only (see _mobile_only).
+    They are the Xbox entities (Xbox lock, Xbox schedule and limits) and the
+    Xbox Family Settings link (see _mobile_only).
     """
     return any(str(p).lower() == "xbox" for p in (platforms or []))
 
@@ -157,32 +155,18 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return FamilySafetyOptionsFlow(config_entry)
 
     def __init__(self) -> None:
-        self._detected_source: str | None = None
-        self._detected_url: str | None = None
         self._pending_data: dict[str, Any] | None = None
         self._pending_options: dict[str, Any] | None = None
         self._pending_title: str = INTEGRATION_NAME
-        self._native_proxy: Any | None = None
         self._mobile_proxy: Any | None = None
-        self._mobile_sso_cookies: list[dict[str, Any]] = []
-        #: Web session captured before the mobile OAuth phase (web-first flow),
-        #: kept aside while a browser fallback obtains the mobile token.
-        self._web_first_capture: tuple[
-            list[dict[str, Any]], str | None, str | None
-        ] | None = None
-        self._pending_auth_url: str | None = None
-        self._pending_api_key: str | None = None
         #: Existing entry of the same Microsoft account found by a user flow;
         #: the sign-in then updates it instead of aborting (#50).
         self._update_entry: config_entries.ConfigEntry | None = None
-        self._native_mobile_abort_reason: str | None = None
         self._allow_insecure_http_auth: bool = False
-        self._family_wait_task: Any | None = None
-        #: Tracks the web-first completion (mobile-token exchange) so a repeat
-        #: entry into async_step_finish_proxy attaches to the running completion
-        #: instead of aborting the flow. See async_step_finish_proxy.
-        self._finish_task: Any | None = None
-        self._finish_result: FlowResult | None = None
+        #: Token exchange (and Xbox link) of a completed browser sign-in; see
+        #: async_step_finish_mobile_proxy.
+        self._finish_task: asyncio.Task[None] | None = None
+        self._finish_abort: str | None = None
 
     def _is_existing_entry_auth_flow(self) -> bool:
         """Return whether this flow updates an existing config entry."""
@@ -250,18 +234,6 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         raise NativeAuthHttpsRequired
 
-    async def _detect_legacy_auth(self) -> None:
-        """Detect an optional legacy Playwright auth source without blocking setup."""
-        try:
-            from .auth.addon_client import AddonCookieClient
-
-            source_type, detected_url = await AddonCookieClient(self.hass).detect_auth_source()
-        except Exception as err:
-            _LOGGER.debug("Legacy Family Safety auth source detection failed: %s", err)
-            source_type, detected_url = "none", None
-        self._detected_source = source_type
-        self._detected_url = detected_url
-
     def _user_schema(self, user_input: dict[str, Any] | None = None) -> vol.Schema:
         """Build the initial setup schema."""
         values = user_input or {}
@@ -301,42 +273,14 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 ),
                 CONF_ALLOW_INSECURE_HTTP_AUTH: self._allow_insecure_http_auth,
             }
-            # New entries are never created in legacy add-on mode any more:
-            # existing add-on entries keep working and move to the native
-            # sign-in at their next reauthentication (#49).
-            self._pending_auth_url = None
-            self._pending_api_key = None
-            await self._detect_legacy_auth()
             try:
                 return await self.async_step_start_mobile_auth()
             except NativeAuthLocalHttpRequired:
                 errors["base"] = "native_http_not_local"
-                return self.async_show_form(
-                    step_id="user",
-                    data_schema=self._user_schema(user_input),
-                    description_placeholders={
-                        "auth_url": "automatically handled by Home Assistant",
-                        "addon_status": "native Home Assistant browser authentication",
-                    },
-                    errors=errors,
-                )
             except NativeAuthHttpsRequired:
-                # An entry with Xbox needs the account.microsoft.com web
-                # session, which the manual step cannot capture. Without Xbox
-                # the mobile token is all it needs, so the manual redirect
-                # step is enough on an HTTP-only instance.
-                if self._mobile_only():
-                    return await self.async_step_auth()
-                errors["base"] = "native_https_required"
-                return self.async_show_form(
-                    step_id="user",
-                    data_schema=self._user_schema(user_input),
-                    description_placeholders={
-                        "auth_url": "automatically handled by Home Assistant",
-                        "addon_status": "native Home Assistant browser authentication",
-                    },
-                    errors=errors,
-                )
+                # The mobile token is all the integration needs, so the manual
+                # redirect step is enough on an HTTP-only instance.
+                return await self.async_step_auth()
 
         return self.async_show_form(
             step_id="user",
@@ -355,14 +299,9 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> FlowResult:
         """Start the browser-assisted Microsoft sign-in.
 
-        Native entries sign in on account.microsoft.com **first**. That web
-        sign-in is the one that offers "Stay signed in?", which turns the
-        Microsoft SSO cookies into persistent ones; the mobile OAuth page never
-        offers it, and a session captured through it expired after a few hours
-        (observed: about 7 h). The mobile refresh token is then obtained
-        server-side from the same cookies (_try_server_side_mobile_oauth), so
-        the user signs in exactly once. Legacy add-on entries keep the mobile
-        OAuth-only journey: their web session lives in the add-on.
+        The proxy serves the mobile OAuth sign-in of the Family Safety app
+        (client 000000000004893A) and captures its ``oauth20_desktop.srf``
+        redirect, whose code becomes the long-lived mobile refresh token.
         """
         hass_url = URL(self._browser_hass_url())
         try:
@@ -381,75 +320,20 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         callback_url = str(
             hass_url.with_path(AUTH_CALLBACK_PATH).with_query({"flow_id": self.flow_id})
         )
-        if self._uses_legacy_addon() or self._mobile_only():
-            self._mobile_proxy = MicrosoftFamilyAuthProxy(
-                self.hass,
-                callback_url=callback_url,
-                start_url=_build_auth_url(),
-                completion_mode="oauth",
-            )
-            register_native_proxy(self.hass, self._mobile_proxy)
-            proxy_url = str(hass_url.with_path(self._mobile_proxy.access_path))
-            _LOGGER.debug(
-                "Starting native Microsoft Family mobile OAuth proxy "
-                "(legacy add-on entry or Xbox features off)"
-            )
-            return self.async_external_step(step_id="check_mobile_proxy", url=proxy_url)
-
-        resume_cookies = self._interrupt_resume_cookies()
-        self._native_proxy = MicrosoftFamilyAuthProxy(
+        self._mobile_proxy = MicrosoftFamilyAuthProxy(
             self.hass,
             callback_url=callback_url,
-            start_url="https://account.microsoft.com/",
-            completion_mode="web",
-            initial_cookies=resume_cookies,
+            start_url=_build_auth_url(),
         )
-        register_native_proxy(self.hass, self._native_proxy)
-        proxy_url = str(hass_url.with_path(self._native_proxy.access_path))
-        _LOGGER.debug(
-            "Starting native Microsoft Family web sign-in proxy (web-first, "
-            "resuming stored session=%s)",
-            bool(resume_cookies),
-        )
+        register_native_proxy(self.hass, self._mobile_proxy)
+        proxy_url = str(hass_url.with_path(self._mobile_proxy.access_path))
+        _LOGGER.debug("Starting native Microsoft Family mobile OAuth proxy")
         return self.async_external_step(step_id="check_mobile_proxy", url=proxy_url)
 
-    def _interrupt_resume_cookies(self) -> list[dict[str, Any]] | None:
-        """Return the stored session when Microsoft waits for a security check.
-
-        When the integration's own session hits "Help us protect your account"
-        (``account_interrupt == "proof_confirm"``), a fresh sign-in never shows
-        that page: neither the user's browser nor an empty proxy jar carry the
-        session Microsoft is challenging (#52). Starting the reauthentication
-        from the stored cookies lets the user reach that page and confirm it
-        themselves. Any other case keeps the clean, cookie-less sign-in.
-        """
-        if not self._is_existing_entry_auth_flow():
-            return None
-        entry = self._get_existing_entry()
-        coordinator = self.hass.data.get(DOMAIN, {}).get(entry.entry_id)
-        web_api = getattr(coordinator, "web_api", None)
-        if getattr(web_api, "account_interrupt", None) != "proof_confirm":
-            return None
-        try:
-            cookies = web_api.export_web_cookies()
-        except Exception as err:  # noqa: BLE001 - fall back to a clean sign-in
-            _LOGGER.debug("Could not export stored cookies for reauth: %r", err)
-            return None
-        if not cookies:
-            return None
-        _LOGGER.info(
-            "Microsoft asks this account to confirm its security info; starting "
-            "the sign-in from the stored session so the page can be confirmed"
-        )
-        return cookies
-
     def _mobile_only(self) -> bool:
-        """Return whether this flow signs in for the mobile API only.
+        """Return whether this flow is for an entry without the Xbox features.
 
-        True when "Xbox features" is off: everything except the Xbox usage
-        report and the Xbox lock runs on the mobile refresh token, so the
-        account.microsoft.com web sign-in, its Family bootstrap and its
-        cookies are skipped entirely.
+        Such an entry does not link the Xbox Family Settings sign-in.
         """
         if self._is_existing_entry_auth_flow():
             options = self._get_existing_entry().options
@@ -457,70 +341,10 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             options = self._pending_options or {}
         return not options.get(CONF_XBOX_FEATURES, DEFAULT_XBOX_FEATURES)
 
-    def _uses_legacy_addon(self) -> bool:
-        """Return whether this flow serves a Playwright add-on entry.
-
-        Only a new entry whose user explicitly typed an add-on URL stays on the
-        legacy journey.  Reauth and reconfigure always run the native web-first
-        sign-in: an add-on entry used to keep the mobile-only reauth, which never
-        offers "Stay signed in?" and never renews the add-on's own web session,
-        so the entry asked for reauthentication again within minutes (#49).
-        Merely detecting an installed add-on no longer forces legacy mode either.
-        """
-        if self._is_existing_entry_auth_flow():
-            return False
-        return bool(self._pending_auth_url)
-
     async def async_step_check_mobile_proxy(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Complete mobile OAuth and continue directly into web SSO.
-
-        For native authentication the mobile OAuth and account.microsoft.com
-        web-session phases are one browser journey.  Returning the web external
-        step directly lets the native callback redirect the already-open tab to
-        the second phase.  This avoids requiring a second popup / second press of
-        Home Assistant's generic ``Open website`` button.
-
-        Legacy add-on entries keep the older EXTERNAL_STEP_DONE path because
-        they do not require the native account.microsoft.com web session.
-        """
-        # v37 deliberately keeps *both* Microsoft phases on the same HA external
-        # step id.  Home Assistant's frontend GET for an external-step progress
-        # event calls async_configure(), not a passive getter.  If the mobile->web
-        # transition used a second step id, that GET could prematurely execute the
-        # web completion step before Microsoft had finished SSO and abort the flow.
-        # The already-open browser tab is redirected directly by the callback, so
-        # the frontend does not need a second external-step transition at all.
-        web_proxy = self._native_proxy
-        if web_proxy is not None:
-            _LOGGER.debug(
-                "Native auth flow %s handling web phase on shared external step: "
-                "complete=%s family_wait_started=%s pending_data=%s cookies=%d",
-                self.flow_id,
-                web_proxy.complete,
-                bool(getattr(web_proxy, "family_wait_started", False)),
-                self._pending_data is not None,
-                len(web_proxy.export_cookies()),
-            )
-            # Once the visible Microsoft account sign-in has completed, move the
-            # Home Assistant dialog from the generic EXTERNAL step to HA's native
-            # SHOW_PROGRESS step.  The browser tab stays open and continues the
-            # Family silent-SSO bootstrap in parallel.
-            if getattr(web_proxy, "family_wait_started", False):
-                _LOGGER.debug(
-                    "Native auth flow %s Family SSO wait started; returning "
-                    "external_done -> wait_family_proxy",
-                    self.flow_id,
-                )
-                return self.async_external_step_done(next_step_id="wait_family_proxy")
-            return self.async_external_step(
-                step_id="check_mobile_proxy",
-                url=str(
-                    URL(self._browser_hass_url()).with_path(web_proxy.access_path)
-                ),
-            )
-
+        """Wait on the external step until the browser sign-in has completed."""
         proxy = self._mobile_proxy
         _LOGGER.debug(
             "Native auth flow %s handling mobile phase: proxy_present=%s "
@@ -530,58 +354,12 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             bool(proxy and proxy.complete),
             bool(proxy and proxy.oauth_redirect_url),
         )
-        if proxy is None or not proxy.complete or not proxy.oauth_redirect_url:
-            if proxy is not None:
-                return self.async_external_step(
-                    step_id="check_mobile_proxy",
-                    url=str(
-                        URL(self._browser_hass_url()).with_path(proxy.access_path)
-                    ),
-                )
-            return self.async_external_step_done(next_step_id="finish_mobile_proxy")
-
-        # Preserve the legacy add-on flow unchanged.  The native flow below is
-        # deliberately restricted to entries that need a Family web session.
-        if self._uses_legacy_addon() or self._mobile_only():
-            return self.async_external_step_done(next_step_id="finish_mobile_proxy")
-
-        redirect_url = proxy.oauth_redirect_url
-        self._mobile_sso_cookies = proxy.export_cookies()
-        _LOGGER.debug(
-            "Native auth flow %s captured mobile OAuth completion: "
-            "sso_cookie_count=%d",
-            self.flow_id,
-            len(self._mobile_sso_cookies),
-        )
-        try:
-            from .auth.native_proxy import unregister_native_proxy
-
-            await unregister_native_proxy(self.hass, proxy)
-        except Exception as err:
-            _LOGGER.debug("Could not close mobile OAuth proxy cleanly: %s", err)
-        self._mobile_proxy = None
-
-        try:
-            info = await validate_redirect_url(self.hass, redirect_url)
-        except InvalidAuth as err:
-            _LOGGER.warning(
-                "Native auth flow %s mobile OAuth validation failed (%s)",
-                self.flow_id,
-                type(err).__name__,
+        if proxy is not None and not (proxy.complete and proxy.oauth_redirect_url):
+            return self.async_external_step(
+                step_id="check_mobile_proxy",
+                url=str(URL(self._browser_hass_url()).with_path(proxy.access_path)),
             )
-            self._native_mobile_abort_reason = "native_oauth_failed"
-            return self.async_external_step_done(next_step_id="finish_mobile_proxy")
-
-        abort_reason = await self._apply_mobile_oauth_info(info)
-        if abort_reason:
-            self._native_mobile_abort_reason = abort_reason
-            return self.async_external_step_done(next_step_id="finish_mobile_proxy")
-
-        _LOGGER.debug(
-            "Native Microsoft Family mobile OAuth complete; redirecting the "
-            "same browser tab directly into the Family web-session phase"
-        )
-        return await self.async_step_start_web_auth()
+        return self.async_external_step_done(next_step_id="finish_mobile_proxy")
 
     async def _apply_mobile_oauth_info(self, info: dict[str, Any]) -> str | None:
         """Turn a validated mobile OAuth result into pending entry data.
@@ -618,7 +396,10 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._prepare_existing_entry_update(existing, refresh_token, new_user_id)
             return None
 
-        data: dict[str, Any] = {CONF_REFRESH_TOKEN: refresh_token}
+        data: dict[str, Any] = {
+            CONF_REFRESH_TOKEN: refresh_token,
+            CONF_SIGNED_IN_AT: dt_util.utcnow().isoformat(),
+        }
         if new_user_id:
             data[CONF_AUTH_USER_ID] = new_user_id
 
@@ -629,620 +410,136 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def _prepare_existing_entry_update(
         self, entry: config_entries.ConfigEntry, refresh_token: str, user_id: str
     ) -> None:
-        """Build pending data that renews ``entry`` with a native web session.
-
-        The add-on URL and key are cleared: once native cookies are stored the
-        entry runs natively for good, and keeping them would only resurrect
-        the legacy path if the cookies were ever lost (#49).
-        """
-        new_data: dict[str, Any] = {CONF_REFRESH_TOKEN: refresh_token}
+        """Build pending data that renews ``entry`` with the new refresh token."""
+        new_data: dict[str, Any] = {
+            CONF_REFRESH_TOKEN: refresh_token,
+            CONF_SIGNED_IN_AT: dt_util.utcnow().isoformat(),
+        }
         if user_id:
             new_data[CONF_AUTH_USER_ID] = user_id
-        if entry.data.get(CONF_AUTH_URL) is not None:
-            new_data[CONF_AUTH_URL] = None
-        if entry.data.get(CONF_API_KEY) is not None:
-            new_data[CONF_API_KEY] = None
 
         self._pending_data = new_data
         merged_options = dict(entry.options)
         if self._pending_options:
             merged_options.update(self._pending_options)
-        merged_options.pop(CONF_AUTH_URL, None)
-        merged_options.pop(CONF_API_KEY, None)
         self._pending_options = merged_options
         self._allow_insecure_http_auth = bool(
             merged_options.get(CONF_ALLOW_INSECURE_HTTP_AUTH, False)
         )
         self._pending_title = entry.title
 
-    async def _try_server_side_mobile_oauth(
+    async def _async_xbox_token_from_sign_in(
         self, cookies: list[dict[str, Any]]
-    ) -> tuple[str, list[dict[str, Any]]] | None:
-        """Obtain the mobile OAuth redirect from an existing web sign-in.
+    ) -> str | None:
+        """Link the Xbox Family Settings client from the sign-in just completed.
 
-        With the Microsoft SSO cookies of a fresh account.microsoft.com sign-in,
-        ``oauth20_authorize.srf`` answers with a single redirect straight to
-        ``oauth20_desktop.srf?code=...``: no sign-in page, no consent. Returns
-        ``(redirect_url, refreshed_cookies)`` or ``None`` when the browser has
-        to do it after all.
+        With the Microsoft account cookies of that sign-in, its
+        ``oauth20_authorize.srf`` answers with a single redirect carrying the
+        code, without another sign-in page. Only tried for an entry with the
+        Xbox features whose Xbox link is missing or refused; the cookies are
+        used for this one request and never stored. Returns the refresh token,
+        or None when the link has to be made from the integration options.
         """
-        try:
-            from .auth.native_proxy import async_fetch_mobile_oauth_redirect
-        except Exception as err:  # pragma: no cover - defensive import guard
-            _LOGGER.debug("Server-side mobile OAuth unavailable: %s", err)
+        if self._mobile_only() or not cookies:
             return None
+        entry = self._update_entry
+        if entry is None and self._is_existing_entry_auth_flow():
+            entry = self._get_existing_entry()
+        if entry is not None:
+            coordinator = self.hass.data.get(DOMAIN, {}).get(entry.entry_id)
+            xbox_family = getattr(coordinator, "xbox_family", None)
+            if xbox_family is not None and xbox_family.usable:
+                return None
+        from .auth.native_proxy import async_fetch_oauth_redirect
+        from .xbox_family_api import XboxFamilyAPI, build_authorize_url
+
+        url, verifier = build_authorize_url()
         try:
-            return await async_fetch_mobile_oauth_redirect(
-                self.hass, _build_auth_url(), cookies
-            )
-        except Exception as err:  # pragma: no cover - network defensive guard
-            _LOGGER.debug("Server-side mobile OAuth raised: %r", err)
-            return None
-
-    async def _finish_web_first(
-        self,
-        cookies: list[dict[str, Any]],
-        family_token: str | None,
-        family_referer: str | None,
-    ) -> FlowResult:
-        """Complete a web-first sign-in: mobile token server-side, else browser."""
-        server_side = await self._try_server_side_mobile_oauth(cookies)
-        if server_side is None:
-            # The browser holds the same session; let it complete the mobile
-            # OAuth hop with the captured cookies preloaded.
-            self._web_first_capture = (cookies, family_token, family_referer)
-            hass_url = URL(self._browser_hass_url())
-            from .auth.native_proxy import (
-                AUTH_CALLBACK_PATH,
-                MicrosoftFamilyAuthProxy,
-                register_native_proxy,
-            )
-
-            callback_url = str(
-                hass_url.with_path(AUTH_CALLBACK_PATH).with_query(
-                    {"flow_id": self.flow_id}
+            result = await async_fetch_oauth_redirect(self.hass, url, cookies)
+            if result is None:
+                _LOGGER.info(
+                    "Xbox Family Settings could not be linked from the sign-in; link it "
+                    "from the integration options"
                 )
+                return None
+            body = await XboxFamilyAPI(self.hass, "sign_in").async_exchange_redirect(
+                result, verifier
             )
-            self._mobile_proxy = MicrosoftFamilyAuthProxy(
-                self.hass,
-                callback_url=callback_url,
-                start_url=_build_auth_url(),
-                completion_mode="oauth",
-                initial_cookies=cookies,
-            )
-            register_native_proxy(self.hass, self._mobile_proxy)
-            _LOGGER.info(
-                "Mobile OAuth could not be completed server-side; "
-                "asking the browser to finish it"
-            )
-            return self.async_external_step(
-                step_id="check_mobile_proxy",
-                url=str(hass_url.with_path(self._mobile_proxy.access_path)),
-            )
-
-        redirect_url, refreshed_cookies = server_side
-        try:
-            info = await validate_redirect_url(self.hass, redirect_url)
-        except InvalidAuth:
-            return self.async_abort(reason="native_oauth_failed")
-        abort_reason = await self._apply_mobile_oauth_info(info)
-        if abort_reason:
-            return self.async_abort(reason=abort_reason)
-        return self._show_native_success(
-            refreshed_cookies or cookies, family_token, family_referer
-        )
-
-    def _show_native_success(
-        self,
-        cookies: list[dict[str, Any]],
-        family_token: str | None,
-        family_referer: str | None,
-    ) -> FlowResult:
-        """Merge the web session into pending data and show the final form."""
-        assert self._pending_data is not None
-        data = dict(self._pending_data)
-        data[CONF_WEB_COOKIES] = cookies
-        if family_token:
-            data[CONF_WEB_FAMILY_TOKEN] = family_token
-        else:
-            data.pop(CONF_WEB_FAMILY_TOKEN, None)
-        if family_referer:
-            data[CONF_WEB_FAMILY_REFERER] = family_referer
-        else:
-            data.pop(CONF_WEB_FAMILY_REFERER, None)
-        self._pending_data = data
-        _LOGGER.info(
-            "Native Microsoft Family sign-in complete: cookies=%d "
-            "family_token_present=%s",
-            len(cookies),
-            bool(family_token),
-        )
-        if self._is_existing_entry_auth_flow():
-            return self.async_show_form(
-                step_id="reauth_success",
-                data_schema=vol.Schema({}),
-            )
-        return self.async_show_form(
-            step_id="auth_success",
-            data_schema=vol.Schema({}),
-            last_step=True,
-        )
+        except Exception as err:  # noqa: BLE001 - optional, the options can link it
+            _LOGGER.info("Linking Xbox Family Settings from the sign-in failed: %r", err)
+            return None
+        _LOGGER.info("Xbox Family Settings linked from the sign-in")
+        return str(body["refresh_token"])
 
     async def async_step_finish_mobile_proxy(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Exchange captured OAuth code and continue with web-session capture."""
-        if self._native_mobile_abort_reason:
-            reason = self._native_mobile_abort_reason
-            self._native_mobile_abort_reason = None
-            return self.async_abort(reason=reason)
+        """Exchange the captured OAuth code (and link Xbox) as one tracked task.
 
-        proxy = self._mobile_proxy
-        if proxy is None or not proxy.complete or not proxy.oauth_redirect_url:
-            return self.async_abort(reason="native_oauth_failed")
-
-        redirect_url = proxy.oauth_redirect_url
-        self._mobile_sso_cookies = proxy.export_cookies()
-        try:
-            from .auth.native_proxy import unregister_native_proxy
-
-            await unregister_native_proxy(self.hass, proxy)
-        except Exception as err:
-            _LOGGER.debug("Could not close mobile OAuth proxy cleanly: %s", err)
-        self._mobile_proxy = None
-
-        try:
-            info = await validate_redirect_url(self.hass, redirect_url)
-        except InvalidAuth:
-            return self.async_abort(reason="native_oauth_failed")
-
-        refresh_token = info["refresh_token"]
-
-        if self._is_existing_entry_auth_flow():
-            entry = self._get_existing_entry()
-            old_user_id = str(entry.data.get(CONF_AUTH_USER_ID, ""))
-            new_user_id = str(info.get("user_id") or "")
-            if old_user_id and new_user_id and old_user_id != new_user_id:
-                return self.async_abort(reason="wrong_account")
-            self._prepare_existing_entry_update(entry, refresh_token, new_user_id)
-            if self._mobile_only():
-                # No web session: drop any stored browser credentials too.
-                assert self._pending_data is not None
-                self._pending_data[CONF_WEB_COOKIES] = None
-                return await self.async_step_reauth_success(user_input={})
-            # Existing entries always renew the web session natively (#49).
-            return await self.async_step_start_web_auth()
-
-        user_id = str(info.get("user_id") or "")
-        await self.async_set_unique_id(user_id or refresh_token[:20])
-        self._abort_if_unique_id_configured()
-
-        data: dict[str, Any] = {CONF_REFRESH_TOKEN: refresh_token}
-        if user_id:
-            data[CONF_AUTH_USER_ID] = user_id
-        if self._uses_legacy_addon():
-            data[CONF_AUTH_URL] = self._pending_auth_url
-            if self._pending_api_key:
-                data[CONF_API_KEY] = self._pending_api_key
-
-        self._pending_data = data
-        self._pending_title = info["title"]
-
-        # An add-on URL typed by the user keeps the legacy journey; an entry
-        # with Xbox features off needs nothing beyond the mobile token.
-        if self._uses_legacy_addon() or self._mobile_only():
-            return self.async_create_entry(
-                title=self._pending_title,
-                data=data,
-                options=self._pending_options or {},
-            )
-
-        return await self.async_step_start_web_auth()
-
-    async def _try_server_side_family_bootstrap(
-        self, cookies: list[dict[str, Any]]
-    ) -> tuple[str | None, str | None, list[dict[str, Any]]] | None:
-        """Establish the Family web context server-side, without the browser.
-
-        The mobile OAuth phase already yields the Microsoft SSO cookies. The
-        Family request-verification token can then be obtained by loading
-        /family/home directly from Home Assistant (httpx), exactly like the
-        regular polling path does (FamilySafetyWebAPI._warm_family_context).
-
-        Doing this here avoids re-driving the browser through the HA HTTP proxy
-        for the silent Family SSO — which Microsoft implements with OAuth URLs
-        (``epctrc=/w/...``) that Home Assistant's http.security_filter middleware
-        rejects with 400 before the integration ever sees them.
-
-        Returns ``(family_token, family_referer, refreshed_cookies)`` on success,
-        or ``None`` if the token could not be captured server-side (the caller
-        then falls back to the browser proxy).
-        """
-        if not cookies:
-            return None
-        try:
-            from .api_client import FamilySafetyWebAPI
-        except Exception as err:  # pragma: no cover - defensive import guard
-            _LOGGER.debug("Server-side Family bootstrap unavailable: %s", err)
-            return None
-
-        # On a first install no entry is loaded yet, so the transport patches
-        # of async_setup_entry have not run: without them this bootstrap would
-        # go through plain aiohttp with a 15 s timeout and no browser hints.
-        apply_httpx_web_transport_patch(self.hass)
-        apply_httpx_web_tuning_patch()
-        web_api = FamilySafetyWebAPI(None)
-        web_api.set_web_cookies(cookies)
-        try:
-            token = await web_api._warm_family_context()
-            refreshed = web_api.export_web_cookies() or cookies
-            referer = web_api._family_referer if token else None
-        except Exception as err:  # pragma: no cover - network defensive guard
-            _LOGGER.debug("Server-side Family bootstrap raised: %r", err)
-            token = None
-            refreshed = cookies
-            referer = None
-        finally:
-            session = getattr(web_api, "_web_session", None)
-            if session is not None and not session.closed:
-                try:
-                    await session.close()
-                except Exception:  # pragma: no cover
-                    pass
-        if not token:
-            _LOGGER.debug(
-                "Server-side Family bootstrap did not yield a token "
-                "(state=%s); will fall back to browser proxy",
-                getattr(web_api, "family_context_state", None),
-            )
-            return None
-        _LOGGER.info(
-            "Native Microsoft Family web session captured server-side "
-            "(no browser proxy needed): cookies=%d token_length=%d",
-            len(refreshed),
-            len(token),
-        )
-        return token, referer, refreshed
-
-    async def async_step_start_web_auth(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Capture the account.microsoft.com Family web session."""
-        if self._pending_data is None:
-            return self.async_abort(reason="native_auth_state_lost")
-
-        if self._web_first_capture is not None:
-            # Web-first flow whose mobile token needed the browser: the web
-            # session was captured before that hop, nothing left to fetch.
-            cookies, family_token, family_referer = self._web_first_capture
-            self._web_first_capture = None
-            return self._show_native_success(cookies, family_token, family_referer)
-
-        # Preferred path: complete the Family web session entirely server-side
-        # using the SSO cookies from the mobile OAuth phase. This bypasses the
-        # browser silent-SSO redirect that HA's security_filter blocks (400).
-        server_side = await self._try_server_side_family_bootstrap(
-            self._mobile_sso_cookies
-        )
-        if server_side is not None:
-            family_token, family_referer, cookies = server_side
-            data = dict(self._pending_data)
-            data[CONF_WEB_COOKIES] = cookies
-            if family_token:
-                data[CONF_WEB_FAMILY_TOKEN] = family_token
-            else:
-                data.pop(CONF_WEB_FAMILY_TOKEN, None)
-            if family_referer:
-                data[CONF_WEB_FAMILY_REFERER] = family_referer
-            else:
-                data.pop(CONF_WEB_FAMILY_REFERER, None)
-            self._pending_data = data
-            if self._is_existing_entry_auth_flow():
-                return self.async_show_form(
-                    step_id="reauth_success",
-                    data_schema=vol.Schema({}),
-                )
-            return self.async_show_form(
-                step_id="auth_success",
-                data_schema=vol.Schema({}),
-                last_step=True,
-            )
-
-        # Fallback: drive the browser through the proxy (legacy behaviour).
-        hass_url = URL(self._browser_hass_url())
-        try:
-            from .auth.native_proxy import (
-                AUTH_CALLBACK_PATH,
-                MicrosoftFamilyAuthProxy,
-                register_native_proxy,
-            )
-        except Exception as err:
-            _LOGGER.exception("Native Family Safety auth module could not be loaded")
-            return self.async_abort(
-                reason="native_auth_unavailable",
-                description_placeholders={"error": str(err)},
-            )
-
-        callback_url = str(
-            hass_url.with_path(AUTH_CALLBACK_PATH).with_query({"flow_id": self.flow_id})
-        )
-        self._native_proxy = MicrosoftFamilyAuthProxy(
-            self.hass,
-            callback_url=callback_url,
-            start_url="https://account.microsoft.com/",
-            completion_mode="web",
-            initial_cookies=self._mobile_sso_cookies,
-        )
-        register_native_proxy(self.hass, self._native_proxy)
-        proxy_url = str(hass_url.with_path(self._native_proxy.access_path))
-        _LOGGER.debug(
-            "Native auth flow %s starting Family web-session proxy on the same "
-            "external step: initial_cookie_count=%d",
-            self.flow_id,
-            len(self._mobile_sso_cookies),
-        )
-        # Keep the same external step id as the mobile OAuth phase.  The native
-        # callback redirects the already-open browser tab to proxy_url itself.
-        # This intentionally avoids emitting a frontend progress event here: HA's
-        # GET handler advances flows by calling async_configure(), so a frontend
-        # refresh during an unfinished web phase must not be able to consume a
-        # premature completion step.
-        return self.async_external_step(step_id="check_mobile_proxy", url=proxy_url)
-
-    async def async_step_wait_family_proxy(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Show Home Assistant's native progress UI while Family SSO finishes."""
-        proxy = self._native_proxy
-        if proxy is None:
-            _LOGGER.warning(
-                "Native auth flow %s lost web proxy while waiting for Family SSO",
-                self.flow_id,
-            )
-            return self.async_abort(reason="native_auth_state_lost")
-
-        if proxy.complete:
-            _LOGGER.debug(
-                "Native auth flow %s Family SSO completed while HA progress step "
-                "was active; returning progress_done -> finish_proxy",
-                self.flow_id,
-            )
-            return self.async_show_progress_done(next_step_id="finish_proxy")
-
-        if self._family_wait_task is None or self._family_wait_task.done():
-            self._family_wait_task = self.hass.async_create_task(
-                proxy.async_wait_until_complete(),
-                "Microsoft Family Safety Family SSO wait",
-            )
-            _LOGGER.debug(
-                "Native auth flow %s started HA native Family SSO progress task",
-                self.flow_id,
-            )
-
-        return self.async_show_progress(
-            step_id="wait_family_proxy",
-            progress_action="family_sso",
-            progress_task=self._family_wait_task,
-        )
-
-    async def async_step_check_proxy(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Compatibility handler for a web external step from older in-flight flows."""
-        proxy = self._native_proxy
-        _LOGGER.debug(
-            "Native auth flow %s entered compatibility check_proxy step: "
-            "proxy_present=%s complete=%s pending_data=%s",
-            self.flow_id,
-            proxy is not None,
-            bool(proxy and proxy.complete),
-            self._pending_data is not None,
-        )
-        if proxy is None:
-            return self.async_external_step_done(next_step_id="finish_proxy")
-        if not proxy.complete:
-            return self.async_external_step(
-                step_id="check_proxy",
-                url=str(URL(self._browser_hass_url()).with_path(proxy.access_path)),
-            )
-        return self.async_external_step_done(next_step_id="finish_proxy")
-
-    def _attach_to_finish_task(self) -> FlowResult | None:
-        """Attach a repeat finish_proxy entry to the tracked completion.
-
-        Returns None when no completion has been started yet, i.e. this entry
-        should start it.
+        This step is entered several times for one sign-in: by the frontend,
+        by the re-notification helper, and by Home Assistant when the task
+        ends. Home Assistant has no per-flow lock, so a second entry while the
+        exchange is still running must attach to it: starting again would find
+        the proxy gone and abort a sign-in that is about to succeed (the
+        single-use code is already spent by then).
         """
         if self._finish_task is None:
-            return None
-        if not self._finish_task.done():
-            _LOGGER.debug(
-                "Native auth flow %s: repeat finish_proxy entry while the "
-                "web-first completion is still running; attaching to it",
-                self.flow_id,
+            proxy = self._mobile_proxy
+            if proxy is None or not proxy.complete or not proxy.oauth_redirect_url:
+                return self.async_abort(reason="native_oauth_failed")
+            self._mobile_proxy = None
+            self._finish_task = self.hass.async_create_task(
+                self._async_complete_sign_in(
+                    proxy, proxy.oauth_redirect_url, proxy.export_cookies()
+                ),
+                "Microsoft Family Safety sign-in completion",
             )
+        if not self._finish_task.done():
             return self.async_show_progress(
-                step_id="finish_proxy",
-                progress_action="family_sso",
+                step_id="finish_mobile_proxy",
+                progress_action="sign_in",
                 progress_task=self._finish_task,
             )
-        if self._finish_result is None:
-            try:
-                self._finish_result = self._finish_task.result()
-            except Exception:  # noqa: BLE001 - surface as a flow abort
-                _LOGGER.exception(
-                    "Native auth flow %s failed while completing the "
-                    "web-first sign-in",
-                    self.flow_id,
-                )
-                self._finish_result = self.async_abort(reason="native_auth_failed")
-            return self.async_show_progress_done(next_step_id="finish_web_first_done")
-        # Defensive: the flow manager removes the flow once a terminal result
-        # is returned, so this should be unreachable.
-        return self._finish_result
+        return self.async_show_progress_done(next_step_id="finish_sign_in")
 
-    async def async_step_finish_proxy(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        self._family_wait_task = None
-
-        # This step can be entered more than once for a single sign-in: it is
-        # reached both from async_step_wait_family_proxy's progress_done and
-        # from the browser callback, and HA's GET handler advances flows by
-        # calling async_configure(). The first entry clears self._native_proxy
-        # (below) before awaiting the mobile-token exchange, so an unguarded
-        # second entry lands in the "proxy is None" branch and aborts a flow
-        # that is actually succeeding. Attach repeat entries to the tracked
-        # completion instead. (Same class of race the existing-entry path guards
-        # against further down in this method.)
-        if (attached := self._attach_to_finish_task()) is not None:
-            return attached
-
-        proxy = self._native_proxy
-        _LOGGER.debug(
-            "Native auth flow %s entering finish_proxy: proxy_present=%s "
-            "proxy_complete=%s pending_data=%s",
-            self.flow_id,
-            proxy is not None,
-            bool(proxy and proxy.complete),
-            self._pending_data is not None,
-        )
-        if proxy is None or not proxy.complete:
-            _LOGGER.warning(
-                "Native auth flow %s cannot finish web authentication: "
-                "proxy_present=%s proxy_complete=%s pending_data=%s",
-                self.flow_id,
-                proxy is not None,
-                bool(proxy and proxy.complete),
-                self._pending_data is not None,
-            )
-            return self.async_abort(reason="native_auth_failed")
-        cookies = proxy.export_cookies()
-        _LOGGER.debug(
-            "Native auth flow %s exporting completed web session: cookie_count=%d",
-            self.flow_id,
-            len(cookies),
-        )
+    async def _async_complete_sign_in(
+        self, proxy: Any, redirect_url: str, cookies: list[dict[str, Any]]
+    ) -> None:
+        """Turn the captured code into pending entry data; failures become an abort."""
         try:
             from .auth.native_proxy import unregister_native_proxy
 
             await unregister_native_proxy(self.hass, proxy)
-        except Exception as err:
-            _LOGGER.debug("Could not unregister native web auth proxy: %s", err)
-        # A second entry can pass the guard above while the first is suspended
-        # in that await (the proxy is still set and complete until the line
-        # below). Whichever entry resumes first starts the completion; the
-        # other attaches to it here instead of starting a second exchange.
-        if (attached := self._attach_to_finish_task()) is not None:
-            return attached
-        self._native_proxy = None
-        if not cookies:
-            _LOGGER.warning(
-                "Native auth flow %s web proxy completed without exportable Microsoft cookies",
-                self.flow_id,
-            )
-            return self.async_abort(reason="native_auth_failed")
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Could not close mobile OAuth proxy cleanly: %s", err)
+        try:
+            info = await validate_redirect_url(self.hass, redirect_url)
+            self._finish_abort = await self._apply_mobile_oauth_info(info)
+            if self._finish_abort is None and (
+                xbox_token := await self._async_xbox_token_from_sign_in(cookies)
+            ):
+                assert self._pending_data is not None
+                self._pending_data[CONF_XBOX_REFRESH_TOKEN] = xbox_token
+        except InvalidAuth:
+            self._finish_abort = "native_oauth_failed"
+        except Exception:  # noqa: BLE001 - surface as an abort, never a stuck flow
+            _LOGGER.exception("Completing the Microsoft sign-in failed")
+            self._finish_abort = "native_oauth_failed"
 
-        family_token = proxy.family_request_verification_token
-        family_referer = proxy.family_referer
-        _LOGGER.debug(
-            "Native auth flow %s captured Family browser context: "
-            "token_present=%s token_length=%d referer_path=%s",
-            self.flow_id, bool(family_token), len(family_token or ""),
-            URL(family_referer).path if family_referer else None,
-        )
-
-        if self._pending_data is None:
-            # Web-first flow: the mobile refresh token comes next, from the
-            # cookies the browser just established. Run it as a tracked task
-            # rather than awaiting inline: self._native_proxy has just been
-            # cleared, so if the browser callback re-enters this step while the
-            # exchange is in flight it would otherwise abort the flow. The
-            # guard at the top of this method attaches repeat entries here.
-            self._finish_task = self.hass.async_create_task(
-                self._finish_web_first(cookies, family_token, family_referer),
-                "Microsoft Family Safety web-first completion",
-            )
-            return self.async_show_progress(
-                step_id="finish_proxy",
-                progress_action="family_sso",
-                progress_task=self._finish_task,
-            )
-
-        data = dict(self._pending_data)
-        data[CONF_WEB_COOKIES] = cookies
-        if family_token:
-            data[CONF_WEB_FAMILY_TOKEN] = family_token
-        else:
-            data.pop(CONF_WEB_FAMILY_TOKEN, None)
-        if family_referer:
-            data[CONF_WEB_FAMILY_REFERER] = family_referer
-        else:
-            data.pop(CONF_WEB_FAMILY_REFERER, None)
-
-        if self._is_existing_entry_auth_flow():
-            # Do not terminate the reauth directly from the backend-driven
-            # EXTERNAL_STEP_DONE fetch. Home Assistant's frontend can issue a
-            # follow-up fetch for the same flow while the terminal abort is being
-            # processed, which surfaces as "Invalid flow specified" even though
-            # the credentials were already updated. Keep the flow alive on a
-            # final confirmation form; the user's submit request then receives
-            # the terminal abort directly and no stale fetch is possible.
-            self._pending_data = data
-            _LOGGER.debug(
-                "Native Microsoft Family credentials captured for existing entry; "
-                "showing final confirmation step"
-            )
-            return self.async_show_form(
-                step_id="reauth_success",
-                data_schema=vol.Schema({}),
-            )
-
-        # Keep a successful initial setup alive on a final confirmation form.
-        # Besides giving the user an explicit Continue action, this also avoids
-        # removing the flow while a delayed frontend refresh may still be in flight.
-        self._pending_data = data
-        _LOGGER.debug(
-            "Native Microsoft Family credentials captured for new entry; "
-            "showing final confirmation step"
-        )
-        return self.async_show_form(
-            step_id="auth_success",
-            data_schema=vol.Schema({}),
-            last_step=True,
-        )
-
-    async def async_step_finish_web_first_done(
+    async def async_step_finish_sign_in(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Return the result produced by the tracked web-first completion.
+        """Store the result of the completed sign-in."""
+        if self._finish_abort:
+            return self.async_abort(reason=self._finish_abort)
+        return self._async_store_sign_in()
 
-        async_show_progress_done() cannot itself carry a terminal result, so the
-        result computed in async_step_finish_proxy is handed back here. It may be
-        a created entry, an abort, or the external step that asks the browser to
-        finish the mobile OAuth hop when it could not be done server-side.
-        """
-        result = self._finish_result
-        if result is None:
-            _LOGGER.warning(
-                "Native auth flow %s reached finish_web_first_done with no result",
-                self.flow_id,
-            )
-            return self.async_abort(reason="native_auth_failed")
-        return result
-
-    async def async_step_auth_success(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Finish a successful initial native authentication."""
-        if user_input is None:
-            return self.async_show_form(
-                step_id="auth_success",
-                data_schema=vol.Schema({}),
-                last_step=True,
-            )
+    def _async_store_sign_in(self) -> FlowResult:
+        """Create the entry, or update the one this sign-in renews."""
         if self._pending_data is None:
             return self.async_abort(reason="native_auth_state_lost")
+        if self._is_existing_entry_auth_flow():
+            return self._async_finish_reauth()
         if self._update_entry is not None:
             return self._async_finish_existing_account_update()
         return self.async_create_entry(
@@ -1250,6 +547,15 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data=dict(self._pending_data),
             options=self._pending_options or {},
         )
+
+    @staticmethod
+    def _renewed_data(
+        entry: config_entries.ConfigEntry, pending: dict[str, Any]
+    ) -> dict[str, Any]:
+        """The entry's data with the new sign-in, without any earlier web session."""
+        data = {k: v for k, v in entry.data.items() if k not in LEGACY_WEB_AUTH_KEYS}
+        data.update(pending)
+        return data
 
     def _async_finish_existing_account_update(self) -> FlowResult:
         """Store a user-flow sign-in into the account's existing entry (#50).
@@ -1260,9 +566,6 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """
         entry = self._update_entry
         assert entry is not None and self._pending_data is not None
-        updates = dict(self._pending_data)
-        updates.setdefault(CONF_WEB_FAMILY_TOKEN, None)
-        updates.setdefault(CONF_WEB_FAMILY_REFERER, None)
         for flow in self._async_in_progress(include_uninitialized=True):
             if flow["flow_id"] != self.flow_id and flow["context"].get(
                 "unique_id"
@@ -1276,61 +579,28 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # need one too, and core no longer lets the helper do it for us (2026.12).
         result = self.async_update_and_abort(
             entry,
-            data_updates=updates,
+            data=self._renewed_data(entry, self._pending_data),
             options=self._pending_options or entry.options,
             reason="reauth_successful",
         )
         self.hass.config_entries.async_schedule_reload(entry.entry_id)
         return result
 
-    async def async_step_reauth_success(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Finalize a successful reauthentication from a frontend POST."""
-        if user_input is None:
-            return self.async_show_form(
-                step_id="reauth_success",
-                data_schema=vol.Schema({}),
-            )
-
+    def _async_finish_reauth(self) -> FlowResult:
+        """Store the renewed credentials of a reauthentication or reconfigure."""
         if self._pending_data is None:
             return self.async_abort(reason="native_auth_state_lost")
 
         entry = self._get_existing_entry()
-        # Home Assistant's data_updates are merged into the existing entry data.
-        # A reconfigure that fails to capture a new Family antiforgery token must
-        # therefore explicitly overwrite the previous token/referer with None;
-        # omitting the keys would silently resurrect stale browser context.
-        updates = dict(self._pending_data)
-        updates.setdefault(CONF_WEB_FAMILY_TOKEN, None)
-        updates.setdefault(CONF_WEB_FAMILY_REFERER, None)
-        _LOGGER.debug(
-            "Finalizing existing-entry Microsoft Family credentials: "
-            "family_token_present=%s family_referer_present=%s",
-            bool(updates.get(CONF_WEB_FAMILY_TOKEN)),
-            bool(updates.get(CONF_WEB_FAMILY_REFERER)),
-        )
-        if self.source == SOURCE_RECONFIGURE:
-            _LOGGER.info(
-                "Microsoft Family Safety reconfiguration completed; "
-                "updating and reloading config entry"
-            )
-            result = self.async_update_and_abort(
-                entry,
-                data_updates=updates,
-                options=self._pending_options or entry.options,
-            )
-            self.hass.config_entries.async_schedule_reload(entry.entry_id)
-            return result
-
         _LOGGER.info(
-            "Microsoft Family Safety reauthentication completed; updating and reloading config entry"
+            "Microsoft Family Safety %s completed; updating and reloading config entry",
+            "reconfiguration" if self.source == SOURCE_RECONFIGURE else "reauthentication",
         )
-        # Same reload as above: a coordinator loaded without web credentials (Xbox
-        # just ticked) would otherwise never see them and ask to sign in again.
+        # The update listener only reloads on an options change; new credentials
+        # need one too, and core no longer lets the helper do it for us.
         result = self.async_update_and_abort(
             entry,
-            data_updates=updates,
+            data=self._renewed_data(entry, self._pending_data),
             options=self._pending_options or entry.options,
         )
         self.hass.config_entries.async_schedule_reload(entry.entry_id)
@@ -1339,7 +609,12 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_auth(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Manual OAuth fallback for HTTP-only Home Assistant installations."""
+        """Manual OAuth fallback for HTTP-only Home Assistant installations.
+
+        Serves new entries, reauthentication and reconfigure alike, with the
+        same account checks as the browser sign-in. There are no sign-in
+        cookies here, so the Xbox Family Settings link is left to the options.
+        """
         errors: dict[str, str] = {}
         if user_input is not None:
             redirect_url = user_input.get(CONF_REDIRECT_URL, "").strip()
@@ -1348,18 +623,15 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             else:
                 try:
                     info = await validate_redirect_url(self.hass, redirect_url)
-                    refresh_token = info["refresh_token"]
-                    await self.async_set_unique_id(refresh_token[:20])
-                    self._abort_if_unique_id_configured()
-                    data: dict[str, Any] = {CONF_REFRESH_TOKEN: refresh_token}
-                    return self.async_create_entry(
-                        title=info["title"], data=data, options=self._pending_options or {}
-                    )
                 except InvalidAuth:
                     errors["base"] = ERROR_AUTH_FAILED
                 except Exception:
                     _LOGGER.exception("Unexpected exception during manual authentication")
                     errors["base"] = "unknown"
+                else:
+                    if reason := await self._apply_mobile_oauth_info(info):
+                        return self.async_abort(reason=reason)
+                    return self._async_store_sign_in()
 
         return self.async_show_form(
             step_id="auth",
@@ -1405,7 +677,7 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_reauth_full_confirm(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Confirm and start full mobile + web reauthentication."""
+        """Confirm and start the Microsoft sign-in again."""
         entry = self._get_existing_entry()
         current_allow_http = bool(
             entry.options.get(CONF_ALLOW_INSECURE_HTTP_AUTH, False)
@@ -1446,7 +718,8 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         except NativeAuthLocalHttpRequired:
             return self.async_abort(reason="native_http_not_local")
         except NativeAuthHttpsRequired:
-            return self.async_abort(reason="native_https_required")
+            # The mobile token is all the entry needs: the manual step works.
+            return await self.async_step_auth()
 
 
 class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
@@ -1466,11 +739,6 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
             data = dict(user_input)
             link_xbox = bool(data.pop(CONF_XBOX_LINK, False))
             data[CONF_XBOX_FEATURES] = _wants_xbox(data.get(CONF_PLATFORMS))
-            # The add-on fields are gone from the form; keep a legacy entry's
-            # values so saving the options does not cut it off its add-on.
-            for key in (CONF_AUTH_URL, CONF_API_KEY):
-                if self._config_entry.options.get(key):
-                    data[key] = self._config_entry.options[key]
             if link_xbox and data[CONF_XBOX_FEATURES]:
                 self._pending_options = data
                 return await self.async_step_xbox_link()
@@ -1484,8 +752,8 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
         current_allow_insecure_http_auth = self._config_entry.options.get(
             CONF_ALLOW_INSECURE_HTTP_AUTH, False
         )
-        # Entries created before the option keep the Xbox features (and the
-        # web session) until the user unticks Xbox here.
+        # Entries created before the option keep the Xbox features until the
+        # user unticks Xbox here.
         if self._config_entry.options.get(
             CONF_XBOX_FEATURES, DEFAULT_XBOX_FEATURES
         ) and not _wants_xbox(current_platforms):

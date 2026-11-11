@@ -3,60 +3,43 @@
     "step": {
       "user": {
         "title": "Microsoft Family Safety",
-        "description": "Configure the integration. After Submit, Home Assistant opens the Microsoft sign-in through a temporary authentication proxy. Sign in with the parent account and answer **Yes** to \"Stay signed in?\": that is what keeps the Family session valid for about a year instead of a few hours. If Home Assistant is not reachable over HTTPS, local HTTP can be explicitly enabled for testing; Microsoft credentials are then not transport-encrypted on the local network.",
+        "description": "Configure the integration. After Submit, Home Assistant opens the Microsoft sign-in through a temporary authentication proxy: sign in with the parent account. If Home Assistant is not reachable over HTTPS, local HTTP can be explicitly enabled for testing; Microsoft credentials are then not transport-encrypted on the local network. Without either, the next step lets you paste Microsoft's redirect address by hand.",
         "data": {
           "update_interval": "Update interval (seconds)",
           "platforms": "Monitored platforms",
           "allow_insecure_http_auth": "Allow insecure local HTTP authentication (testing only)"
         },
         "data_description": {
-          "platforms": "Windows, Xbox, Mobile: one lock switch per ticked platform. Ticking Xbox also turns on Xbox play time and the Xbox lock, which need the Microsoft web session (some accounts must renew it with a sign-in every 24 hours). Leave Xbox unticked if the children have no Xbox: the integration then runs on the mobile token only, with a shorter sign-in."
+          "platforms": "Windows, Xbox, Mobile: one lock switch per ticked platform. Ticking Xbox also adds the Xbox lock and the Xbox limits, which go through the Xbox Family Settings sign-in (linked during the Microsoft sign-in when possible, otherwise from the options). Leave Xbox unticked if the children have no Xbox."
         }
       },
       "auth": {
         "title": "Manual Microsoft Family Safety authentication",
-        "description": "Home Assistant could not use the secure browser-assisted login because no HTTPS Home Assistant URL is configured. Open this Microsoft URL, sign in, and paste the complete resulting redirect URL here:\n\n{auth_url}",
+        "description": "Home Assistant cannot use the browser-assisted sign-in because no HTTPS Home Assistant URL is configured. Open this Microsoft URL, sign in, and paste the complete resulting redirect URL here:\n\n{auth_url}",
         "data": {
           "redirect_url": "Redirect URL"
         }
       },
       "reauth_confirm": {
         "title": "Reauthenticate Microsoft Family Safety",
-        "description": "The stored Microsoft sign-in is incomplete, expired, or revoked. Continue to run the complete sign-in again and renew both the mobile refresh token and the Family web session."
+        "description": "The stored Microsoft sign-in is incomplete, expired, or revoked. Continue to sign in again and renew the integration's refresh token."
       },
       "reauth_full_confirm": {
         "title": "Reauthenticate Microsoft Family Safety",
-        "description": "The stored Microsoft authentication is incomplete, expired, or revoked. Continue to sign in again; answer **Yes** to \"Stay signed in?\" so the renewed session lasts. If this Home Assistant instance is only reachable over a private local HTTP URL, enable the local HTTP test option below.",
+        "description": "The stored Microsoft sign-in is incomplete, expired, or revoked. Continue to sign in again with the same parent account. If this Home Assistant instance is only reachable over a private local HTTP URL, enable the local HTTP test option below.",
         "data": {
           "allow_insecure_http_auth": "Allow insecure local HTTP authentication (testing only)"
         }
       },
-      "reauth_success": {
-        "title": "Microsoft Family Safety sign-in completed",
-        "description": "Microsoft authentication completed successfully and the new credentials are ready to be saved. Select Submit to finish the reauthentication."
-      },
       "check_mobile_proxy": {
         "title": "Microsoft sign-in",
-        "description": "Sign in with the Microsoft account that manages the family, and answer **Yes** when Microsoft asks \"Stay signed in?\". Keep the opened authentication window open: after the visible sign-in completes, Home Assistant switches to a waiting screen while the Family session and the mobile token are established."
-      },
-      "check_proxy": {
-        "title": "Microsoft Family web session",
-        "description": "**Sign in in the window that just opened**, with the Microsoft account that manages the family, and answer **Yes** to \"Stay signed in?\".\n\nThen come back here and **wait**: this dialog continues on its own, which can take up to about a minute after the sign-in. Do not press *Open website* again unless the Microsoft window never opened or was closed before you signed in."
-      },
-      "auth_success": {
-        "title": "Microsoft Family Safety sign-in completed",
-        "description": "Microsoft sign-in completed: the Family web session and the mobile refresh token are both ready. Select Continue to create the integration.",
-        "submit": "Continue"
-      },
-      "wait_family_proxy": {
-        "title": "Completing Microsoft Family Safety sign-in"
+        "description": "Sign in with the Microsoft account that manages the family in the window that opened. Keep it open until the Microsoft sign-in is complete: Home Assistant then continues on its own."
       }
     },
     "error": {
       "auth_failed": "Authentication failed.",
       "token_expired": "Authentication expired.",
       "no_redirect_url": "Please enter a valid redirect URL.",
-      "native_https_required": "Automatic browser authentication normally requires HTTPS. For local testing you can explicitly enable insecure local HTTP authentication.",
       "unknown": "Unexpected authentication error.",
       "native_http_not_local": "Insecure HTTP authentication is allowed only through localhost, .local, or a private/local IP address."
     },
@@ -64,21 +47,21 @@
       "already_configured": "This account is already configured.",
       "reauth_successful": "Reauthentication successful!",
       "reconfigure_successful": "Reconfiguration successful!",
-      "native_auth_failed": "The Microsoft web authentication did not complete successfully.",
       "native_auth_state_lost": "The browser authentication flow expired. Please start again.",
-      "native_auth_unavailable": "Native web authentication could not be loaded: {error}",
+      "native_auth_unavailable": "The browser sign-in could not be loaded: {error}",
       "native_oauth_failed": "The Microsoft Family Safety OAuth login did not complete successfully.",
-      "wrong_account": "A different Microsoft account was used. Please reauthenticate the same Family Safety account."
+      "wrong_account": "A different Microsoft account was used. Please reauthenticate the same Family Safety account.",
+      "native_http_not_local": "Insecure HTTP authentication is allowed only through localhost, .local, or a private/local IP address."
     },
     "progress": {
-      "family_sso": "Microsoft sign-in is complete. Home Assistant is finishing the Family session in the open authentication window and fetching the mobile token. This can take up to about 60 seconds. Keep the Microsoft window open; no action is required."
+      "sign_in": "The Microsoft sign-in is complete. Home Assistant is fetching the integration's tokens; this takes a few seconds."
     }
   },
   "options": {
     "step": {
       "init": {
         "title": "Microsoft Family Safety Options",
-        "description": "Configure polling, platforms, and optional legacy add-on fallback.",
+        "description": "Configure polling, platforms, who may control the integration and the Xbox Family Settings link.",
         "data": {
           "update_interval": "Update interval (seconds)",
           "platforms": "Monitored platforms",
@@ -87,9 +70,9 @@
           "xbox_link": "Link the Xbox Family Settings sign-in"
         },
         "data_description": {
-          "platforms": "Windows, Xbox, Mobile: one lock switch per ticked platform. Ticking Xbox also turns on Xbox play time and the Xbox lock, which need the Microsoft web session (some accounts must renew it with a sign-in every 24 hours). Leave Xbox unticked if the children have no Xbox: the integration then runs on the mobile token only, with a shorter sign-in.",
+          "platforms": "Windows, Xbox, Mobile: one lock switch per ticked platform. Ticking Xbox also adds the Xbox lock and the Xbox limits, which go through the Xbox Family Settings sign-in (linked during the Microsoft sign-in when possible, otherwise from the options). Leave Xbox unticked if the children have no Xbox.",
           "allowed_users": "Leave empty to let every user use the buttons and settings (default). As soon as users are ticked, only they and the administrators can: a child's non-administrator account is refused on every button, switch, limit and time window, and on the microsoft_family_safety actions. Automations and scripts run by Home Assistant are not affected. Give the child a non-administrator account: an administrator can change this option.",
-          "xbox_link": "Xbox limits, the Xbox lock and Xbox play time then come from the Xbox Family Settings app's service, on their own sign-in, without the web session. Only with Xbox ticked. Usually linked automatically after a sign-in; tick this if the Connection sensor shows xbox_family: not_linked."
+          "xbox_link": "Xbox limits, the Xbox lock and Xbox play time then come from the Xbox Family Settings app's service, on their own sign-in. Only with Xbox ticked. Usually linked automatically during the Microsoft sign-in; tick this if the Connection sensor shows xbox_family: not_linked."
         }
       },
       "xbox_link": {
@@ -102,6 +85,16 @@
     },
     "error": {
       "xbox_link_failed": "Microsoft did not accept that address. Sign in again with the new link and paste the address straight away."
+    }
+  },
+  "issues": {
+    "xbox_not_linked": {
+      "title": "Link the Xbox Family Settings sign-in",
+      "description": "{entry_title} has Xbox among its monitored platforms, but the Xbox Family Settings sign-in is not linked: the Xbox lock does not work and Xbox play time is not read.\n\nOpen **Settings > Devices & services > Microsoft Family Safety > Configure**, tick **Link the Xbox Family Settings sign-in** and follow the steps. This issue disappears once the link works."
+    },
+    "xbox_link_refused": {
+      "title": "Link the Xbox Family Settings sign-in again",
+      "description": "Microsoft no longer accepts the Xbox Family Settings sign-in of {entry_title}: the Xbox lock does not work and Xbox play time is not read. Everything else keeps working.\n\nOpen **Settings > Devices & services > Microsoft Family Safety > Configure**, tick **Link the Xbox Family Settings sign-in** and follow the steps. This issue disappears once the link works."
     }
   },
   "services": {

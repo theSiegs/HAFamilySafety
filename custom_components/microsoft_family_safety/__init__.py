@@ -43,8 +43,6 @@ from .const import (
 )
 from .coordinator import FamilySafetyDataUpdateCoordinator
 from .permissions import guard_service
-from ._httpx_web_adapter import apply_httpx_web_transport_patch
-from ._httpx_web_tuning import apply_httpx_web_tuning_patch
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -81,7 +79,7 @@ SERVICE_DENY_REQUEST_SCHEMA = vol.Schema({
     vol.Required("request_id"): cv.string,
 })
 
-# New service schemas (web API)
+# Service schemas for the settings beyond pyfamilysafety
 
 SERVICE_SET_SCREENTIME_LIMIT_SCHEMA = vol.Schema({
     vol.Required("account_id"): cv.string,
@@ -176,11 +174,10 @@ def _get_coordinator(
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Microsoft Family Safety from a config entry."""
-    apply_httpx_web_transport_patch(hass)
-    apply_httpx_web_tuning_patch()
     coordinator = FamilySafetyDataUpdateCoordinator(hass, entry)
 
-    # Load persisted screentime policies (for lock/unlock survival across restarts)
+    # Load persisted screentime policies (for lock/unlock survival across
+    # restarts) and the rotated refresh token.
     await coordinator.async_load_saved_screentime()
 
     try:
@@ -321,9 +318,12 @@ def _register_services(hass: HomeAssistant) -> None:
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Delete the Xbox Family Settings refresh token kept for this entry."""
+    from homeassistant.helpers import issue_registry as ir
+
     from .xbox_family_api import XboxFamilyAPI
 
     await XboxFamilyAPI(hass, entry.entry_id).async_unlink()
+    ir.async_delete_issue(hass, DOMAIN, f"xbox_link_{entry.entry_id}")
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
