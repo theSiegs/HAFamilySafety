@@ -42,7 +42,7 @@ async def test_probe_sends_only_gets_and_reports_each_answer():
         if path == f"/v4/activityReport/appUsage/{CHILD}":
             return {"status": 200, "body": {"appActivity": [
                 {"appId": "x:other", "policy": "Unlimited", "blockState": "NotBlocked"},
-                {"appId": APP, "policy": "Limited", "blockState": "NotBlocked",
+                {"appId": APP, "policy": _policy(), "blockState": "NotBlocked",
                  "isLegacyBlocked": False, "usage": 3},
             ]}}
         if path == f"/v3/AppLimits/policies/{CHILD}" and params is None:
@@ -62,12 +62,13 @@ async def test_probe_sends_only_gets_and_reports_each_answer():
 
     assert by_name["v3_policy"]["status"] == 404
     assert by_name["v3_policy"]["pause_can_use"] is False
-    assert by_name["v2_policy"]["pause_can_use"] is True
+    # A bare policy is not what pause_app reads: the activity report entry is.
+    assert by_name["v2_policy"]["pause_can_use"] is False
     assert by_name["v3_policies_list"]["app_entry"]["appId"] == APP
-    assert by_name["v3_policies_list"]["pause_can_use"] is True
+    assert by_name["v3_policies_list"]["pause_can_use"] is False
     usage = by_name["v4_app_usage_today"]
-    assert usage["app_entry"]["policy"] == "Limited"
-    assert usage["pause_can_use"] is False
+    assert usage["app_entry"]["policy"] == _policy()
+    assert usage["pause_can_use"] is True
     assert usage["params"]["beginTime"].endswith("Z")
     assert by_name["v1_policies_list"]["error"] == "ClientError: boom"
     clipped = by_name["v4_policy"]["body"]
@@ -77,7 +78,11 @@ async def test_probe_sends_only_gets_and_reports_each_answer():
     assert encoded["path"] == f"/v3/AppLimits/policies/{CHILD}/appx%3Awindowsplt%3Aexample_1234abcd"
     assert any(c.kwargs.get("encoded") for c in calls)
     assert by_name["v3_policy_no_plat_info"]["headers"] is None
-    assert result["usable"] == ["v3_policies_list", "v2_policy"]
+    assert result["usable"] == [
+        r["name"] for r in result["requests"]
+        if r["path"] == f"/v4/activityReport/appUsage/{CHILD}"
+    ]
+    assert "v4_app_usage_today" in result["usable"]
     assert result["platform"] == "windows"
 
 

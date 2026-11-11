@@ -21,7 +21,7 @@ from urllib.parse import quote
 
 from homeassistant.util import dt as dt_util
 
-from .app_pause import app_platform, policy_state
+from .app_pause import app_platform, read_entry, saved_policy
 
 if TYPE_CHECKING:
     from .api_client import FamilySafetyWebAPI
@@ -113,6 +113,20 @@ def candidates(child: str, app_id: str, platform: str) -> list[dict[str, Any]]:
     ]
 
 
+def _pause_can_use(entry: Any) -> bool:
+    """pause_app would accept this as an app's activity report entry."""
+    if not isinstance(entry, dict) or "policy" not in entry:
+        return False
+    now = read_entry(entry)
+    if now is None:
+        return False
+    try:
+        saved_policy(now["policy"])
+    except ValueError:
+        return False
+    return True
+
+
 async def async_probe_app_policy(
     web_api: FamilySafetyWebAPI, child: str, app_id: str
 ) -> dict[str, Any]:
@@ -120,7 +134,7 @@ async def async_probe_app_policy(
 
     For each answer, ``app_entry`` is the part naming this app (the whole body
     when it is the app's policy itself) and ``pause_can_use`` says whether
-    pause_app's parser accepts it as a restorable policy.
+    pause_app accepts it as the app's activity report entry.
     """
     platform = app_platform(app_id) or "windows"
     results: list[dict[str, Any]] = []
@@ -143,7 +157,7 @@ async def async_probe_app_policy(
             **({"error": answer["error"]} if "error" in answer else {}),
             "body": _clip(body),
             "app_entry": _clip(entry),
-            "pause_can_use": policy_state(entry) is not None,
+            "pause_can_use": _pause_can_use(entry),
         })
     return {
         "account_id": str(child),
