@@ -86,16 +86,31 @@
           "allowed_users": "Users allowed to control Microsoft Family Safety",
           "strict_mode": "Strict mode: put back a platform lock cancelled elsewhere",
           "xbox_lock_mobile_fallback": "Xbox lock without the web session: use today's Xbox schedule",
-          "app_usage_sensors": "App usage sensors per child"
+          "app_usage_sensors": "App usage sensors per child",
+          "xbox_link": "Link the Xbox Family Settings sign-in"
         },
         "data_description": {
           "platforms": "Windows, Xbox, Mobile: one lock switch per ticked platform. Ticking Xbox also turns on Xbox play time and the Xbox lock, which need the Microsoft web session (some accounts must renew it with a sign-in every 24 hours). Xbox daily limits work either way. Leave Xbox unticked if you do not need the Xbox lock or Xbox play time: the integration then runs on the mobile token only, with a shorter sign-in.",
           "allowed_users": "Leave empty to let every user use the buttons and settings (default). As soon as users are ticked, only they and the administrators can: a child's non-administrator account is refused on every button, switch, limit and time window, and on the microsoft_family_safety actions. Automations and scripts run by Home Assistant are not affected. Give the child a non-administrator account: an administrator can change this option.",
           "strict_mode": "Off by default. When on, a Windows or Xbox lock placed by microsoft_family_safety.lock_platform that Microsoft reports as cancelled (for example from the Family Safety app) while it should still hold is placed again on the next update, at most every 10 minutes, and the event microsoft_family_safety_lock_reasserted is fired. unlock_platform ends it. Keep strict mode off when another integration (Hearth, for example) manages these locks: strict mode would place a lock again after a parent released it in the Family Safety app, fighting the parent's decision.",
           "xbox_lock_mobile_fallback": "Off by default: turn it on once you have checked that your console stops when today's Xbox daily limit is set to no time in the middle of the day. The Xbox lock is normally sent through the Microsoft web session, which some accounts must renew with a sign-in every 24 hours. While that session is down, an Xbox lock sets today's Xbox daily limit to no time (through the mobile token) and puts the saved day back at unlock, at the end of the lock, and at midnight in any case: such a lock never lasts past midnight. A change a parent makes to that day in the Family Safety app meanwhile is kept. Needs a separate Xbox schedule. The lock switch shows lock_path: web or mobile_schedule.",
-          "app_usage_sensors": "0 (default) = off. Otherwise each child's most used apps today, up to this number, get a sensor with their minutes used today, and the event microsoft_family_safety_app_usage fires when an app's usage grows between two updates. An app keeps its sensor once it has one."
+          "app_usage_sensors": "0 (default) = off. Otherwise each child's most used apps today, up to this number, get a sensor with their minutes used today, and the event microsoft_family_safety_app_usage fires when an app's usage grows between two updates. An app keeps its sensor once it has one.",
+          "xbox_link": "Xbox limits, the Xbox lock and Xbox play time then come from the Xbox Family Settings app's service, on their own sign-in, without the web session. Only with Xbox ticked. Usually linked automatically after a sign-in; tick this if the Connection sensor shows xbox_family: not_linked."
+        }
+      },
+      "xbox_link_manual": {
+        "title": "Link Xbox Family Settings",
+        "description": "1. Open [this Microsoft sign-in]({url}) and sign in with the parent account you use in the Xbox Family Settings app.\n2. You end up on a blank page whose address starts with `{redirect_prefix}`. Copy that whole address and paste it below within a few minutes.",
+        "data": {
+          "redirect_url": "Address of the blank page"
         }
       }
+    },
+    "error": {
+      "xbox_link_failed": "Microsoft did not accept that address. Sign in again with the new link and paste the address straight away."
+    },
+    "progress": {
+      "xbox_link": "Open [this Microsoft sign-in]({url}) and sign in with the account you use in the Xbox Family Settings app. When the browser shows “Authentication completed” you can close it; this step finishes on its own — nothing to copy."
     }
   },
   "services": {

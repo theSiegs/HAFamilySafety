@@ -39,6 +39,17 @@ from .xbox_token_probe import async_probe_xbox_token
 from .app_usage import EVENT_APP_USAGE, AppUsageGrowthTracker
 from . import site_sync
 from .auth.addon_client import AddonCookieClient
+from .xbox_family_api import (
+    OVERRIDE_BLOCK,
+    OVERRIDE_REVOKE,
+    XboxFamilyAPI,
+    XboxFamilyAuthError,
+    XboxFamilyError,
+    build_authorize_url,
+    overrides_to_policy,
+    schedule_to_policy,
+    usage_today,
+)
 from .screen_time import (
     ALLOW_UNTIL,
     BLOCK_UNTIL,
@@ -242,6 +253,16 @@ class FamilySafetyDataUpdateCoordinator(
         #: was read, or a web lock/unlock from here succeeded. Until then the
         #: Xbox lock switch reports unknown rather than "unlocked".
         self._xbox_lock_known: set[str] = set()
+        #: Xbox settings through the Xbox Family Settings app's API
+        #: (xapprove), on its own refresh token instead of the web session.
+        self.xbox_family = XboxFamilyAPI(hass, entry.entry_id)
+        self._xbox_xuids: dict[str, str] = {}
+        #: Roster accounts with no Xbox child of the same name (no Xbox, or
+        #: names that differ between the Xbox profile and the Microsoft account).
+        self._xbox_unmatched: set[str] = set()
+        #: monotonic time before which no silent Xbox link is attempted again.
+        self._xbox_link_retry_at = 0.0
+        self._xbox_auth_warned = False
         #: "account|platform" -> the lock this integration holds there and
         #: the override in force before it (see async_lock_platform).
         self._hold_store: Store = Store(
@@ -454,6 +475,7 @@ class FamilySafetyDataUpdateCoordinator(
     async def _async_setup_api(self) -> None:
         refresh_token = self._runtime_refresh_token()
         apply_patches(self.hass)
+        await self.xbox_family.async_load()
         try:
             self.api = await FamilySafety.create(
                 token=refresh_token,
@@ -951,6 +973,31 @@ class FamilySafetyDataUpdateCoordinator(
         if account is None:
             raise ValueError(f"Account {account_id} not found")
         self._check_platform_lockable(platform)
+        xbox_until = dt_util.as_utc(valid_until or (dt_util.now() + timedelta(hours=24)))
+        if platform.lower() == "xbox" and (xuid := await self._xapprove_xuid_for(account_id)):
+            # The Xbox Family Settings sign-in (xapprove) is the path the console
+            # actually enforces; try it first and fall back to the web lock below.
+            try:
+                result = await self.xbox_family.async_create_override(
+                    xuid, OVERRIDE_BLOCK, xbox_until
+                )
+            except XboxFamilyError as err:
+                _LOGGER.warning("xapprove Xbox lock failed, trying the web path: %s", err)
+            else:
+                if any(
+                    o.get("overrideType") == OVERRIDE_BLOCK
+                    for o in result.get("overrides") or []
+                ):
+                    self._platform_override_until[(str(account_id), "xbox")] = xbox_until
+                    self._xbox_lock_known.add(str(account_id))
+                    await self.async_request_refresh()
+                    return {
+                        "prior": make_override(UNKNOWN),
+                        "applied": make_override(BLOCK_UNTIL, xbox_until),
+                    }
+                _LOGGER.warning(
+                    "xapprove accepted the Xbox lock but reports no block; trying the web path"
+                )
         requested = dt_util.as_utc(valid_until or (dt_util.now() + timedelta(hours=24)))
         key = self._hold_key(account_id, platform)
         fallback = platform.lower() == "xbox" and self._xbox_mobile_fallback
@@ -1304,6 +1351,27 @@ class FamilySafetyDataUpdateCoordinator(
         if account is None:
             raise ValueError(f"Account {account_id} not found")
         self._check_platform_lockable(platform)
+        if platform.lower() == "xbox" and (xuid := await self._xapprove_xuid_for(account_id)):
+            # Unlock via the Xbox app's revoke (type 100); the read-back decides
+            # whether it lifted the block. Falls back to the web cancel below.
+            try:
+                result = await self.xbox_family.async_create_override(
+                    xuid, OVERRIDE_REVOKE, dt_util.utcnow() + timedelta(minutes=10)
+                )
+            except XboxFamilyError as err:
+                _LOGGER.warning("xapprove Xbox unlock failed, trying the web path: %s", err)
+            else:
+                if not any(
+                    o.get("overrideType") == OVERRIDE_BLOCK
+                    for o in result.get("overrides") or []
+                ):
+                    self._platform_override_until.pop((str(account_id), "xbox"), None)
+                    self._xbox_lock_known.add(str(account_id))
+                    await self.async_request_refresh()
+                    return {"prior": None, "applied": make_override(NO_OVERRIDE)}
+                _LOGGER.warning(
+                    "xapprove revoke left the Xbox block in place; trying the web path"
+                )
         key = self._hold_key(account_id, platform)
         if platform.lower() == "xbox":
             async with self._hold_lock(key):
@@ -1824,6 +1892,149 @@ class FamilySafetyDataUpdateCoordinator(
         )
         await self.async_request_refresh()
 
+    # --- Xbox Family Settings API (xapprove) ---------------------------------
+    @property
+    def _xapprove_active(self) -> bool:
+        return self.xbox_features and self.xbox_family.linked
+
+    async def _async_xbox_xuid(self, account: Account) -> str | None:
+        """The child's Xbox user id, matched by name on the Xbox family roster."""
+        key = str(account.user_id)
+        if key in self._xbox_xuids:
+            return self._xbox_xuids[key]
+        xuid = await self.xbox_family.async_child_xuid(
+            getattr(account, "first_name", None), getattr(account, "surname", None)
+        )
+        if xuid:
+            self._xbox_xuids[key] = xuid
+            _LOGGER.info("Xbox Family Settings: a child was matched to their Xbox account")
+            _LOGGER.debug("Xbox Family Settings: account %s is Xbox user %s", key, xuid)
+        else:
+            self._xbox_unmatched.add(key)
+        return xuid
+
+    async def _xapprove_xuid_for(self, child_id: str) -> str | None:
+        """xuid for a write, or None when xapprove is not in use for this child."""
+        if not self._xapprove_active:
+            return None
+        # Roster ids are int, entity and service ids may be str: compare as str.
+        account = next(
+            (a for key, a in self._accounts.items() if str(key) == str(child_id)), None
+        )
+        if account is None:
+            _LOGGER.warning(
+                "Xbox Family Settings: no roster account %s; using the previous path",
+                child_id,
+            )
+            return None
+        try:
+            return await self._async_xbox_xuid(account)
+        except XboxFamilyError as err:
+            _LOGGER.warning("Xbox Family Settings lookup failed: %s", err)
+            return None
+
+    def _xbox_web_gates(self, xapprove: dict[str, Any] | None) -> tuple[bool, bool]:
+        """Whether the web Xbox policy and the web usage report may be read.
+
+        Only while the Family session is healthy and not backing off. With
+        xapprove answering, the policy is not read from the web; the usage is,
+        when only xapprove's usage report failed.
+        """
+        web_gate = bool(
+            self.web_api is not None
+            and self.web_api.has_web_cookies
+            and self.web_api.family_context_state == "ready"
+            and float(getattr(self.web_api, "_family_web_backoff_until", 0.0) or 0.0)
+            <= time.monotonic()
+        )
+        return (
+            web_gate and xapprove is None,
+            web_gate and (xapprove is None or xapprove.get("usage") is None),
+        )
+
+    async def _async_fetch_xapprove(
+        self, account: Account, account_data: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Read the Xbox schedule, override and usage from xapprove.
+
+        Puts the schedule on ``xbox_screentime_policy`` (what the Xbox numbers
+        and switch read) and returns the usage and the override in the web
+        policy shape, or None to let the web path run as before.
+        """
+        if not self._xapprove_active:
+            return None
+        try:
+            xuid = await self._async_xbox_xuid(account)
+            if xuid is None:
+                return None
+            schedule = await self.xbox_family.async_get_schedule(xuid)
+            overrides = await self.xbox_family.async_get_overrides(xuid)
+            try:
+                usage = usage_today(
+                    await self.xbox_family.async_get_usage(xuid),
+                    dt_util.now().date().isoformat(),
+                )
+            except XboxFamilyError as err:
+                _LOGGER.debug("Could not read Xbox usage from xapprove: %s", err)
+                usage = None
+        except XboxFamilyAuthError as err:
+            if not self._xbox_auth_warned:
+                self._xbox_auth_warned = True
+                _LOGGER.warning(
+                    "Xbox Family Settings sign-in no longer works (%s); Xbox falls back "
+                    "to the web session. Link it again from the integration options.",
+                    err,
+                )
+            return None
+        except XboxFamilyError as err:
+            _LOGGER.debug("xapprove read failed, using the web path this poll: %s", err)
+            return None
+        self._xbox_auth_warned = False
+        account_data["xbox_screentime_policy"] = schedule_to_policy(schedule)
+        account_data["xbox_source"] = "xapprove"
+        return {"usage": usage, "lock_policy": overrides_to_policy(overrides)}
+
+    def async_xbox_linked(self) -> None:
+        """A manual link just stored a new token in this instance: use it now."""
+        self._xbox_xuids.clear()
+        self._xbox_unmatched.clear()
+        self._xbox_auth_warned = False
+        self.hass.async_create_task(self.async_request_refresh())
+
+    async def _async_try_silent_xbox_link(self) -> None:
+        """Link the Xbox Family Settings client from the web sign-in's cookies.
+
+        Same idea as the mobile token after a web sign-in: with live Microsoft
+        account cookies, oauth20_authorize.srf can answer with a single
+        redirect carrying the code. Tried at most every 6 h; a failure only
+        means the manual link in the options is needed.
+        """
+        if (
+            not self.xbox_features
+            or self.xbox_family.linked
+            or self.web_api is None
+            or not self.web_api.has_web_cookies
+            or time.monotonic() < self._xbox_link_retry_at
+        ):
+            return
+        self._xbox_link_retry_at = time.monotonic() + 6 * 3600
+        from .auth.native_proxy import async_fetch_mobile_oauth_redirect
+
+        url, verifier = build_authorize_url()
+        try:
+            result = await async_fetch_mobile_oauth_redirect(
+                self.hass, url, self.web_api.export_web_cookies()
+            )
+            if result is None:
+                _LOGGER.info(
+                    "Xbox Family Settings could not be linked silently; link it from "
+                    "the integration options"
+                )
+                return
+            await self.xbox_family.async_link_from_redirect(result[0], verifier, "silent")
+        except Exception as err:  # noqa: BLE001 - optional, retried later
+            _LOGGER.info("Silent Xbox Family Settings link failed: %r", err)
+
     def _set_xbox_policy_field(self, child_id: str, update) -> None:
         account = self.account_data(child_id)
         policy = account.get("xbox_screentime_policy") if isinstance(account, dict) else None
@@ -1841,9 +2052,18 @@ class FamilySafetyDataUpdateCoordinator(
             raise ValueError("day_of_week must be between 0 and 6")
         if hours < 0 or minutes < 0 or minutes > 59 or hours * 60 + minutes > 1440:
             raise ValueError("screen-time allowance must be between 0 and 24 hours")
-        await self.web_api.set_mobile_xbox_screentime_allowance(
-            child_id, day_of_week, hours, minutes
-        )
+        xuid = await self._xapprove_xuid_for(child_id)
+        if xuid is not None:
+            try:
+                await self.xbox_family.async_set_day(
+                    xuid, day_of_week, minutes=hours * 60 + minutes
+                )
+            except XboxFamilyError as err:
+                raise HomeAssistantError(f"Could not set the Xbox limit: {err}") from err
+        else:
+            await self.web_api.set_mobile_xbox_screentime_allowance(
+                child_id, day_of_week, hours, minutes
+            )
         day = DAY_KEYS[day_of_week]
 
         def _update(policy: dict) -> None:
@@ -1883,7 +2103,16 @@ class FamilySafetyDataUpdateCoordinator(
         """Turn the Xbox schedule on or off, keeping its days as they are."""
         if not self.web_api:
             raise RuntimeError("Web API not initialized")
-        await self.web_api.set_mobile_schedule_enabled(child_id, enabled, platform="Xbox")
+        xuid = await self._xapprove_xuid_for(child_id)
+        if xuid is not None:
+            # xapprove takes isEnabled with one day; send today unchanged.
+            today = (dt_util.now().weekday() + 1) % 7  # DAY_KEYS: 0 = Sunday
+            try:
+                await self.xbox_family.async_set_day(xuid, today, enabled=enabled)
+            except XboxFamilyError as err:
+                raise HomeAssistantError(f"Could not switch the Xbox limits: {err}") from err
+        else:
+            await self.web_api.set_mobile_schedule_enabled(child_id, enabled, platform="Xbox")
 
         def _update(policy: dict) -> None:
             policy["isEnabled"] = bool(enabled)
@@ -2684,8 +2913,9 @@ class FamilySafetyDataUpdateCoordinator(
         )
         web_ok = web_authenticated is True and family_ok
         state = "connected" if mobile_ok and web_ok else "degraded" if mobile_ok else "disconnected"
-        if self._mobile_only:
-            # No web session by design: the mobile API alone decides.
+        if self._mobile_only or (self.xbox_features and self.xbox_family.usable):
+            # No web session by design, or Xbox runs on its own sign-in:
+            # the mobile API alone decides.
             state = "connected" if mobile_ok else "disconnected"
         reauth_recommended = bool(
             self._native_web_auth
@@ -2744,6 +2974,9 @@ class FamilySafetyDataUpdateCoordinator(
             "cookies_loaded": self._web_cookies_loaded,
             "native_web_auth": self._native_web_auth,
             "xbox_features": not self._mobile_only,
+            **self.xbox_family.diagnostics(),
+            "xbox_family_matched_children": len(self._xbox_xuids),
+            "xbox_family_unmatched_children": len(self._xbox_unmatched - set(self._xbox_xuids)),
             "runtime_credentials_persisted": bool(self._runtime_auth_state),
             "reauth_requested": self._reauth_requested,
             "reauth_required": self._reauth_requested,
@@ -2904,17 +3137,28 @@ class FamilySafetyDataUpdateCoordinator(
         self._family_auth_required_polls += 1
         if not self._family_context_dead_end:
             return
-        if getattr(self.web_api, "mobile_schedule_ok", False) and not self.xbox_features:
-            # Schedules run on the mobile API; the expired web context only
-            # affects web-only extras, so a daily reauth prompt is not worth it.
-            # With the Xbox features on it is: Xbox play time and the Xbox
-            # lock exist only on the web session, and without a prompt they
-            # stay unknown with no sign that anything is wrong.
+        xbox_on_xapprove = self.xbox_features and self.xbox_family.usable
+        if (
+            getattr(self.web_api, "mobile_schedule_ok", False) and not self.xbox_features
+        ) or xbox_on_xapprove:
+            # The expired web/Family context only gated Xbox play time and the
+            # Xbox lock. With Xbox on the Xbox Family Settings sign-in (xapprove)
+            # and schedules on the mobile API, a reauth prompt for the web
+            # session is not worth it.
             if self._family_auth_required_polls == _FAMILY_AUTH_REQUIRED_POLLS:
                 _LOGGER.info(
-                    "Family web context needs an interactive sign-in; schedules keep "
-                    "working through the mobile API, so no reauthentication is requested"
+                    "Family web context needs an interactive sign-in; %s, so no "
+                    "reauthentication is requested",
+                    "Xbox runs on the Xbox Family Settings sign-in"
+                    if xbox_on_xapprove
+                    else "schedules keep working through the mobile API",
                 )
+            # Clear a family-context reauth raised on an earlier poll (before the
+            # Xbox link became usable) so the standing prompt goes away.
+            if self._reauth_reason == "family_context_auth_required":
+                self._reauth_requested = False
+                self._reauth_reason = None
+                await self._dismiss_auth_notification()
             return
         await self._create_auth_notification()
         self._request_reauth("family_context_auth_required")
@@ -3004,6 +3248,7 @@ class FamilySafetyDataUpdateCoordinator(
                         else "web_session_expired"
                     )
             await self._async_ensure_family_context()
+            await self._async_try_silent_xbox_link()
             await self.api.update()
             if not getattr(self.api, "accounts", None):
                 self.api.accounts = []
@@ -3042,19 +3287,17 @@ class FamilySafetyDataUpdateCoordinator(
                 # on the /st (Windows schedule) read: a child with no Windows
                 # schedule still has an Xbox. Per-child intervals and the shared
                 # "no Xbox" backoff live in the api_client methods.
-                xbox_gate = bool(
-                    self.web_api is not None
-                    and self.web_api.has_web_cookies
-                    and self.web_api.family_context_state == "ready"
-                    and float(getattr(self.web_api, "_family_web_backoff_until", 0.0) or 0.0)
-                    <= time.monotonic()
-                )
+                # With the Xbox Family Settings sign-in linked, the schedule,
+                # lock state and usage come from xapprove, and the web reads
+                # below only run when that fails.
+                xapprove = await self._async_fetch_xapprove(account, accounts_data[account_id])
+                xbox_gate, usage_gate = self._xbox_web_gates(xapprove)
                 # Xbox usage: since about 2026-08-20 the mobile aggregator
                 # reports 0 (or a stale figure) for Xbox play on some accounts,
                 # so read the Xbox activity report from the web API as well.
                 today_iso = dt_util.now().date().isoformat()
-                xbox_usage: int | None = None
-                if xbox_gate:
+                xbox_usage: int | None = xapprove.get("usage") if xapprove else None
+                if usage_gate:
                     try:
                         xbox_usage = await self.web_api.get_xbox_screentime_usage(
                             account_id,
@@ -3087,7 +3330,7 @@ class FamilySafetyDataUpdateCoordinator(
                 # an Xbox the report answers 403 and sets the shared "no Xbox"
                 # backoff, which then skips this read in the same poll (the
                 # policy itself answers 200 for such a child).
-                xbox_policy: dict | None = None
+                xbox_policy: dict | None = xapprove.get("lock_policy") if xapprove else None
                 policy_read_at = dt_util.utcnow()
                 if xbox_gate:
                     try:
