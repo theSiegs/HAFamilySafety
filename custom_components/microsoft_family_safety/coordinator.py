@@ -254,6 +254,9 @@ class FamilySafetyDataUpdateCoordinator(
         #: was read, or a web lock/unlock from here succeeded. Until then the
         #: Xbox lock switch reports unknown rather than "unlocked".
         self._xbox_lock_known: set[str] = set()
+        #: monotonic time of the next web activity read per child (#65); the
+        #: report covers 7 days, so every 30 min is plenty.
+        self._web_activity_next: dict[str, float] = {}
         #: Xbox settings through the Xbox Family Settings app's API
         #: (xapprove), on its own refresh token instead of the web session.
         self.xbox_family = XboxFamilyAPI(hass, entry.entry_id)
@@ -347,8 +350,8 @@ class FamilySafetyDataUpdateCoordinator(
         Account ids reach the coordinator as int (from the mobile API roster)
         and as str (from the web API and from service calls), while JSON object
         keys are always str. Without normalizing, a restore point saved before
-        a reload became invisible afterwards: `1055519684390826 in
-        {"1055519684390826": ...}` is False, so unlock believed there was
+        a reload became invisible afterwards: `1234567890123456 in
+        {"1234567890123456": ...}` is False, so unlock believed there was
         nothing to restore and overwrote the schedule with its default.
         """
         return str(account_id)
@@ -3102,6 +3105,12 @@ class FamilySafetyDataUpdateCoordinator(
             )
         except Exception as err:
             _LOGGER.debug("Could not fetch the app limits switch: %r", err)
+        if time.monotonic() >= self._web_activity_next.get(account_id, 0.0):
+            self._web_activity_next[account_id] = time.monotonic() + 1800
+            try:
+                result["web_activity"] = await self.web_api.get_web_activity(account_id)
+            except Exception as err:
+                _LOGGER.debug("Could not fetch web activity: %r", err)
         try:
             screentime = await self._fetch_screentime_policy(account_id)
             expired = (
@@ -3368,7 +3377,7 @@ class FamilySafetyDataUpdateCoordinator(
                 # it applies only to configuration/policy payloads and never
                 # modifies measured usage values.
                 previous = (self.account_data(account_id) or {})
-                for key in ("web_browsing", "content_settings", "screentime_policy", "app_limits_enabled", "xbox_screentime_policy"):
+                for key in ("web_browsing", "content_settings", "screentime_policy", "app_limits_enabled", "xbox_screentime_policy", "web_activity"):
                     if web_data.get(key) is None and previous.get(key) is not None:
                         web_data[key] = previous.get(key)
                 accounts_data[account_id].update(web_data)
