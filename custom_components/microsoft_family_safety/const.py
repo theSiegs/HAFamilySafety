@@ -48,6 +48,8 @@ CONF_ALLOWED_USERS: Final = "allowed_users"
 DEFAULT_XBOX_FEATURES: Final = True
 #: Fired once for each pending request (more time, an app) that appears.
 EVENT_REQUEST: Final = f"{DOMAIN}_request"
+#: Fired once when a pending request leaves the list (answered here or in the app).
+EVENT_REQUEST_RESOLVED: Final = f"{DOMAIN}_request_resolved"
 # Strict mode: a platform lock placed by lock_platform that Microsoft reports
 # as cancelled while it should still hold is placed again.
 CONF_STRICT_MODE: Final = "strict_mode"
