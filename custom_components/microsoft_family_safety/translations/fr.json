@@ -104,7 +104,11 @@
       "fields": {
         "account_id": {
           "name": "ID du compte",
-          "description": "L'identifiant utilisateur du compte enfant."
+          "description": "L'identifiant utilisateur du compte enfant. Indiquez-le ou une entité de l'enfant."
+        },
+        "entity_id": {
+          "name": "Entité de l'enfant",
+          "description": "N'importe quelle entité Microsoft Family Safety de l'enfant (ou de l'un de ses appareils), à la place de l'identifiant du compte."
         },
         "app_id": {
           "name": "ID de l'application",
@@ -118,7 +122,11 @@
       "fields": {
         "account_id": {
           "name": "ID du compte",
-          "description": "L'identifiant utilisateur du compte enfant."
+          "description": "L'identifiant utilisateur du compte enfant. Indiquez-le ou une entité de l'enfant."
+        },
+        "entity_id": {
+          "name": "Entité de l'enfant",
+          "description": "N'importe quelle entité Microsoft Family Safety de l'enfant (ou de l'un de ses appareils), à la place de l'identifiant du compte."
         },
         "app_id": {
           "name": "ID de l'application",
@@ -132,7 +140,11 @@
       "fields": {
         "account_id": {
           "name": "ID du compte",
-          "description": "L'identifiant utilisateur du compte enfant."
+          "description": "L'identifiant utilisateur du compte enfant. Indiquez-le ou une entité de l'enfant."
+        },
+        "entity_id": {
+          "name": "Entité de l'enfant",
+          "description": "N'importe quelle entité Microsoft Family Safety de l'enfant (ou de l'un de ses appareils), à la place de l'identifiant du compte."
         },
         "platform": {
           "name": "Plateforme",
@@ -150,7 +162,11 @@
       "fields": {
         "account_id": {
           "name": "ID du compte",
-          "description": "L'identifiant utilisateur du compte enfant."
+          "description": "L'identifiant utilisateur du compte enfant. Indiquez-le ou une entité de l'enfant."
+        },
+        "entity_id": {
+          "name": "Entité de l'enfant",
+          "description": "N'importe quelle entité Microsoft Family Safety de l'enfant (ou de l'un de ses appareils), à la place de l'identifiant du compte."
         },
         "platform": {
           "name": "Plateforme",
@@ -188,7 +204,11 @@
       "fields": {
         "account_id": {
           "name": "ID du compte",
-          "description": "L'identifiant utilisateur du compte enfant."
+          "description": "L'identifiant utilisateur du compte enfant. Indiquez-le ou une entité de l'enfant."
+        },
+        "entity_id": {
+          "name": "Entité de l'enfant",
+          "description": "N'importe quelle entité Microsoft Family Safety de l'enfant (ou de l'un de ses appareils), à la place de l'identifiant du compte."
         },
         "day_of_week": {
           "name": "Jour de la semaine",
@@ -210,7 +230,11 @@
       "fields": {
         "account_id": {
           "name": "ID du compte",
-          "description": "L'identifiant utilisateur du compte enfant."
+          "description": "L'identifiant utilisateur du compte enfant. Indiquez-le ou une entité de l'enfant."
+        },
+        "entity_id": {
+          "name": "Entité de l'enfant",
+          "description": "N'importe quelle entité Microsoft Family Safety de l'enfant (ou de l'un de ses appareils), à la place de l'identifiant du compte."
         },
         "day_of_week": {
           "name": "Jour de la semaine",
@@ -240,7 +264,11 @@
       "fields": {
         "account_id": {
           "name": "ID du compte",
-          "description": "L'identifiant utilisateur du compte enfant."
+          "description": "L'identifiant utilisateur du compte enfant. Indiquez-le ou une entité de l'enfant."
+        },
+        "entity_id": {
+          "name": "Entité de l'enfant",
+          "description": "N'importe quelle entité Microsoft Family Safety de l'enfant (ou de l'un de ses appareils), à la place de l'identifiant du compte."
         },
         "app_id": {
           "name": "ID de l'application",
@@ -278,7 +306,11 @@
       "fields": {
         "account_id": {
           "name": "ID du compte",
-          "description": "L'identifiant utilisateur du compte enfant."
+          "description": "L'identifiant utilisateur du compte enfant. Indiquez-le ou une entité de l'enfant."
+        },
+        "entity_id": {
+          "name": "Entité de l'enfant",
+          "description": "N'importe quelle entité Microsoft Family Safety de l'enfant (ou de l'un de ses appareils), à la place de l'identifiant du compte."
         },
         "app_id": {
           "name": "ID de l'application",
@@ -300,7 +332,11 @@
       "fields": {
         "account_id": {
           "name": "ID du compte",
-          "description": "L'identifiant utilisateur du compte enfant."
+          "description": "L'identifiant utilisateur du compte enfant. Indiquez-le ou une entité de l'enfant."
+        },
+        "entity_id": {
+          "name": "Entité de l'enfant",
+          "description": "N'importe quelle entité Microsoft Family Safety de l'enfant (ou de l'un de ses appareils), à la place de l'identifiant du compte."
         },
         "website": {
           "name": "Site web",
@@ -314,7 +350,11 @@
       "fields": {
         "account_id": {
           "name": "ID du compte",
-          "description": "L'identifiant utilisateur du compte enfant."
+          "description": "L'identifiant utilisateur du compte enfant. Indiquez-le ou une entité de l'enfant."
+        },
+        "entity_id": {
+          "name": "Entité de l'enfant",
+          "description": "N'importe quelle entité Microsoft Family Safety de l'enfant (ou de l'un de ses appareils), à la place de l'identifiant du compte."
         },
         "website": {
           "name": "Site web",
@@ -328,7 +368,11 @@
       "fields": {
         "account_id": {
           "name": "ID du compte",
-          "description": "L'identifiant utilisateur du compte enfant."
+          "description": "L'identifiant utilisateur du compte enfant. Indiquez-le ou une entité de l'enfant."
+        },
+        "entity_id": {
+          "name": "Entité de l'enfant",
+          "description": "N'importe quelle entité Microsoft Family Safety de l'enfant (ou de l'un de ses appareils), à la place de l'identifiant du compte."
         },
         "enabled": {
           "name": "Activé",
@@ -342,7 +386,11 @@
       "fields": {
         "account_id": {
           "name": "ID du compte",
-          "description": "L'identifiant utilisateur du compte enfant."
+          "description": "L'identifiant utilisateur du compte enfant. Indiquez-le ou une entité de l'enfant."
+        },
+        "entity_id": {
+          "name": "Entité de l'enfant",
+          "description": "N'importe quelle entité Microsoft Family Safety de l'enfant (ou de l'un de ses appareils), à la place de l'identifiant du compte."
         },
         "age": {
           "name": "Limite d'âge",
@@ -356,7 +404,11 @@
       "fields": {
         "account_id": {
           "name": "ID du compte",
-          "description": "L'identifiant utilisateur du compte enfant."
+          "description": "L'identifiant utilisateur du compte enfant. Indiquez-le ou une entité de l'enfant."
+        },
+        "entity_id": {
+          "name": "Entité de l'enfant",
+          "description": "N'importe quelle entité Microsoft Family Safety de l'enfant (ou de l'un de ses appareils), à la place de l'identifiant du compte."
         },
         "require_approval": {
           "name": "Approbation requise",
@@ -370,7 +422,11 @@
       "fields": {
         "account_id": {
           "name": "ID du compte",
-          "description": "L'identifiant utilisateur du compte enfant à verrouiller."
+          "description": "L'identifiant utilisateur du compte enfant. Indiquez-le ou une entité de l'enfant."
+        },
+        "entity_id": {
+          "name": "Entité de l'enfant",
+          "description": "N'importe quelle entité Microsoft Family Safety de l'enfant (ou de l'un de ses appareils), à la place de l'identifiant du compte."
         }
       }
     },
@@ -380,7 +436,11 @@
       "fields": {
         "account_id": {
           "name": "ID du compte",
-          "description": "L'identifiant utilisateur du compte enfant à déverrouiller."
+          "description": "L'identifiant utilisateur du compte enfant. Indiquez-le ou une entité de l'enfant."
+        },
+        "entity_id": {
+          "name": "Entité de l'enfant",
+          "description": "N'importe quelle entité Microsoft Family Safety de l'enfant (ou de l'un de ses appareils), à la place de l'identifiant du compte."
         }
       }
     },
@@ -394,7 +454,11 @@
       "fields": {
         "account_id": {
           "name": "ID du compte",
-          "description": "L'identifiant utilisateur du compte enfant."
+          "description": "L'identifiant utilisateur du compte enfant. Indiquez-le ou une entité de l'enfant."
+        },
+        "entity_id": {
+          "name": "Entité de l'enfant",
+          "description": "N'importe quelle entité Microsoft Family Safety de l'enfant (ou de l'un de ses appareils), à la place de l'identifiant du compte."
         },
         "website": {
           "name": "Site web",
