@@ -176,7 +176,7 @@ Service call / entity write
 | Monitored platforms | Windows / Xbox / Mobile | Windows | One lock switch per platform. Xbox also adds the Xbox entities, see [below](#xbox) |
 | Users allowed to control Microsoft Family Safety | list of Home Assistant users | *(empty: everybody)* | See [Who can control the integration](#who-can-control-the-integration) |
 | Allow insecure local HTTP authentication (testing only) | on / off | off | See below |
-| Link the Xbox Family Settings sign-in | on / off | off | Only with Xbox ticked. Opens the [manual Xbox link](#xbox) step |
+| Link the Xbox Family Settings sign-in | on / off | off | Only with Xbox ticked; for when the Connection sensor shows `xbox_family: not_linked`. Opens a Microsoft sign-in through the same temporary proxy as the setup, which picks up the result itself: sign in, close the window, done. Without an HTTPS URL (or the local HTTP option below), or if the sign-in does not finish within 5 minutes, you paste the address of the blank page Microsoft ends on instead |
 
 #### Who can control the integration
 
@@ -194,7 +194,7 @@ Give the child a **non-administrator** account and tick the parents: an administ
 
 The Xbox lock, the Xbox limits and Xbox play time go through the **Xbox Family Settings** app's service, on its own refresh token. Microsoft moved the Xbox settings there: its per-day limits are the ones the console enforces, and an Xbox override stored by the Family Safety mobile API is accepted but ignored by the console.
 
-- **Xbox ticked** among the monitored platforms: the Xbox entities are created (Xbox lock, Xbox schedule switch, Xbox daily limits). The Xbox Family Settings sign-in is linked during the Microsoft sign-in when Microsoft allows it. Otherwise a repair issue appears (and the Connection sensor shows `xbox_family: not_linked`): open the options, tick **Link the Xbox Family Settings sign-in**, open the link shown, sign in with the parent account and paste the address of the blank page you end up on. If Microsoft later refuses that sign-in, it is retried every 6 hours and a repair issue asks you to link it again the same way.
+- **Xbox ticked** among the monitored platforms: the Xbox entities are created (Xbox lock, Xbox schedule switch, Xbox daily limits). The Xbox Family Settings sign-in is linked during the Microsoft sign-in when Microsoft allows it. Otherwise a repair issue appears (and the Connection sensor shows `xbox_family: not_linked`): open the options, tick **Link the Xbox Family Settings sign-in** and sign in with the parent account in the window that opens (without an HTTPS URL, open the link shown instead and paste the address of the blank page you end up on). If Microsoft later refuses that sign-in, it is retried every 6 hours and a repair issue asks you to link it again the same way.
 - **Xbox unticked** (the default for new installs): no Xbox entities are created and no Xbox Family Settings link is made.
 
 Without the link, the Xbox daily limits and the Xbox schedule switch still work through the mobile API, but the Xbox lock fails with an error (the mobile API's Xbox override does nothing on the console) and the Xbox play time is not read. Children are matched to their Xbox account by first name and surname; a child whose names differ between Microsoft and Xbox is reported in `xbox_family_unmatched_children` and has no Xbox lock.
