@@ -37,6 +37,8 @@ CONF_XBOX_LINK: Final = "xbox_link"
 # everybody, as before.
 CONF_ALLOWED_USERS: Final = "allowed_users"
 DEFAULT_XBOX_FEATURES: Final = True
+#: Fired once for each pending request (more time, an app) that appears.
+EVENT_REQUEST: Final = f"{DOMAIN}_request"
 
 # Days of week, in Microsoft API order (index 0 = Sunday)
 DAY_KEYS: Final = [

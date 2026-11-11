@@ -53,6 +53,7 @@ from .const import (
     DOMAIN,
     ERROR_AUTH_FAILED,
     ERROR_TOKEN_EXPIRED,
+    EVENT_REQUEST,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -66,6 +67,8 @@ _FAMILY_TOKEN_REJECTED = "web_family_token_rejected"
 #: Polls in a row ending in family_context_state == "auth_required" before the
 #: coordinator treats the Family session as gone and starts reauthentication.
 _FAMILY_AUTH_REQUIRED_POLLS = 2
+#: Polls in a row a pending request must be missing before its id is forgotten.
+_REQUEST_FORGET_POLLS = 3
 
 
 def _range_to_slots(start_hour: int, start_minute: int, end_hour: int, end_minute: int) -> list[bool]:
@@ -221,6 +224,11 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: monotonic time before which no silent Xbox link is attempted again.
         self._xbox_link_retry_at = 0.0
         self._xbox_auth_warned = False
+        #: request id -> polls in a row it has been missing; None before the
+        #: first poll, which only sets the baseline (a restart is not news).
+        #: An id is forgotten only after _REQUEST_FORGET_POLLS misses, so one
+        #: empty or failed read does not make every open request "new" again.
+        self._seen_request_ids: dict[str, int] | None = None
 
     @property
     def _native_web_auth(self) -> bool:
@@ -2039,6 +2047,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._accounts = new_accounts
             self._devices = new_devices
             pending = getattr(self.api, "pending_requests", None) or []
+            self._fire_request_events(pending, accounts_data)
             self._is_retrying_auth = False
             return {"accounts": accounts_data, "devices": devices_data, "pending_requests": pending}
         except HttpException as err:
@@ -2062,6 +2071,47 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "Could not persist rotated Family Safety credentials: %s",
                     persist_err,
                 )
+
+    def _fire_request_events(
+        self, pending: list[Any], accounts_data: dict[str, Any]
+    ) -> None:
+        """Fire microsoft_family_safety_request for each request new since the last poll.
+
+        The fields are Microsoft's as pyfamilysafety returns them (puid, id,
+        type, platform, requestedTime, appId / displayName when present);
+        requested_time is passed on as Microsoft gives it, since its unit is
+        not documented.
+        """
+        requests = [r for r in pending if isinstance(r, dict) and r.get("id") is not None]
+        ids = {str(r["id"]) for r in requests}
+        seen = self._seen_request_ids
+        tracked: dict[str, int] = {request_id: 0 for request_id in ids}
+        for request_id, misses in (seen or {}).items():
+            if request_id not in ids and misses + 1 < _REQUEST_FORGET_POLLS:
+                tracked[request_id] = misses + 1
+        self._seen_request_ids = tracked
+        if seen is None:
+            return
+        for request in requests:
+            if str(request["id"]) in seen:
+                continue
+            puid = request.get("puid")
+            account_id = str(puid) if puid is not None else None
+            account = accounts_data.get(account_id) or accounts_data.get(puid) or {}
+            self.hass.bus.async_fire(
+                EVENT_REQUEST,
+                {
+                    "entry_id": self.entry.entry_id,
+                    "account_id": account_id,
+                    "first_name": account.get("first_name"),
+                    "request_id": str(request["id"]),
+                    "type": request.get("type"),
+                    "platform": request.get("platform"),
+                    "app_id": request.get("appId"),
+                    "app_name": request.get("displayName") or request.get("appName"),
+                    "requested_time": request.get("requestedTime"),
+                },
+            )
 
     async def _create_auth_notification(self) -> None:
         if self._auth_notification_sent:
