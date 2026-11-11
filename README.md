@@ -1091,7 +1091,7 @@ Be aware of the following before enabling native authentication:
 | GET | `/v4/devicelimits/{childId}/overrides` (`Plat-Info: ALL`) | Active device overrides, read fresh on every poll and around every lock/unlock; the platform name to send is its `appliesTo` (Windows can be listed as `Desktop`) | `switch.lock`, `lock_platform` / `unlock_platform` |
 | POST | `/v4/devicelimits/{childId}/overrides` (`Plat-Info: ALL`) | Lock (`BlockUntil`) or unlock (`Cancel`) Windows/Mobile; body `{target, overrideType, validUntil, culture}` | `lock_platform`, `unlock_platform` |
 
-> Microsoft sometimes answers HTTP 500 to a lock or unlock it applied anyway, and has failed a cancel without applying it. `lock_platform` / `unlock_platform` therefore read the overrides again after every write and succeed only when that read shows the platform locked (lock) or not locked (unlock).
+> The POST answers with the whole overrides document as it stands after the write, and `lock_platform` / `unlock_platform` / Windows `add_time_bonus` / `cancel_time_bonus` are judged by that answer: a GET made right after a write can still list the previous state for a while. Microsoft sometimes answers HTTP 500 to a write it applied anyway, and has failed a cancel without applying it; after an error the overrides are read up to three times over a few seconds, and the action succeeds only when a read shows the expected state. For two minutes after a write, its answer stands over what a GET says for that platform (the poll, the lock holds, strict mode), so a lagging read is never taken for a parent's change.
 
 ### Xbox Family Settings — `xapprove.xboxlive.com`
 

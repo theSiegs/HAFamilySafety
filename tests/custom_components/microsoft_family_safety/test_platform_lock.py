@@ -119,8 +119,14 @@ class FakeMobile:
     async def set_mobile_device_override(self, child_id, target, override_type, valid_until):
         assert child_id == CHILD
         if override_type == "Cancel":
+            before = list(self.platforms[target])
             self.platforms[target] = []
             self.writes.append((target, "Cancel"))
+            if getattr(self, "lag_after_cancel", False):
+                # Answers the cancelled state; later GETs still list the old one.
+                answer = self.state()
+                self.platforms[target] = before
+                return answer
         else:
             assert override_type == "BlockUntil"
             until = iso_utc(valid_until)
@@ -360,6 +366,7 @@ async def test_no_write_goes_through_the_web_session(hass, platform):
     coord._platform_holds[key]["confirmed_at"] = iso_utc(_hours(-1))
     xbox.overrides = []
     mobile.platforms["Windows"] = []
+    coord._mobile_writes.clear()  # our write is minutes old
     before = len(writes)
     await coord._async_enforce_holds({CHILD: NONE})  # cancelled elsewhere: placed again
     await hass.async_block_till_done()
@@ -410,8 +417,8 @@ async def test_reads_never_touch_the_web_session(coordinator, mobile):
     web = _web_session(coordinator, mobile)
     await coordinator.async_lock_platform(CHILD, "Mobile", _hours(2))
     await coordinator.async_unlock_platform(CHILD, "Mobile")
-    # Each: the hold's read, then the write's target read and read-back.
-    assert mobile.reads == 6
+    # Each: the hold's read and the write's target read; the POST answer decides.
+    assert mobile.reads == 4
     assert [name for name, _ in mobile.writes] == ["Mobile", "Mobile"]
     assert web.method_calls == []
 
@@ -681,3 +688,41 @@ async def test_service_answers_with_prior_and_applied(hass, service):
     }
     # Without asking for it, as existing callers do, nothing changes.
     assert await _call(hass, duration_hours=2) is None
+
+
+async def test_a_lagging_read_after_our_write_is_not_a_parent_change(coordinator, mobile):
+    """Microsoft's GET lags behind its writes; our write's answer stands for 2 minutes."""
+    parent_until = _hours(1)
+    parent = [{"overrideType": "BlockUntil", "validUntil": iso_utc(parent_until)}]
+    mobile.platforms["Windows"] = list(parent)
+    await coordinator.async_lock_platform(CHILD, "Windows", _hours(3))
+
+    # The GET still lists the parent's lock it had before ours.
+    mobile.platforms["Windows"] = list(parent)
+    current = await coordinator._async_read_platform_override(CHILD, "Windows")
+    assert current["type"] == "blockUntil"
+    assert parse_utc(current["valid_until"]) != parse_utc(parent[0]["validUntil"])
+
+    # So unlock knows the lock as ours and puts the parent's lock back...
+    result = await coordinator.async_unlock_platform(CHILD, "Windows")
+    assert result["applied"]["type"] == "blockUntil"
+    assert mobile.writes[-1] == ("Windows", iso_utc(parent_until))
+
+    # ...and a poll that still shows our (longer) lock does not count either.
+    stale = SimpleNamespace(user_id=CHILD, blocked_platforms=["Windows"])
+    assert coordinator._merge_blocked_platforms(stale) == ["Windows"]  # the parent's lock
+
+
+async def test_a_lagging_read_after_a_cancel_is_not_an_error(coordinator, mobile):
+    await coordinator.async_lock_platform(CHILD, "Windows", _hours(2))
+    mobile.lag_after_cancel = True
+    result = await coordinator.async_unlock_platform(CHILD, "Windows")
+    assert result["applied"]["type"] == "none"
+    assert coordinator.platform_hold(CHILD, "Windows") is None
+    # The poll still lists the lock: not believed, the switch stays off.
+    stale = SimpleNamespace(user_id=CHILD, blocked_platforms=["Windows"])
+    coordinator.data["accounts"][CHILD]["blocked_platforms"] = (
+        coordinator._merge_blocked_platforms(stale)
+    )
+    assert coordinator.data["accounts"][CHILD]["blocked_platforms"] == []
+    assert coordinator.platform_hold_state(CHILD, "Windows")["hold"] == "none"

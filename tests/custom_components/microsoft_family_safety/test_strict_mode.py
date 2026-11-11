@@ -46,6 +46,9 @@ async def _locked(coord, xbox, mobile, platform="Xbox", age=timedelta(minutes=11
     await coord.async_lock_platform(CHILD, platform, dt_util.utcnow() + timedelta(hours=2))
     hold = coord._platform_holds[coord._hold_key(CHILD, platform)]
     hold["confirmed_at"] = iso_utc(dt_util.utcnow() - age)
+    # Our mobile write's answer is that old too (see _MOBILE_WRITE_GRACE).
+    for key, (written, entry) in list(coord._mobile_writes.items()):
+        coord._mobile_writes[key] = (written - age, entry)
     xbox.writes.clear()
     mobile.writes.clear()
 

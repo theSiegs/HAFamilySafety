@@ -9,7 +9,9 @@ child's full override state::
         ...]}
 
 A POST to the same route takes ``{target, overrideType, validUntil, culture}``,
-where ``target`` is the platform name Microsoft lists in ``appliesTo``. That
+where ``target`` is the platform name Microsoft lists in ``appliesTo``, and
+answers with the whole document as it stands after the write. A GET can lag
+behind that answer for a while, so a write is judged by its own answer. That
 name is not fixed: Windows has been listed as "Windows" and as "Desktop", so
 the name to send is always taken from a read.
 
@@ -41,6 +43,16 @@ _PLATFORM_NAMES = {
 
 #: Override types that do not lock the platform.
 _NOT_A_LOCK = frozenset({MOBILE_OVERRIDE_ALLOW.lower(), MOBILE_OVERRIDE_CANCEL.lower()})
+
+
+def is_overrides_document(value: Any) -> bool:
+    """True for a full overrides answer (``{"lockablePlatforms": [...]}``).
+
+    A POST answers with the whole document already showing the write, which
+    is more current than a GET made right after it: the GET has been seen to
+    list an override for a while after a Cancel the POST answer had removed.
+    """
+    return isinstance(value, dict) and isinstance(value.get("lockablePlatforms"), list)
 
 
 def mobile_platform_name(applies_to: Any) -> str:

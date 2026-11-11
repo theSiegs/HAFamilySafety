@@ -368,6 +368,7 @@ async def test_windows_lock_is_put_back_when_our_extra_time_has_ended(
     hold["bonus_until"] = iso_utc(_minutes(-1))
     coord._time_bonuses[key]["until"] = hold["bonus_until"]
     mobile_extra.platforms["Windows"] = []  # the extra time has run out
+    coord._mobile_writes.clear()  # and our write is minutes old
     mobile_extra.writes.clear()
 
     _windows_polled(coord, mobile_extra)

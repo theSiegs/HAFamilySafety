@@ -1,8 +1,10 @@
 """Windows/Mobile lock and unlock on the /v4 mobile device-limits overrides.
 
-The outcome of a lock or unlock is decided by a fresh read of the overrides
-after the write: Microsoft has answered HTTP 500 to overrides it applied, and
-a cancel that did not apply must not be reported as an unlock.
+A write is judged by the overrides document the POST answers with: a GET
+right after it can lag (still listing an override the Cancel removed). Only
+when the POST fails (Microsoft has answered HTTP 500 to overrides it applied)
+or answers no document do retried reads decide; a cancel that did not apply
+is never reported as an unlock.
 """
 
 from __future__ import annotations
@@ -49,11 +51,17 @@ class FakeMobileOverrides:
         self.reads = 0
         self.post_error: Exception | None = None
         self.applies = True
+        #: A GET lists what was there before the last write for this many reads.
+        self.lag_reads = 0
+        self._stale: list[dict] | None = None
+        #: The POST answers no body (None) instead of the document.
+        self.empty_answer = False
 
-    def state(self) -> dict:
+    def state(self, overrides: list[dict] | None = None) -> dict:
+        overrides = self.overrides if overrides is None else overrides
         return {
             "lockablePlatforms": [
-                {"appliesTo": self.applies_to, "overrides": list(self.overrides), "devices": []},
+                {"appliesTo": self.applies_to, "overrides": list(overrides), "devices": []},
                 {"appliesTo": "Xbox", "overrides": [], "devices": []},
             ]
         }
@@ -61,11 +69,15 @@ class FakeMobileOverrides:
     async def get_mobile_device_overrides(self, child_id: str) -> dict:
         assert child_id == CHILD
         self.reads += 1
+        if self._stale is not None and self.lag_reads > 0:
+            self.lag_reads -= 1
+            return self.state(self._stale)
         return self.state()
 
     async def set_mobile_device_override(self, child_id, target, override_type, until):
         assert child_id == CHILD
         self.posts.append((target, override_type, until))
+        self._stale = list(self.overrides)
         if self.applies:
             if override_type == "BlockUntil":
                 self.overrides = [{"overrideType": "BlockUntil", "validUntil": _iso(until)}]
@@ -73,7 +85,7 @@ class FakeMobileOverrides:
                 self.overrides = []
         if self.post_error is not None:
             raise self.post_error
-        return self.state()
+        return None if self.empty_answer else self.state()
 
 
 @pytest.fixture
@@ -82,6 +94,7 @@ async def coordinator(hass):
     entry.add_to_hass(hass)
     coord = FamilySafetyDataUpdateCoordinator(hass, entry)
     coord.web_api = FakeMobileOverrides()
+    coord._MOBILE_READBACK_DELAYS = (0.0, 0.0, 0.0)
     coord.async_request_refresh = AsyncMock()
     coord._accounts[CHILD] = MagicMock(blocked_platforms=[])
     return coord
@@ -92,7 +105,7 @@ async def test_lock_sends_block_until_and_reads_it_back(coordinator):
     until = dt_util.utcnow() + timedelta(minutes=3)
     await coordinator.async_lock_platform(CHILD, "Windows", until)
     assert web.posts == [("Windows", "BlockUntil", until)]
-    assert web.reads == 2  # the target name before, the outcome after
+    assert web.reads == 1  # the target name; the POST answer decides
     assert coordinator._accounts[CHILD].blocked_platforms == ["Windows"]
 
 
@@ -132,6 +145,7 @@ async def test_cancel_answered_500_and_not_applied_raises(coordinator):
     coordinator._platform_override_until[(CHILD, "windows")] = dt_util.utcnow() + timedelta(hours=1)
     with pytest.raises(HomeAssistantError, match="still lists a lock"):
         await coordinator.async_unlock_platform(CHILD, "Windows")
+    assert web.reads == 1 + 3  # the target, then three reads that never settle
     assert coordinator._accounts[CHILD].blocked_platforms == ["Windows"]
     assert (CHILD, "windows") in coordinator._platform_override_until
 
@@ -239,3 +253,52 @@ async def test_poll_reads_the_v4_overrides():
     )
     assert account.blocked_platforms == ["Windows"]
     device.update_blocked_status.assert_called_once_with(True)
+
+
+async def test_post_answer_decides_while_the_get_lags(coordinator):
+    """The Cancel's answer lists nothing; a GET still lists the lock: unlocked."""
+    web = coordinator.web_api
+    await coordinator.async_lock_platform(CHILD, "Windows")
+    web.lag_reads = 5
+    await coordinator.async_unlock_platform(CHILD, "Windows")
+    assert web.overrides == []
+    assert coordinator._accounts[CHILD].blocked_platforms == []
+    assert web.reads == 2  # one target read per action, no read-back
+
+
+async def test_cancel_500_is_judged_by_retried_reads(coordinator):
+    """After a 500 the GET may lag too: read again until it settles."""
+    web = coordinator.web_api
+    web.overrides = [{"overrideType": "BlockUntil", "validUntil": _iso(dt_util.utcnow() + timedelta(hours=1))}]
+    web.post_error = FamilySafetyWebAPIError(ERROR_500)
+    web.lag_reads = 2
+    await coordinator.async_unlock_platform(CHILD, "Windows")
+    assert web.reads == 1 + 3  # target, two lagging reads, the settled one
+    assert coordinator._accounts[CHILD].blocked_platforms == []
+
+
+async def test_no_answer_body_falls_back_to_reads(coordinator):
+    web = coordinator.web_api
+    web.empty_answer = True
+    await coordinator.async_lock_platform(CHILD, "Windows")
+    assert web.reads == 2
+    assert coordinator._accounts[CHILD].blocked_platforms == ["Windows"]
+
+
+async def test_lagging_poll_does_not_undo_our_write(coordinator):
+    """For two minutes after our Cancel, a poll still listing the lock is not believed."""
+    web = coordinator.web_api
+    await coordinator.async_lock_platform(CHILD, "Windows")
+    await coordinator.async_unlock_platform(CHILD, "Windows")
+    stale = MagicMock(user_id=CHILD, blocked_platforms=["Windows"])
+    assert coordinator._merge_blocked_platforms(stale) == []
+    # The next lock's target read sees our Cancel, not the lagging lock.
+    web.lag_reads = 5
+    entry_read = await coordinator._async_read_mobile_overrides(CHILD)
+    assert entry_read["lockablePlatforms"][0]["overrides"] == []
+    # After the grace period the poll is believed again.
+    key = (CHILD, "Windows")
+    written, entry = coordinator._mobile_writes[key]
+    coordinator._mobile_writes[key] = (written - timedelta(minutes=3), entry)
+    assert coordinator._merge_blocked_platforms(stale) == ["Windows"]
+    assert key not in coordinator._mobile_writes
