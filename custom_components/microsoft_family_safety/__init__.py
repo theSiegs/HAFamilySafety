@@ -439,19 +439,26 @@ def _register_services(hass: HomeAssistant) -> None:
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Delete what this entry keeps: the Xbox token, the platform holds, the
-    site-list sync record and the paused apps."""
+    """Delete what this entry keeps: the Xbox token, the platform holds and
+    extra time records, the site-list sync record and the paused apps."""
     from homeassistant.helpers import issue_registry as ir
     from homeassistant.helpers.storage import Store
 
     from .app_pause import AppPauser
-    from .coordinator import PLATFORM_HOLD_STORAGE_KEY, STORAGE_VERSION
+    from .coordinator import (
+        PLATFORM_HOLD_STORAGE_KEY,
+        STORAGE_VERSION,
+        TIME_BONUS_STORAGE_KEY,
+    )
     from .xbox_family_api import XboxFamilyAPI
 
     await XboxFamilyAPI(hass, entry.entry_id).async_unlink()
     ir.async_delete_issue(hass, DOMAIN, f"xbox_link_{entry.entry_id}")
     await Store(
         hass, STORAGE_VERSION, f"{PLATFORM_HOLD_STORAGE_KEY}.{entry.entry_id}"
+    ).async_remove()
+    await Store(
+        hass, STORAGE_VERSION, f"{TIME_BONUS_STORAGE_KEY}.{entry.entry_id}"
     ).async_remove()
     await site_sync_store(hass, entry.entry_id).async_remove()
     await AppPauser(hass, entry.entry_id).async_remove()

@@ -331,7 +331,7 @@ An app used on two platforms has a different id on each, so it is listed once pe
 | App Limits | `switch.{prefix}_app_limits` | The "App, feature, and game limits" toggle above the app list. While it is OFF, the per-app time limits are kept but not enforced. |
 | Web Filtering | `switch.{prefix}_web_filtering` | ON = Microsoft filters inappropriate websites and searches in Microsoft Edge, and the blocked and allowed lists apply. Same write as the `toggle_web_filter` action. |
 | App Block | `switch.{prefix}_app_{appname}` | ON = app blocked. One switch per application. |
-| Platform Lock | `switch.{prefix}_{platform}_lock` | ON = platform locked. Windows and Mobile are locked through the mobile API's device override, the Xbox through the [Xbox Family Settings](#xbox) sign-in (an error without it). Use **Account Lock** to lock every platform at once. Turning it off cancels whatever lock is in force (it does not put back an earlier one, unlike `unlock_platform`). Attributes `user_id`, `platform`, `blocked`, and who decides the lock: `hold` (`ours`, `parent` or `none`), `override` (`blockUntil`, `allowUntil`, `none`, or null when unreadable), `override_until` and `allow_until` (local ISO time or null), see [below](#platform-locks-and-a-parents-own-changes). |
+| Platform Lock | `switch.{prefix}_{platform}_lock` | ON = platform locked. Windows and Mobile are locked through the mobile API's device override, the Xbox through the [Xbox Family Settings](#xbox) sign-in (an error without it). Use **Account Lock** to lock every platform at once. Turning it off cancels whatever lock is in force (it does not put back an earlier one, unlike `unlock_platform`). Attributes `user_id`, `platform`, `blocked`, and who decides the lock: `hold` (`ours`, `bonus_ours`, `parent` or `none`), `override` (`blockUntil`, `allowUntil`, `none`, or null when unreadable), `override_until` and `allow_until` (local ISO time or null), see [below](#platform-locks-and-a-parents-own-changes). |
 
 ### Buttons — Per Child Account
 
@@ -435,9 +435,10 @@ data:
 
 - Microsoft keeps **one** Xbox override, so extra time replaces a lock. While the Xbox is locked (by `lock_platform` or by a parent in the app), `add_time_bonus` is refused unless you pass `replace_lock: true`.
 - The extra time is believed only when Microsoft's answer lists it ending when asked; otherwise the action fails. If a lock is still listed afterwards, the action fails and the lock stays.
-- While extra time runs, the Xbox lock switch reads off (Microsoft reports `allowUntil`).
+- While extra time runs, the Xbox lock switch reads off (Microsoft reports `allowUntil`). Extra time given here is remembered as the integration's own: the `hold` attribute reads `bonus_ours` (not `parent`) while it is in force.
+- Given with `replace_lock: true` over a lock placed by `lock_platform`, the integration keeps that lock's hold: strict mode never locks over the extra time, and once the extra time ends (or `cancel_time_bonus` ends it) the lock goes back on until its own end. `unlock_platform` during that extra time forgets the lock and leaves the extra time running (`applied: "bonus_kept"`).
 - `cancel_time_bonus` only ever cancels extra time. While the Xbox is locked it fails without sending anything (the cancel would lift the lock too); with no extra time in force it does nothing.
-- Both can answer with what they did (`response_variable`): `add_time_bonus` with `{added, until, replaced_lock}`, `cancel_time_bonus` with `{cancelled: true, lock_in_force}` or `{cancelled: false, reason: "no_extra_time"}`.
+- Both can answer with what they did (`response_variable`): `add_time_bonus` with `{added, until, applied_until, replaced_lock, hold_kept}`, `cancel_time_bonus` with `{cancelled: true, lock_in_force}` (plus `lock_restored: true` and `lock_until` when a lock of the integration's was put back) or `{cancelled: false, reason: "no_extra_time"}`.
 - Windows has no confirmed request for extra time yet, so only `platform: "Xbox"` (the default) is accepted.
 
 ```yaml
@@ -483,6 +484,7 @@ Both actions can answer with what they did (`response_variable`), `{prior, appli
 | `"parent_lock_kept"` | (`lock_platform`) A longer lock that is not the integration's is in force; nothing was sent, see `current` |
 | `"hold_expired"` | The integration's lock had already run out; nothing was sent |
 | `"not_locked"` | The integration's lock never went through; nothing was sent |
+| `"bonus_kept"` | (`unlock_platform`) Extra time the integration gave is in force (it replaced the lock); nothing was sent and the extra time keeps running, see `current` |
 
 `unlock_platform` adds `prior_unknown: true` when the state before the lock could not be read, and `state_unknown: true` when the state at unlock could not be read. `until` may be at most 168 hours away, like `duration_hours`.
 
@@ -503,7 +505,7 @@ The platform lock switches show the same as attributes, for automations that mus
 
 | Attribute | Values |
 |-----------|--------|
-| `hold` | `ours` (the integration's lock, still as it was placed), `parent` (a lock or extra time the integration did not place, or its own lock changed elsewhere), `none` (nothing in force, nothing held) |
+| `hold` | `ours` (the integration's lock, still as it was placed), `bonus_ours` (extra time given by `add_time_bonus` is in force), `parent` (a lock or extra time the integration did not place, or its own lock changed elsewhere), `none` (nothing in force, nothing held) |
 | `override` | `blockUntil`, `allowUntil`, `none`, or null when it could not be read |
 | `override_until` | When the lock or extra time in force ends (local ISO time), or null |
 | `allow_until` | When extra time in force ends (local ISO time), or null |
