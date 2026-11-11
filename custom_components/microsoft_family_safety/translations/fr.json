@@ -3,14 +3,14 @@
     "step": {
       "user": {
         "title": "Microsoft Family Safety",
-        "description": "Configurez l'intégration. Après validation, Home Assistant ouvre la connexion Microsoft via un proxy d'authentification temporaire. Connectez-vous avec le compte parent et répondez **Oui** à « Rester connecté ? » : c'est ce qui garde la session Family valide environ un an plutôt que quelques heures. Si Home Assistant n'est pas accessible en HTTPS, le HTTP local peut être activé explicitement pour des tests ; les identifiants Microsoft ne sont alors pas chiffrés sur le réseau local.",
+        "description": "Configurez l'intégration. Après validation, Home Assistant ouvre la connexion Microsoft via un proxy d'authentification temporaire : connectez-vous avec le compte parent. Si Home Assistant n'est pas accessible en HTTPS, le HTTP local peut être activé explicitement pour des tests ; les identifiants Microsoft ne sont alors pas chiffrés sur le réseau local. Sans l'un ni l'autre, l'étape suivante vous permet de coller à la main l'adresse de redirection de Microsoft.",
         "data": {
           "update_interval": "Intervalle de mise à jour (secondes)",
           "platforms": "Plateformes surveillées",
           "allow_insecure_http_auth": "Autoriser l'authentification HTTP locale non sécurisée (tests uniquement)"
         },
         "data_description": {
-          "platforms": "Windows, Xbox, Mobile : un interrupteur de verrouillage par plateforme cochée. Cocher Xbox active aussi le temps de jeu et le verrou Xbox, qui nécessitent la session web Microsoft (certains comptes doivent la renouveler par une connexion toutes les 24 heures). Laissez Xbox décoché si vos enfants n'ont pas de Xbox : l'intégration fonctionne alors uniquement avec le jeton mobile, avec une connexion plus courte."
+          "platforms": "Windows, Xbox, Mobile : un interrupteur de verrouillage par plateforme cochée. Cocher Xbox ajoute aussi le verrou et les limites Xbox, qui passent par la connexion Xbox Family Settings (liée pendant la connexion Microsoft quand c'est possible, sinon depuis les options). Laissez Xbox décoché si vos enfants n'ont pas de Xbox."
         }
       },
       "auth": {
@@ -22,41 +22,24 @@
       },
       "reauth_confirm": {
         "title": "Ré-authentifier Microsoft Family Safety",
-        "description": "La connexion Microsoft enregistrée est incomplète, expirée ou révoquée. Continuez pour relancer la connexion complète et renouveler à la fois le jeton de rafraîchissement mobile et la session web Family."
+        "description": "La connexion Microsoft enregistrée est incomplète, expirée ou révoquée. Continuez pour vous reconnecter et renouveler le jeton de rafraîchissement de l'intégration."
       },
       "reauth_full_confirm": {
         "title": "Ré-authentifier Microsoft Family Safety",
-        "description": "L'authentification Microsoft enregistrée est incomplète, expirée ou révoquée. Continuez pour vous reconnecter ; répondez **Oui** à « Rester connecté ? » pour que la session renouvelée dure. Si cette instance Home Assistant n'est joignable qu'en HTTP local privé, activez l'option de test HTTP local ci-dessous.",
+        "description": "La connexion Microsoft enregistrée est incomplète, expirée ou révoquée. Continuez pour vous reconnecter avec le même compte parent. Si cette instance Home Assistant n'est joignable qu'en HTTP local privé, activez l'option de test HTTP local ci-dessous.",
         "data": {
           "allow_insecure_http_auth": "Autoriser l'authentification HTTP locale non sécurisée (tests uniquement)"
         }
       },
-      "reauth_success": {
-        "title": "Connexion Microsoft Family Safety terminée",
-        "description": "L'authentification Microsoft s'est terminée avec succès et les nouveaux identifiants sont prêts à être enregistrés. Cliquez sur Valider pour terminer la ré-authentification."
-      },
       "check_mobile_proxy": {
         "title": "Connexion Microsoft",
-        "description": "Connectez-vous avec le compte Microsoft qui gère la famille, et répondez **Oui** quand Microsoft demande « Rester connecté ? ». Laissez la fenêtre d'authentification ouverte : une fois la connexion visible terminée, Home Assistant passe sur un écran d'attente pendant que la session Family et le jeton mobile sont établis."
-      },
-      "check_proxy": {
-        "title": "Session web Microsoft Family",
-        "description": "**Connectez-vous dans la fenêtre qui vient de s'ouvrir**, avec le compte Microsoft qui gère la famille, et répondez **Oui** à « Rester connecté ? ».\n\nRevenez ensuite ici et **patientez** : cette fenêtre continue toute seule, ce qui peut prendre jusqu'à une minute environ après la connexion. Ne cliquez pas à nouveau sur *Ouvrir le site*, sauf si la fenêtre Microsoft ne s'est jamais ouverte ou a été fermée avant la connexion."
-      },
-      "auth_success": {
-        "title": "Connexion Microsoft Family Safety terminée",
-        "description": "Connexion Microsoft terminée : la session web Family et le jeton mobile sont prêts. Cliquez sur Continuer pour créer l'intégration.",
-        "submit": "Continuer"
-      },
-      "wait_family_proxy": {
-        "title": "Finalisation de la connexion Microsoft Family Safety"
+        "description": "Connectez-vous, dans la fenêtre qui s'est ouverte, avec le compte Microsoft qui gère la famille. Laissez-la ouverte jusqu'à la fin de la connexion Microsoft : Home Assistant continue ensuite tout seul."
       }
     },
     "error": {
       "auth_failed": "Échec de l'authentification.",
       "token_expired": "Authentification expirée.",
       "no_redirect_url": "Veuillez saisir une URL de redirection valide.",
-      "native_https_required": "L'authentification automatique par navigateur nécessite normalement HTTPS. Pour des tests locaux, vous pouvez activer explicitement l'authentification HTTP locale non sécurisée.",
       "unknown": "Erreur d'authentification inattendue.",
       "native_http_not_local": "L'authentification HTTP non sécurisée n'est autorisée que via localhost, .local ou une adresse IP privée/locale."
     },
@@ -64,21 +47,19 @@
       "already_configured": "Ce compte est déjà configuré.",
       "reauth_successful": "Ré-authentification réussie !",
       "reconfigure_successful": "Reconfiguration réussie !",
-      "native_auth_failed": "L'authentification web Microsoft ne s'est pas terminée correctement.",
       "native_auth_state_lost": "Le processus d'authentification par navigateur a expiré. Veuillez recommencer.",
-      "native_auth_unavailable": "L'authentification web native n'a pas pu être chargée : {error}",
+      "native_auth_unavailable": "La connexion par navigateur n'a pas pu être chargée : {error}",
       "native_oauth_failed": "La connexion OAuth Microsoft Family Safety ne s'est pas terminée correctement.",
-      "wrong_account": "Un compte Microsoft différent a été utilisé. Veuillez ré-authentifier le même compte Family Safety."
-    },
-    "progress": {
-      "family_sso": "La connexion Microsoft est terminée. Home Assistant finalise la session Family dans la fenêtre ouverte et récupère le jeton mobile. Cela peut prendre jusqu'à 60 secondes environ. Laissez la fenêtre Microsoft ouverte ; aucune action n'est requise."
+      "wrong_account": "Un compte Microsoft différent a été utilisé. Veuillez ré-authentifier le même compte Family Safety.",
+      "native_https_required": "L'authentification automatique par navigateur nécessite HTTPS. Pour des tests locaux, vous pouvez activer explicitement l'authentification HTTP locale non sécurisée.",
+      "native_http_not_local": "L'authentification HTTP non sécurisée n'est autorisée que via localhost, .local ou une adresse IP privée/locale."
     }
   },
   "options": {
     "step": {
       "init": {
         "title": "Options Microsoft Family Safety",
-        "description": "Configurez l'interrogation, les plateformes et le repli optionnel vers l'add-on legacy.",
+        "description": "Configurez l'interrogation, les plateformes, les utilisateurs autorisés et la liaison Xbox Family Settings.",
         "data": {
           "update_interval": "Intervalle de mise à jour (secondes)",
           "platforms": "Plateformes surveillées",
@@ -87,9 +68,9 @@
           "xbox_link": "Lier la connexion Xbox Family Settings"
         },
         "data_description": {
-          "platforms": "Windows, Xbox, Mobile : un interrupteur de verrouillage par plateforme cochée. Cocher Xbox active aussi le temps de jeu et le verrou Xbox, qui nécessitent la session web Microsoft (certains comptes doivent la renouveler par une connexion toutes les 24 heures). Laissez Xbox décoché si vos enfants n'ont pas de Xbox : l'intégration fonctionne alors uniquement avec le jeton mobile, avec une connexion plus courte.",
+          "platforms": "Windows, Xbox, Mobile : un interrupteur de verrouillage par plateforme cochée. Cocher Xbox ajoute aussi le verrou et les limites Xbox, qui passent par la connexion Xbox Family Settings (liée pendant la connexion Microsoft quand c'est possible, sinon depuis les options). Laissez Xbox décoché si vos enfants n'ont pas de Xbox.",
           "allowed_users": "Laisser vide pour que tous les utilisateurs puissent utiliser les boutons et réglages (par défaut). Dès que des utilisateurs sont cochés, seuls eux et les administrateurs le peuvent : le compte non administrateur d'un enfant est refusé sur chaque bouton, interrupteur, limite et horaire, et sur les actions microsoft_family_safety. Les automatisations et scripts lancés par Home Assistant ne sont pas concernés. Donnez à l'enfant un compte non administrateur : un administrateur peut modifier cette option.",
-          "xbox_link": "Les limites Xbox, le verrouillage Xbox et le temps de jeu Xbox passent alors par le service de l'application Xbox Family Settings, avec leur propre connexion, sans la session web. Uniquement si Xbox est coché. La liaison se fait en général automatiquement après une connexion ; cochez ceci si le capteur Connexion indique xbox_family: not_linked."
+          "xbox_link": "Les limites Xbox, le verrouillage Xbox et le temps de jeu Xbox passent alors par le service de l'application Xbox Family Settings, avec leur propre connexion. Uniquement si Xbox est coché. La liaison se fait en général automatiquement pendant la connexion Microsoft ; cochez ceci si le capteur Connexion indique xbox_family: not_linked."
         }
       },
       "xbox_link": {

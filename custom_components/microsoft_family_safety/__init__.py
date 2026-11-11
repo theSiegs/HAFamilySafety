@@ -43,8 +43,6 @@ from .const import (
 )
 from .coordinator import FamilySafetyDataUpdateCoordinator
 from .permissions import guard_service
-from ._httpx_web_adapter import apply_httpx_web_transport_patch
-from ._httpx_web_tuning import apply_httpx_web_tuning_patch
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -81,7 +79,7 @@ SERVICE_DENY_REQUEST_SCHEMA = vol.Schema({
     vol.Required("request_id"): cv.string,
 })
 
-# New service schemas (web API)
+# Service schemas for the settings beyond pyfamilysafety
 
 SERVICE_SET_SCREENTIME_LIMIT_SCHEMA = vol.Schema({
     vol.Required("account_id"): cv.string,
@@ -176,11 +174,10 @@ def _get_coordinator(
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Microsoft Family Safety from a config entry."""
-    apply_httpx_web_transport_patch(hass)
-    apply_httpx_web_tuning_patch()
     coordinator = FamilySafetyDataUpdateCoordinator(hass, entry)
 
-    # Load persisted screentime policies (for lock/unlock survival across restarts)
+    # Load persisted screentime policies (for lock/unlock survival across
+    # restarts) and the rotated refresh token.
     await coordinator.async_load_saved_screentime()
 
     try:
