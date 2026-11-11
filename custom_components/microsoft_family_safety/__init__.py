@@ -42,10 +42,13 @@ from .const import (
     SERVICE_REQUEST_REAUTH,
     SERVICE_ADD_TIME_BONUS,
     SERVICE_CANCEL_TIME_BONUS,
+    SERVICE_SYNC_SITE_LIST,
+    SERVICE_GET_SITES,
     CONF_ALLOWED_USERS,
 )
-from .coordinator import FamilySafetyDataUpdateCoordinator
-from .permissions import guard_service
+from .coordinator import FamilySafetyDataUpdateCoordinator, site_sync_store
+from .permissions import async_require_admin, guard_service
+from .site_sync import MAX_SYNC_DOMAINS, https_url
 from .targeting import child_schema, resolve_account_id
 
 _LOGGER = logging.getLogger(__name__)
@@ -128,12 +131,15 @@ SERVICE_REMOVE_APP_TIME_LIMIT_SCHEMA = child_schema({
     vol.Optional("platform", default="windows"): vol.In(["windows", "xbox", "mobile"]),
 })
 
+# One site, or several (a list) applied one after the other.
+_WEBSITES = vol.All(cv.ensure_list, [cv.string], vol.Length(min=1))
+
 SERVICE_BLOCK_WEBSITE_SCHEMA = child_schema({
-    vol.Required("website"): cv.string,
+    vol.Required("website"): _WEBSITES,
 })
 
 SERVICE_REMOVE_WEBSITE_SCHEMA = child_schema({
-    vol.Required("website"): cv.string,
+    vol.Required("website"): _WEBSITES,
 })
 
 SERVICE_TOGGLE_WEB_FILTER_SCHEMA = child_schema({
@@ -153,6 +159,32 @@ SERVICE_LOCK_ACCOUNT_SCHEMA = child_schema({})
 SERVICE_UNLOCK_ACCOUNT_SCHEMA = child_schema({})
 
 SERVICE_REQUEST_REAUTH_SCHEMA = vol.Schema({})
+
+SERVICE_SYNC_SITE_LIST_SCHEMA = child_schema({
+    vol.Required("url"): https_url,
+    vol.Optional("max_domains", default=MAX_SYNC_DOMAINS): vol.All(
+        vol.Coerce(int), vol.Range(min=1, max=MAX_SYNC_DOMAINS)
+    ),
+    vol.Optional("stop", default=False): cv.boolean,
+})
+
+SERVICE_GET_SITES_SCHEMA = child_schema({})
+
+#: Services that answer (response_variable): lock_platform / unlock_platform
+#: with ``{"prior", "applied"}``, the extra time actions with what they gave
+#: or cancelled, sync_site_list with what it did, get_sites with what it read.
+_RESPONSE_SERVICES = {
+    SERVICE_LOCK_PLATFORM: SupportsResponse.OPTIONAL,
+    SERVICE_UNLOCK_PLATFORM: SupportsResponse.OPTIONAL,
+    SERVICE_ADD_TIME_BONUS: SupportsResponse.OPTIONAL,
+    SERVICE_CANCEL_TIME_BONUS: SupportsResponse.OPTIONAL,
+    SERVICE_SYNC_SITE_LIST: SupportsResponse.OPTIONAL,
+    SERVICE_GET_SITES: SupportsResponse.ONLY,
+}
+#: Services for administrators only, whatever the allowed-users option says:
+#: sync_site_list downloads a URL from inside Home Assistant, and get_sites
+#: answers with the list URLs it uses.
+_ADMIN_SERVICES = frozenset({SERVICE_SYNC_SITE_LIST, SERVICE_GET_SITES})
 
 
 def _get_coordinator(
@@ -226,17 +258,6 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
 #: The longest platform lock, as for duration_hours.
 _MAX_LOCK_HOURS = 168
-
-#: Actions that can answer with what they did (response_variable):
-#: lock_platform / unlock_platform with ``{"prior", "applied"}``, the extra
-#: time actions with what they gave or cancelled.
-_RESPONSE_SERVICES = frozenset({
-    SERVICE_LOCK_PLATFORM,
-    SERVICE_UNLOCK_PLATFORM,
-    SERVICE_ADD_TIME_BONUS,
-    SERVICE_CANCEL_TIME_BONUS,
-})
-
 
 def _lock_until(data: dict) -> datetime:
     """When a lock_platform lock ends: ``until``, or ``duration_hours`` from now."""
@@ -345,10 +366,16 @@ def _register_services(hass: HomeAssistant) -> None:
          lambda d: (d["account_id"],)),
         (SERVICE_REQUEST_REAUTH, SERVICE_REQUEST_REAUTH_SCHEMA, "async_request_reauth",
          lambda d: ()),
+        (SERVICE_SYNC_SITE_LIST, SERVICE_SYNC_SITE_LIST_SCHEMA, "async_sync_site_list",
+         lambda d: (d["account_id"], d["url"], d["max_domains"], d["stop"])),
+        (SERVICE_GET_SITES, SERVICE_GET_SITES_SCHEMA, "async_get_sites",
+         lambda d: (d["account_id"],)),
     ]
 
-    def make_handler(method_name, extract_args, per_child, responds):
+    def make_handler(method_name, extract_args, per_child, responds, admin_only):
         async def handler(call: ServiceCall) -> dict | None:
+            if admin_only:
+                await async_require_admin(hass, call)
             data = dict(call.data)
             if per_child:
                 # account_id as before, or any entity of the child.
@@ -366,7 +393,7 @@ def _register_services(hass: HomeAssistant) -> None:
                 raise HomeAssistantError(
                     f"Microsoft Family Safety {call.service} failed: {err}"
                 ) from err
-            if responds:
+            if responds and call.return_response:
                 return result if isinstance(result, dict) else {}
             return None
         return handler
@@ -377,19 +404,21 @@ def _register_services(hass: HomeAssistant) -> None:
             SERVICE_DENY_REQUEST_SCHEMA,
             SERVICE_REQUEST_REAUTH_SCHEMA,
         )
-        responds = name in _RESPONSE_SERVICES
+        supports_response = _RESPONSE_SERVICES.get(name, SupportsResponse.NONE)
+        responds = supports_response is not SupportsResponse.NONE
         hass.services.async_register(
             DOMAIN, name,
-            guard_service(hass, make_handler(method, extract, per_child, responds)),
-            schema=schema,
-            supports_response=(
-                SupportsResponse.OPTIONAL if responds else SupportsResponse.NONE
+            guard_service(
+                hass,
+                make_handler(method, extract, per_child, responds, name in _ADMIN_SERVICES),
             ),
+            schema=schema,
+            supports_response=supports_response,
         )
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Delete the Xbox Family Settings refresh token and the platform holds of this entry."""
+    """Delete what this entry keeps: the Xbox token, the platform holds and the site-list sync record."""
     from homeassistant.helpers import issue_registry as ir
     from homeassistant.helpers.storage import Store
 
@@ -401,6 +430,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     await Store(
         hass, STORAGE_VERSION, f"{PLATFORM_HOLD_STORAGE_KEY}.{entry.entry_id}"
     ).async_remove()
+    await site_sync_store(hass, entry.entry_id).async_remove()
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

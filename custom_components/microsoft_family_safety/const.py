@@ -136,6 +136,8 @@ SERVICE_UNLOCK_ACCOUNT: Final = "unlock_account"
 SERVICE_REQUEST_REAUTH: Final = "request_reauth"
 SERVICE_ADD_TIME_BONUS: Final = "add_time_bonus"
 SERVICE_CANCEL_TIME_BONUS: Final = "cancel_time_bonus"
+SERVICE_SYNC_SITE_LIST: Final = "sync_site_list"
+SERVICE_GET_SITES: Final = "get_sites"
 
 ALL_SERVICES: Final = [
     SERVICE_BLOCK_APP,
@@ -159,6 +161,8 @@ ALL_SERVICES: Final = [
     SERVICE_REQUEST_REAUTH,
     SERVICE_ADD_TIME_BONUS,
     SERVICE_CANCEL_TIME_BONUS,
+    SERVICE_SYNC_SITE_LIST,
+    SERVICE_GET_SITES,
 ]
 
 # Platforms

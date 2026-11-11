@@ -122,7 +122,7 @@ Service call / entity write
 | **Screen time monitoring** | Track daily usage per child and per device |
 | **Screen time policies** | Adjust daily allowances and allowed time intervals per day — directly from the UI |
 | **App management** | Block/unblock apps, set per-app time limits and windows |
-| **Web filtering** | Block/unblock domains, toggle content filtering, set PEGI age ratings |
+| **Web filtering** | Block/unblock domains (one or several per call), keep a published blocklist in sync, toggle content filtering (action or switch), set PEGI age ratings |
 | **Purchase controls** | Enable/disable ask-to-buy via service call |
 | **Request handling** | Approve or deny pending screen time requests from HA |
 | **Connection diagnostics** | A dedicated sensor reports whether the mobile API and the Xbox Family Settings sign-in are healthy |
@@ -247,7 +247,7 @@ For one child with no per-app switches, an account with Windows monitoring enabl
 | Platform | Count | What |
 |----------|-------|------|
 | `sensor` | 7 – 8 | Screen Time, Account Info, Applications, Pending Requests, Web Filter, Websites Visited, Screen Time Policy (+ Balance when the account exposes one) |
-| `switch` | 4 + platforms + apps | Account Lock, Screen Time Limits, Xbox Screen Time Limits, App Limits, one Platform Lock per monitored platform, one per application |
+| `switch` | 5 + platforms + apps | Account Lock, Screen Time Limits, Xbox Screen Time Limits, App Limits, Web Filtering, one Platform Lock per monitored platform, one per application |
 | `button` | 2 | Approve Request, Deny Request |
 | `number` | 7 (+7 Xbox) | one daily limit per day, plus one Xbox daily limit per day once the Xbox schedule is on |
 | `time` | 14 | 7 start + 7 end |
@@ -265,7 +265,7 @@ A typical single-child setup with a full app list lands around 85-90 entities.
 | Applications | `sensor.{prefix}_applications` | App count | `blocked_count`, `applications` |
 | Balance | `sensor.{prefix}_balance` | Account balance | *(monetary sensor, only if available)* |
 | Pending Requests | `sensor.{prefix}_pending_requests` | Request count | `requests` |
-| Web Filter | `sensor.{prefix}_web_filter` | enabled / disabled / unknown | `blockedSites`, `allowedSites`, `contentRatingAge`, `content_settings`, `max_age_rating`, `acquisition_policy` |
+| Web Filter | `sensor.{prefix}_web_filter` | enabled / disabled / unknown | `blockedSites`, `allowedSites`, `blocked_site_count`, `allowed_site_count`, `contentRatingAge`, `content_settings`, `max_age_rating`, `acquisition_policy` |
 | Websites Visited | `sensor.{prefix}_websites_visited` | Visits in Edge over the last 7 days | `report_available`, `site_count`, `blocked_count`, `sites` (50 most visited: `domain`, `visits`, `last_visit`, `blocked`), `searches` (50 latest search terms, one row per term: `search`, `visits`, `date`, `site`). Read every 30 min; `report_available: false` when Microsoft has no Edge data for the child. `sites` and `searches` are not stored in the history database |
 | Screen Time Policy | `sensor.{prefix}_screen_time_policy` | enabled / disabled / unknown | `monday_allowance` … `sunday_allowance`, `*_allowed_intervals`, `daily_restrictions` |
 
@@ -292,6 +292,7 @@ A typical single-child setup with a full app list lands around 85-90 entities.
 | **Screen Time Limits** | `switch.{prefix}_screen_time_limits` | OFF = the Windows schedule is turned off, every day kept as it is. ON = turned back on. Same switch as in the Family Safety app (before 2.0.20 it rewrote every day to 24 h). |
 | Xbox Screen Time Limits | `switch.{prefix}_xbox_screen_time_limits` | Turns the child's separate Xbox schedule on or off (the days are kept). Once it is on, seven `number.{prefix}_xbox_{day}_limit` entities set the daily Xbox allowance the console enforces. Not created without Xbox among the monitored platforms. |
 | App Limits | `switch.{prefix}_app_limits` | The "App, feature, and game limits" toggle above the app list. While it is OFF, the per-app time limits are kept but not enforced. |
+| Web Filtering | `switch.{prefix}_web_filtering` | ON = Microsoft filters inappropriate websites and searches in Microsoft Edge, and the blocked and allowed lists apply. Same write as the `toggle_web_filter` action. |
 | App Block | `switch.{prefix}_app_{appname}` | ON = app blocked. One switch per application. |
 | Platform Lock | `switch.{prefix}_{platform}_lock` | ON = platform locked. Windows and Mobile are locked through the mobile API's device override, the Xbox through the [Xbox Family Settings](#xbox) sign-in (an error without it). Use **Account Lock** to lock every platform at once. Turning it off cancels whatever lock is in force (it does not put back an earlier one, unlike `unlock_platform`). Attributes `user_id`, `platform`, `blocked`, and who decides the lock: `hold` (`ours`, `parent` or `none`), `override` (`blockUntil`, `allowUntil`, `none`, or null when unreadable), `override_until` and `allow_until` (local ISO time or null), see [below](#platform-locks-and-a-parents-own-changes). |
 
@@ -346,7 +347,7 @@ automation:
 
 ## Services
 
-The integration exposes **20 services**, split between the pyfamilysafety library, the integration's own mobile API calls and the Xbox Family Settings service, plus one to start the sign-in flow on demand.
+The integration exposes **22 services**, split between the pyfamilysafety library, the integration's own mobile API calls and the Xbox Family Settings service, plus one to start the sign-in flow on demand.
 
 Every service that acts on one child takes the child either as `account_id` (the Microsoft user ID, shown in the `user_id` attribute of the child's entities) or as `entity_id`: any Microsoft Family Safety entity of that child or of one of its devices. The account is looked up from the entity, so automations need no hard-coded ID. A list of entities is accepted as long as they all belong to the same child. When both are given, `account_id` wins.
 
@@ -582,12 +583,43 @@ data:
 ```
 
 ```yaml
+# Block several websites in one call (also works for allow_website and remove_website)
+service: microsoft_family_safety.block_website
+data:
+  account_id: "1234567890123456"
+  website:
+    - "example.com"
+    - "example.net"
+```
+
+```yaml
 # Toggle web content filtering
 service: microsoft_family_safety.toggle_web_filter
 data:
   account_id: "1234567890123456"
   enabled: true
 ```
+
+```yaml
+# Keep the blocked websites in step with a published list (administrators only)
+service: microsoft_family_safety.sync_site_list
+data:
+  account_id: "1234567890123456"
+  url: "https://example.com/blocklist.txt"
+response_variable: sync
+```
+
+`sync_site_list` reads a plain-text list over https (one domain per line, `#` comments, up to 1 MiB, redirects not followed). It blocks the listed domains that are not blocked yet and, on later runs, unblocks only the domains this same list added and has since dropped. Sites blocked by hand and allowed sites are never touched, and a domain that overlaps an allowed site is skipped. Which domains a list added is kept per child in Home Assistant's storage. An empty or failed download, a list that would take back more than half of what it added, or an answer from Microsoft without any of the sites the list added changes nothing. `stop: true` removes everything the list added and forgets it. The response gives counts and examples of `added`, `removed`, `kept`, `skipped_allowed`, `failed` and `ignored`. Run it from an automation to keep a list current, for example once a day.
+
+```yaml
+# Read the blocked and allowed websites (administrators only)
+service: microsoft_family_safety.get_sites
+data:
+  account_id: "1234567890123456"
+response_variable: sites
+```
+
+`get_sites` answers with `blocked` and `allowed` as Microsoft stores them (absolute URLs), `filter_enabled`, and `from_list` / `from_list_by_url`: the blocked domains that `sync_site_list` added, so they can be told apart from sites blocked by hand.
 
 ### Content & Purchase Controls
 
@@ -840,7 +872,7 @@ Be aware of the following before enabling native authentication:
 | Method | Endpoint | Description | Used by |
 |--------|----------|-------------|---------|
 | GET / PATCH | `/v4/devicelimits/schedules/{childId}` | Windows and Xbox schedules (allowance and time windows per day, on/off) | `sensor.screen_time_policy`, `number.*_limit`, `time.*_start/end`, `switch.lock`, `switch.screen_time_limits`, `switch.xbox_screen_time_limits` |
-| GET / PATCH | `/v1/WebRestrictions/{childId}` | Web filter and the blocked / allowed sites (`exceptions=true`) | `sensor.web_filter`, website services |
+| GET / PATCH | `/v1/WebRestrictions/{childId}` | Web filter and the blocked / allowed sites (`exceptions=true`); block/allow/remove a website (one operation per site), web filter on/off | `sensor.web_filter`, `switch.web_filtering`, website services, `get_sites`, `sync_site_list` |
 | GET / PATCH | `/v1/ContentRestrictions/{childId}` | Age rating & ask-to-buy | `sensor.web_filter` attributes, services |
 | GET / PATCH | `/v2/AppLimits/settings/{childId}` | "App, feature, and game limits" switch | `switch.app_limits` |
 | PATCH | `/v3/AppLimits/policies/{childId}/{appId}` | Per-app time limits | app time limit services |
