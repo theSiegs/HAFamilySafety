@@ -161,3 +161,23 @@ async def test_lock_switch_attributes_for_windows_and_xbox(rig):
     coord.data["accounts"][int(CHILD)]["xbox_override"] = None
     attrs = xbox_lock.extra_state_attributes
     assert (attrs["hold"], attrs["override"], attrs["override_until"]) == ("none", None, None)
+
+
+async def test_entities_are_told_once_the_hold_is_saved(rig):
+    """The write refreshes before the hold is confirmed; a last push follows."""
+    coord, _, _ = rig
+    seen: list[tuple[str, bool | None]] = []
+
+    def listener() -> None:
+        hold = coord.platform_hold(CHILD, "Xbox")
+        seen.append(("lock", None if hold is None else bool(hold.get("confirmed"))))
+
+    unsub = coord.async_add_listener(listener)
+    try:
+        await coord.async_lock_platform(CHILD, "Xbox", _hours(2))
+        assert seen and seen[-1] == ("lock", True)
+        seen.clear()
+        await coord.async_unlock_platform(CHILD, "Xbox")
+        assert seen
+    finally:
+        unsub()

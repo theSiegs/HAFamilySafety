@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import asyncio
+import functools
 import hashlib
 import json
 import logging
@@ -93,6 +94,24 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _updates_listeners(func):
+    """Push the entities again once a hold change is done.
+
+    The write inside refreshes the entities before the hold it changes is
+    saved, so without this they show the hold from before (a lock of ours
+    read as ``parent``) until the next poll.
+    """
+
+    @functools.wraps(func)
+    async def wrapper(self, *args, **kwargs):
+        try:
+            return await func(self, *args, **kwargs)
+        finally:
+            self.async_update_listeners()
+
+    return wrapper
 STORAGE_KEY = f"{DOMAIN}.saved_screentime"
 STORAGE_VERSION = 1
 AUTH_STORAGE_VERSION = 1
@@ -1173,6 +1192,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             and abs(ours - theirs) <= self._OWN_LOCK_TOLERANCE
         )
 
+    @_updates_listeners
     async def async_lock_platform(
         self, account_id: str, platform: str, valid_until: datetime | None = None
     ) -> dict[str, Any]:
@@ -1259,6 +1279,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await self._async_save_time_bonuses()
             return {"prior": dict(hold["prior"]), "applied": make_override(BLOCK_UNTIL, target)}
 
+    @_updates_listeners
     async def async_unlock_platform(self, account_id: str, platform: str) -> dict[str, Any]:
         """Unlock a platform, putting back the override saved by the first lock.
 
