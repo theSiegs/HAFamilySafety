@@ -26,6 +26,7 @@ from homeassistant.util import dt as dt_util
 
 from ._pyfamilysafety_compat import apply_patches, is_stale_roster_error
 from .api_client import FamilySafetyWebAPI
+from .app_usage import EVENT_APP_USAGE, AppUsageGrowthTracker
 from .auth.addon_client import AddonCookieClient
 from .xbox_family_api import (
     OVERRIDE_BLOCK,
@@ -39,7 +40,9 @@ from .xbox_family_api import (
     usage_today,
 )
 from .const import (
+    CONF_APP_USAGE_SENSORS,
     CONF_XBOX_FEATURES,
+    DEFAULT_APP_USAGE_SENSORS,
     DEFAULT_XBOX_FEATURES,
     CONF_API_KEY,
     CONF_AUTH_URL,
@@ -221,6 +224,11 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: monotonic time before which no silent Xbox link is attempted again.
         self._xbox_link_retry_at = 0.0
         self._xbox_auth_warned = False
+        #: How many of each child's most used apps get a usage sensor; 0 = off.
+        self.app_usage_sensors = int(
+            entry.options.get(CONF_APP_USAGE_SENSORS, DEFAULT_APP_USAGE_SENSORS) or 0
+        )
+        self._app_usage_tracker = AppUsageGrowthTracker()
 
     @property
     def _native_web_auth(self) -> bool:
@@ -2038,6 +2046,8 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self._async_sync_roster_notification(accounts_data)
             self._accounts = new_accounts
             self._devices = new_devices
+            if self.app_usage_sensors > 0:
+                self._fire_app_usage_events(accounts_data)
             pending = getattr(self.api, "pending_requests", None) or []
             self._is_retrying_auth = False
             return {"accounts": accounts_data, "devices": devices_data, "pending_requests": pending}
@@ -2061,6 +2071,22 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.debug(
                     "Could not persist rotated Family Safety credentials: %s",
                     persist_err,
+                )
+
+    def _fire_app_usage_events(self, accounts_data: dict[str, Any]) -> None:
+        """Fire microsoft_family_safety_app_usage for each app that grew since the last poll."""
+        for account_id, account in accounts_data.items():
+            for grew in self._app_usage_tracker.update(
+                account_id, account.get("screen_time_date") or "", account.get("applications")
+            ):
+                self.hass.bus.async_fire(
+                    EVENT_APP_USAGE,
+                    {
+                        "entry_id": self.entry.entry_id,
+                        "account_id": str(account_id),
+                        "first_name": account.get("first_name"),
+                        **grew,
+                    },
                 )
 
     async def _create_auth_notification(self) -> None:

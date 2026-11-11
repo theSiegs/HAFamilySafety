@@ -181,6 +181,7 @@ Legacy and native mode are mutually exclusive per config entry; there is no auto
 | Update interval (seconds) | 30 – 3600 | 300 (5 min) | |
 | Monitored platforms | Windows / Xbox / Mobile | Windows | One lock switch per platform. Xbox also decides whether the web session is used, see [below](#xbox-and-the-web-session) |
 | Users allowed to control Microsoft Family Safety | list of Home Assistant users | *(empty: everybody)* | See [Who can control the integration](#who-can-control-the-integration) |
+| App usage sensors per child | 0 – 30 | 0 (off) | How many of each child's most used apps today get an [App Usage](#sensors--per-child-account) sensor; also turns on the [`microsoft_family_safety_app_usage`](#events) event |
 | Allow insecure local HTTP authentication (testing only) | on / off | off | See below |
 
 #### Who can control the integration
@@ -268,7 +269,7 @@ For one child with no per-app switches, an account with Windows monitoring enabl
 
 | Platform | Count | What |
 |----------|-------|------|
-| `sensor` | 7 – 8 | Screen Time, Account Info, Applications, Pending Requests, Web Filter, Websites Visited, Screen Time Policy (+ Balance when the account exposes one) |
+| `sensor` | 7 – 8 | Screen Time, Account Info, Applications, Pending Requests, Web Filter, Websites Visited, Screen Time Policy (+ Balance when the account exposes one, + App Usage sensors when turned on) |
 | `switch` | 4 + platforms + apps | Account Lock, Screen Time Limits, Xbox Screen Time Limits, App Limits, one Platform Lock per monitored platform, one per application |
 | `button` | 2 | Approve Request, Deny Request |
 | `number` | 7 (+7 Xbox) | one daily limit per day, plus one Xbox daily limit per day once the Xbox schedule is on |
@@ -282,14 +283,27 @@ A typical single-child setup with a full app list lands around 85-90 entities.
 
 | Entity | Entity ID | State | Key Attributes |
 |--------|-----------|-------|----------------|
-| Screen Time | `sensor.{prefix}_screen_time` | Minutes used today | `formatted_time`, `hours`, `minutes`, `average_screentime`, `date`, `raw_microsoft_minutes`, `last_api_poll`, `update_interval_seconds` |
+| Screen Time | `sensor.{prefix}_screen_time` | Minutes used today | `formatted_time`, `hours`, `minutes`, `average_screentime`, `date`, `raw_microsoft_minutes`, `last_api_poll`, `update_interval_seconds`, `apps` (the apps used today, see below) |
 | Account Info | `sensor.{prefix}_account_info` | Full name | `user_id`, `first_name`, `surname`, `profile_picture`, `device_count` |
-| Applications | `sensor.{prefix}_applications` | App count | `blocked_count`, `applications` |
+| Applications | `sensor.{prefix}_applications` | App count | `blocked_count`, `blocked_apps` (up to 20 names), `top_apps` (the 5 most used today), `applications` (every app as Microsoft lists it, with icons), `apps` (every app, see below). `applications` and `apps` are not stored in the history database: with icons the list can exceed its size limit |
+| App Usage | `sensor.{prefix}_{app}_usage` | Minutes the app was used today | `app_id`, `app_name`, `platform`, `blocked`. Opt-in: only with **App usage sensors per child** above 0, for each child's most used apps today, up to that number. An app keeps its sensor once it has one |
 | Balance | `sensor.{prefix}_balance` | Account balance | *(monetary sensor, only if available)* |
 | Pending Requests | `sensor.{prefix}_pending_requests` | Request count | `requests` |
 | Web Filter | `sensor.{prefix}_web_filter` | enabled / disabled / unknown | `blockedSites`, `allowedSites`, `contentRatingAge`, `content_settings`, `max_age_rating`, `acquisition_policy` |
 | Websites Visited | `sensor.{prefix}_websites_visited` | Visits in Edge over the last 7 days | `report_available`, `site_count`, `blocked_count`, `sites` (50 most visited: `domain`, `visits`, `last_visit`, `blocked`), `searches` (50 latest search terms, one row per term: `search`, `visits`, `date`, `site`). Read every 30 min; `report_available: false` when Microsoft has no Edge data for the child. `sites` and `searches` are not stored in the history database |
 | Screen Time Policy | `sensor.{prefix}_screen_time_policy` | enabled / disabled / unknown | `monday_allowance` … `sunday_allowance`, `*_allowed_intervals`, `daily_restrictions` |
+
+**The `apps` attribute** is a compact list of the child's apps, most used today first, without icons:
+
+```yaml
+apps:
+  - package: "x:1234567890"   # Microsoft's app id; the prefix gives the platform
+    name: "Racing Game"
+    minutes: 42.0             # minutes used today
+    platform: Xbox            # Windows (appx:, win32:), Xbox (x:), Mobile (a:) or null
+```
+
+An app used on two platforms has a different id on each, so it is listed once per platform. The Screen Time sensor lists only the apps used today; the Applications sensor lists every app.
 
 ### Sensors — Per Physical Device
 
@@ -342,6 +356,12 @@ One entity per day of the week (Sunday through Saturday). Adjustable directly fr
 One start/end pair per day of the week, editable from the UI with optimistic updates.
 
 > **The `time.*_end` entities are now populated.** They existed before but stayed `unknown` on many accounts because the end of the allowed window was not parsed from Microsoft's response. Interval parsing now reads the `timeline` array and the *last* allowed interval, so both ends of the window are correct. Microsoft's `24:00:00` end-of-day value is clamped to `23:59`.
+
+### Events
+
+| Event | When | Data |
+|-------|------|------|
+| `microsoft_family_safety_app_usage` | An app's minutes today grew between two updates (at least 0.5 min). Only with **App usage sensors per child** above 0. The first update of a day, or after a restart, only sets the baseline | `entry_id`, `account_id`, `first_name`, `app_id`, `app_name`, `platform`, `grew_minutes`, `today_minutes` |
 
 ---
 
