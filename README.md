@@ -382,16 +382,17 @@ data:
   platform: "Windows"
 ```
 
-#### Xbox extra time
+#### Extra time (Xbox and Windows)
 
-`add_time_bonus` gives a child extra time on the Xbox, for some `minutes` (1 – 1440) or `until` a time (at most 24 hours ahead); `cancel_time_bonus` takes it back. Both go through the Xbox Family Settings service (the same "add time" as the Xbox Family Settings app), so they need **Xbox** among the monitored platforms and the Xbox Family Settings sign-in linked; otherwise they fail with an error saying so. They never use the web session.
+`add_time_bonus` gives a child extra time, for some `minutes` (1 – 1440) or `until` a time (at most 24 hours ahead); `cancel_time_bonus` takes it back. `platform` is `"Xbox"` (the default) or `"Windows"`. Neither uses the web session.
 
-- Microsoft keeps **one** Xbox override, so extra time replaces a lock. While the Xbox is locked (by `lock_platform` or by a parent in the app), `add_time_bonus` is refused unless you pass `replace_lock: true`.
-- The extra time is believed only when Microsoft's answer lists it ending when asked; otherwise the action fails. If a lock is still listed afterwards, the action fails and the lock stays.
-- While extra time runs, the Xbox lock switch reads off (Microsoft reports `allowUntil`).
-- `cancel_time_bonus` only ever cancels extra time. While the Xbox is locked it fails without sending anything (the cancel would lift the lock too); with no extra time in force it does nothing.
+- **Xbox** goes through the Xbox Family Settings service (the same "add time" as the Xbox Family Settings app), so it needs **Xbox** among the monitored platforms and the Xbox Family Settings sign-in linked; otherwise it fails with an error saying so.
+- **Windows** goes through the device-limits overrides of the Family Safety mobile API (the same endpoint as the Windows lock), with an `AllowUntil` override. No published client sends that request, so Windows extra time is believed only when Microsoft lists it on a read right after the write, ending within 2 minutes of the time asked. If it is not listed, whatever the write left is cancelled (never a lock) and the action fails with "Microsoft did not confirm extra time on Windows" and what was done.
+- Microsoft keeps **one** override per platform, so extra time replaces a lock. Before writing, the overrides are read: while the platform is locked (by `lock_platform` or by a parent in the app), `add_time_bonus` is refused unless you pass `replace_lock: true`.
+- The extra time is believed only when Microsoft lists it ending when asked; otherwise the action fails. If a lock is still listed afterwards, the action fails and the lock stays.
+- While extra time runs, the lock switch of that platform reads off (Microsoft reports `allowUntil` / `AllowUntil`).
+- `cancel_time_bonus` only ever cancels extra time. While the platform is locked it fails without sending anything (the cancel would lift the lock too); with no extra time in force it does nothing.
 - Both can answer with what they did (`response_variable`): `add_time_bonus` with `{added, until, replaced_lock}`, `cancel_time_bonus` with `{cancelled: true, lock_in_force}` or `{cancelled: false, reason: "no_extra_time"}`.
-- Windows has no confirmed request for extra time yet, so only `platform: "Xbox"` (the default) is accepted.
 
 ```yaml
 # 30 minutes of extra time on the Xbox
@@ -416,6 +417,16 @@ response_variable: extra_time
 service: microsoft_family_safety.cancel_time_bonus
 data:
   account_id: "1234567890123456"
+```
+
+```yaml
+# 45 minutes of extra time on Windows
+service: microsoft_family_safety.add_time_bonus
+data:
+  account_id: "1234567890123456"
+  platform: "Windows"
+  minutes: 45
+response_variable: extra_time
 ```
 
 ### App Management

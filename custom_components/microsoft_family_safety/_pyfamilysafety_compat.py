@@ -89,6 +89,7 @@ _WEB_PROBE_PATCH_MARKER = "_hafs_web_probe_backoff_patch"
 _CONNECTION_STATE_PATCH_MARKER = "_hafs_connection_state_diagnostics_patch"
 _ROSTER_TOLERANCE_PATCH_MARKER = "_hafs_roster_tolerance_patch"
 _APP_PLATFORM_PATCH_MARKER = "_hafs_app_platform_patch"
+_ALLOW_OVERRIDE_PATCH_MARKER = "_hafs_allow_override_not_blocked_patch"
 
 # Back off private account.microsoft.com probes after transport failures. Mobile
 # data continues to refresh normally during the backoff window.
@@ -700,6 +701,46 @@ def _patch_app_platform() -> bool:
     return True
 
 
+def _patch_allow_override_not_blocked() -> bool:
+    """Do not read extra time (an AllowUntil override) as a lock.
+
+    pyfamilysafety 1.1.2's ``Account._update_device_blocked`` counts a
+    platform as blocked whenever its ``overrides`` list is not empty, so
+    extra time given through add_time_bonus would turn the Windows lock
+    switch on. The replacement drops AllowUntil entries before the original
+    runs.
+    """
+    current = Account._update_device_blocked
+    if getattr(current, _ALLOW_OVERRIDE_PATCH_MARKER, False):
+        return False
+    original = current
+
+    def _patched_update_device_blocked(self: Account, raw_response: dict):
+        if isinstance(raw_response, dict) and isinstance(
+            raw_response.get("lockablePlatforms"), list
+        ):
+            platforms = []
+            for platform in raw_response["lockablePlatforms"]:
+                if isinstance(platform, dict) and isinstance(platform.get("overrides"), list):
+                    platform = {
+                        **platform,
+                        "overrides": [
+                            o for o in platform["overrides"]
+                            if not (
+                                isinstance(o, dict)
+                                and str(o.get("overrideType") or "").lower() == "allowuntil"
+                            )
+                        ],
+                    }
+                platforms.append(platform)
+            raw_response = {**raw_response, "lockablePlatforms": platforms}
+        return original(self, raw_response)
+
+    setattr(_patched_update_device_blocked, _ALLOW_OVERRIDE_PATCH_MARKER, True)
+    Account._update_device_blocked = _patched_update_device_blocked
+    return True
+
+
 def _patch_account_roster_tolerance() -> bool:
     """Keep loading a family member when Microsoft cannot resolve part of it.
 
@@ -803,6 +844,9 @@ def apply_patches(hass: HomeAssistant) -> None:
 
     if _patch_account_roster_tolerance():
         applied.append("per-member roster error tolerance")
+
+    if _patch_allow_override_not_blocked():
+        applied.append("extra time is not a lock")
 
     if applied:
         _LOGGER.debug(

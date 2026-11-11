@@ -43,6 +43,13 @@ _XBOX_REPORT_SLACK_SECONDS = 30
 _XBOX_REPORT_NO_DATA_BACKOFF_SECONDS = (60 * 60, 6 * 60 * 60, 24 * 60 * 60)
 
 _BASE_URL = "https://mobileaggregator.family.microsoft.com/api"
+
+# Mobile device-limits override types (overrideType). BlockUntil and Cancel
+# are the ones pyfamilysafety sends. AllowUntil (extra time) follows the
+# allowUntil the Family web override reports; Microsoft documents none of them.
+MOBILE_OVERRIDE_BLOCK = "BlockUntil"
+MOBILE_OVERRIDE_ALLOW = "AllowUntil"
+MOBILE_OVERRIDE_CANCEL = "Cancel"
 _APP_VERSION = "v 1.26.0.1001"
 _USER_AGENT = f"Family Safety-prod/({_APP_VERSION}) Android/33 google/Pixel 4 XL"
 _BROWSER_USER_AGENT = (
@@ -1631,6 +1638,53 @@ class FamilySafetyWebAPI:
         # Exact pyfamilysafety 1.1.2 compatibility fallback.
         result = await self._request("GET", f"/v1/devicelimits/{child_id}/overrides")
         return result if isinstance(result, dict) else None
+
+    # ------------------------------------------------------------------
+    # Mobile device-limits overrides, on the mobile token only.
+    #
+    # GET/POST /v4/devicelimits/{child}/overrides with Plat-Info: ALL, the
+    # route current pyfamilysafety uses (1.1.2 sends a shorter body to /v1).
+    # The POST body is {target, overrideType, validUntil, culture}; the reply
+    # and the GET are the full state: {"lockablePlatforms": [{"appliesTo",
+    # "overrides": [{"overrideType", "validUntil"}], "devices"}]}. The target
+    # is the platform name Microsoft lists in appliesTo.
+    # ------------------------------------------------------------------
+
+    MOBILE_OVERRIDES_PATH = "/v4/devicelimits/{child_id}/overrides"
+
+    async def get_mobile_device_overrides(self, child_id: str) -> dict:
+        """The child's device-limits overrides from the mobile API (never the web)."""
+        result = await self._request(
+            "GET",
+            self.MOBILE_OVERRIDES_PATH.format(child_id=child_id),
+            extra_headers={"Plat-Info": "ALL"},
+        )
+        if not isinstance(result, dict):
+            raise FamilySafetyWebAPIError("The mobile overrides answer was not an object")
+        return result
+
+    async def set_mobile_device_override(
+        self,
+        child_id: str,
+        target: str,
+        override_type: str,
+        valid_until: datetime,
+        culture: str = "en-US",
+    ) -> dict | list | None:
+        """POST one device-limits override on the mobile API; return the answer."""
+        body = {
+            "target": target,
+            "overrideType": override_type,
+            "validUntil": dt_util.as_utc(valid_until).strftime("%Y-%m-%dT%H:%M:%S.000%z"),
+            "culture": culture,
+        }
+        _LOGGER.debug("Mobile device-limits override for %s: %s", child_id, body)
+        return await self._request(
+            "POST",
+            self.MOBILE_OVERRIDES_PATH.format(child_id=child_id),
+            json_data=body,
+            extra_headers={"Plat-Info": "ALL"},
+        )
 
     # Each platform has its OWN override endpoint.  They are not one endpoint
     # parameterised by platformType -- Xbox lives under an /xbox/ path segment,
