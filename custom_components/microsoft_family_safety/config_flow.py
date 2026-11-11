@@ -27,6 +27,8 @@ from ._httpx_web_adapter import apply_httpx_web_transport_patch
 from ._httpx_web_tuning import apply_httpx_web_tuning_patch
 from .const import (
     CONF_ALLOWED_USERS,
+    CONF_STRICT_MODE,
+    DEFAULT_STRICT_MODE,
     CONF_XBOX_FEATURES,
     CONF_XBOX_LINK,
     DEFAULT_XBOX_FEATURES,
@@ -1511,6 +1513,12 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
                         CONF_ALLOWED_USERS,
                         default=current_allowed,
                     ): users_selector,
+                    vol.Optional(
+                        CONF_STRICT_MODE,
+                        default=self._config_entry.options.get(
+                            CONF_STRICT_MODE, DEFAULT_STRICT_MODE
+                        ),
+                    ): cv.boolean,
                     vol.Optional(
                         CONF_ALLOW_INSECURE_HTTP_AUTH,
                         default=current_allow_insecure_http_auth,
