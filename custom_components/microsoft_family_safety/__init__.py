@@ -60,9 +60,12 @@ SERVICE_BLOCK_APP_SCHEMA = child_schema({
 
 SERVICE_LOCK_PLATFORM_SCHEMA = child_schema({
     vol.Required("platform"): vol.In(["Windows", "Xbox", "Mobile"]),
-    vol.Optional("duration_hours", default=24): vol.All(
+    # No default here: giving both is an error, so the 24 h default is
+    # applied in _lock_until once it is known that ``until`` is absent.
+    vol.Optional("duration_hours"): vol.All(
         vol.Coerce(int), vol.Range(min=1, max=168)
     ),
+    vol.Optional("until"): cv.datetime,
 })
 
 SERVICE_UNLOCK_PLATFORM_SCHEMA = child_schema({
@@ -221,8 +224,37 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
     await hass.config_entries.async_reload(entry.entry_id)
 
 
-#: Actions that can answer with what they did (response_variable).
-_RESPONSE_SERVICES = frozenset({SERVICE_ADD_TIME_BONUS, SERVICE_CANCEL_TIME_BONUS})
+#: The longest platform lock, as for duration_hours.
+_MAX_LOCK_HOURS = 168
+
+#: Actions that can answer with what they did (response_variable):
+#: lock_platform / unlock_platform with ``{"prior", "applied"}``, the extra
+#: time actions with what they gave or cancelled.
+_RESPONSE_SERVICES = frozenset({
+    SERVICE_LOCK_PLATFORM,
+    SERVICE_UNLOCK_PLATFORM,
+    SERVICE_ADD_TIME_BONUS,
+    SERVICE_CANCEL_TIME_BONUS,
+})
+
+
+def _lock_until(data: dict) -> datetime:
+    """When a lock_platform lock ends: ``until``, or ``duration_hours`` from now."""
+    if data.get("until") is not None and data.get("duration_hours") is not None:
+        raise ServiceValidationError("Give either duration_hours or until, not both.")
+    until = data.get("until")
+    if until is None:
+        return dt_util.now() + timedelta(hours=data.get("duration_hours") or 24)
+    if until.tzinfo is None:
+        # A time without offset is Home Assistant's local time.
+        until = until.replace(tzinfo=dt_util.get_default_time_zone())
+    if until <= dt_util.now():
+        raise ServiceValidationError(f"until ({until.isoformat()}) is not in the future.")
+    if until > dt_util.now() + timedelta(hours=_MAX_LOCK_HOURS):
+        raise ServiceValidationError(
+            f"until ({until.isoformat()}) is more than {_MAX_LOCK_HOURS} hours away."
+        )
+    return until
 
 
 def _bonus_until(data: dict) -> datetime:
@@ -259,10 +291,7 @@ def _register_services(hass: HomeAssistant) -> None:
         (SERVICE_UNBLOCK_APP, SERVICE_BLOCK_APP_SCHEMA, "async_unblock_app",
          lambda d: (d["account_id"], d["app_id"])),
         (SERVICE_LOCK_PLATFORM, SERVICE_LOCK_PLATFORM_SCHEMA, "async_lock_platform",
-         lambda d: (
-             d["account_id"], d["platform"],
-             dt_util.now() + timedelta(hours=d.get("duration_hours", 24)),
-         )),
+         lambda d: (d["account_id"], d["platform"], _lock_until(d))),
         (SERVICE_UNLOCK_PLATFORM, SERVICE_UNLOCK_PLATFORM_SCHEMA, "async_unlock_platform",
          lambda d: (d["account_id"], d["platform"])),
         (SERVICE_ADD_TIME_BONUS, SERVICE_ADD_TIME_BONUS_SCHEMA, "async_add_time_bonus",
@@ -318,7 +347,7 @@ def _register_services(hass: HomeAssistant) -> None:
          lambda d: ()),
     ]
 
-    def make_handler(method_name, extract_args, per_child):
+    def make_handler(method_name, extract_args, per_child, responds):
         async def handler(call: ServiceCall) -> dict | None:
             data = dict(call.data)
             if per_child:
@@ -337,7 +366,9 @@ def _register_services(hass: HomeAssistant) -> None:
                 raise HomeAssistantError(
                     f"Microsoft Family Safety {call.service} failed: {err}"
                 ) from err
-            return result if call.return_response and isinstance(result, dict) else None
+            if responds:
+                return result if isinstance(result, dict) else {}
+            return None
         return handler
 
     for name, schema, method, extract in services:
@@ -346,23 +377,30 @@ def _register_services(hass: HomeAssistant) -> None:
             SERVICE_DENY_REQUEST_SCHEMA,
             SERVICE_REQUEST_REAUTH_SCHEMA,
         )
+        responds = name in _RESPONSE_SERVICES
         hass.services.async_register(
-            DOMAIN, name, guard_service(hass, make_handler(method, extract, per_child)),
+            DOMAIN, name,
+            guard_service(hass, make_handler(method, extract, per_child, responds)),
             schema=schema,
             supports_response=(
-                SupportsResponse.OPTIONAL if name in _RESPONSE_SERVICES else SupportsResponse.NONE
+                SupportsResponse.OPTIONAL if responds else SupportsResponse.NONE
             ),
         )
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Delete the Xbox Family Settings refresh token kept for this entry."""
+    """Delete the Xbox Family Settings refresh token and the platform holds of this entry."""
     from homeassistant.helpers import issue_registry as ir
+    from homeassistant.helpers.storage import Store
 
+    from .coordinator import PLATFORM_HOLD_STORAGE_KEY, STORAGE_VERSION
     from .xbox_family_api import XboxFamilyAPI
 
     await XboxFamilyAPI(hass, entry.entry_id).async_unlink()
     ir.async_delete_issue(hass, DOMAIN, f"xbox_link_{entry.entry_id}")
+    await Store(
+        hass, STORAGE_VERSION, f"{PLATFORM_HOLD_STORAGE_KEY}.{entry.entry_id}"
+    ).async_remove()
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

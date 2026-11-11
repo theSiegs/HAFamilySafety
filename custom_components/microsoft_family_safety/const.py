@@ -48,6 +48,11 @@ CONF_ALLOWED_USERS: Final = "allowed_users"
 DEFAULT_XBOX_FEATURES: Final = True
 #: Fired once for each pending request (more time, an app) that appears.
 EVENT_REQUEST: Final = f"{DOMAIN}_request"
+# Strict mode: a platform lock placed by lock_platform that Microsoft reports
+# as cancelled while it should still hold is placed again.
+CONF_STRICT_MODE: Final = "strict_mode"
+DEFAULT_STRICT_MODE: Final = False
+EVENT_LOCK_REASSERTED: Final = f"{DOMAIN}_lock_reasserted"
 
 # Days of week, in Microsoft API order (index 0 = Sunday)
 DAY_KEYS: Final = [
