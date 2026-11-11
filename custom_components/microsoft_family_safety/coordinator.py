@@ -131,6 +131,8 @@ _RUNTIME_AUTH_KEYS = frozenset({"anchor", CONF_REFRESH_TOKEN, "updated_at"})
 _REQUEST_FORGET_POLLS = 3
 #: Locks this integration holds on a platform, with the state before them.
 PLATFORM_HOLD_STORAGE_KEY = f"{DOMAIN}.platform_holds"
+#: Extra time this integration gave (add_time_bonus), per child and platform.
+TIME_BONUS_STORAGE_KEY = f"{DOMAIN}.time_bonus"
 #: Strict mode's read of a Windows/Mobile override gives up after this long.
 _STRICT_READ_TIMEOUT = 15
 #: Strict mode places one lock again at most this often, so a lock Microsoft
@@ -345,6 +347,12 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self._platform_holds: dict[str, dict[str, Any]] = {}
         self._platform_holds_loaded = False
+        #: "account|platform" -> the extra time add_time_bonus gave there
+        #: (``until``, ``given``), so it is told apart from a parent's.
+        self._bonus_store: Store = Store(
+            hass, STORAGE_VERSION, f"{TIME_BONUS_STORAGE_KEY}.{entry.entry_id}"
+        )
+        self._time_bonuses: dict[str, dict[str, Any]] = {}
         self._platform_hold_locks: dict[str, asyncio.Lock] = {}
         self._strict_mode = bool(entry.options.get(CONF_STRICT_MODE, DEFAULT_STRICT_MODE))
         #: hold key -> when strict mode last placed that lock again.
@@ -1055,10 +1063,29 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._platform_holds = {
                 str(k): v for k, v in data.items() if isinstance(v, dict)
             }
+        bonuses = await self._bonus_store.async_load()
+        if isinstance(bonuses, dict):
+            self._time_bonuses = {
+                str(k): v for k, v in bonuses.items() if isinstance(v, dict)
+            }
         self._platform_holds_loaded = True
 
     async def _async_save_platform_holds(self) -> None:
         await self._hold_store.async_save(self._platform_holds)
+
+    async def _async_save_time_bonuses(self) -> None:
+        await self._bonus_store.async_save(self._time_bonuses)
+
+    def _own_bonus(self, key: str, current: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Our recorded extra time, when the allowUntil in force is the one we gave."""
+        bonus = self._time_bonuses.get(key)
+        if not bonus or not isinstance(current, dict) or current.get("type") != ALLOW_UNTIL:
+            return None
+        ours = parse_utc(bonus.get("until"))
+        theirs = parse_utc(current.get("valid_until"))
+        if ours is None or theirs is None or abs(ours - theirs) > self._OWN_LOCK_TOLERANCE:
+            return None
+        return bonus
 
     async def _async_prune_platform_holds(self) -> None:
         """Forget holds whose lock ended more than a day ago (run on each poll)."""
@@ -1074,6 +1101,14 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._last_reassert.pop(key, None)
         if stale:
             await self._async_save_platform_holds()
+        ended = [
+            key for key, bonus in self._time_bonuses.items()
+            if (until := parse_utc(bonus.get("until"))) is None or until <= limit
+        ]
+        for key in ended:
+            self._time_bonuses.pop(key, None)
+        if ended:
+            await self._async_save_time_bonuses()
 
     def platform_hold(self, account_id: Any, platform: str) -> dict[str, Any] | None:
         """The lock this integration holds on a child's platform, if any."""
@@ -1309,7 +1344,11 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self._async_write_platform_override(roster_id, platform, True, target)
             hold["confirmed"] = True
             hold["confirmed_at"] = iso_utc(dt_util.utcnow())
+            # The lock replaced any extra time of ours (one override per platform).
+            hold.pop("bonus_until", None)
             await self._async_save_platform_holds()
+            if self._time_bonuses.pop(key, None) is not None:
+                await self._async_save_time_bonuses()
             return {"prior": dict(hold["prior"]), "applied": make_override(BLOCK_UNTIL, target)}
 
     @_updates_listeners
@@ -1349,6 +1388,16 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if prior is not None and prior.get("type") == UNKNOWN:
                 flags["prior_unknown"] = True
             restore = True
+            if hold is None and self._time_bonuses.get(key):
+                # No lock of ours, but extra time of ours may be in force: an
+                # unlock must not revoke it (the revoke ends extra time too).
+                current = await self._async_read_platform_override_retry(roster_id, platform)
+                if self._own_bonus(key, current):
+                    return {
+                        "prior": None,
+                        "applied": "bonus_kept",
+                        "current": self._override_details(current),
+                    }
             if hold is not None:
                 left: str | None = None
                 current: dict[str, Any] | None = None
@@ -1365,6 +1414,10 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             left = "left_parent_override" if hold.get("confirmed") else "not_locked"
                     elif self._is_own_lock(hold, current) and not hold.get("superseded"):
                         pass  # ours: restore or cancel below
+                    elif self._own_bonus(key, current):
+                        # Our own extra time replaced our lock: the lock is
+                        # gone already, and the extra time is left to run.
+                        left = "bonus_kept"
                     elif current.get("type") == NO_OVERRIDE and holding:
                         # Released elsewhere, or the read misses our lock: cancel
                         # anyway (harmless) rather than leave a child locked.
@@ -1384,7 +1437,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             (str(roster_id), platform.lower()), None
                         )
                     result: dict[str, Any] = {"prior": prior, "applied": left, **flags}
-                    if left == "left_parent_override" and current is not None:
+                    if left in ("left_parent_override", "bonus_kept") and current is not None:
                         # What is in force now, so a caller can match it.
                         result["current"] = self._override_details(current)
                     return result
@@ -1452,6 +1505,10 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             until = parse_utc(hold.get("until"))
             if not self._holds_the_lock(hold) or until is None or until <= now:
                 continue
+            if hold.get("bonus_until"):
+                # Our own extra time replaced this lock: never locked over it;
+                # _async_resume_after_bonus puts the lock back when it ends.
+                continue
             written = [
                 t for t in (self._last_reassert.get(key), parse_utc(hold.get("confirmed_at")))
                 if t is not None
@@ -1491,6 +1548,90 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._async_reassert_hold(key, account_id, platform, until),
                 f"{DOMAIN} reassert {platform} lock",
             )
+
+    async def _async_resume_after_bonus(
+        self,
+        xbox_overrides: dict[str, Any],
+        xbox_read_at: dict[str, datetime] | None = None,
+    ) -> None:
+        """Put back a lock of ours once our own extra time over it has ended.
+
+        add_time_bonus over a lock this integration holds replaces that lock
+        (Microsoft keeps one Xbox override) but keeps the hold, marked with
+        ``bonus_until``. Once the extra time has ended and this poll's read,
+        taken after that end, shows nothing in force, the lock goes back on
+        until the hold's end, whatever the strict mode option. Any other
+        override in force then (a parent's lock or extra time) ends the mark
+        and the usual hold rules apply.
+        """
+        await self._async_load_platform_holds()
+        now = dt_util.utcnow()
+        changed = False
+        for key, hold in list(self._platform_holds.items()):
+            bonus_end = parse_utc(hold.get("bonus_until"))
+            if bonus_end is None:
+                continue
+            until = parse_utc(hold.get("until"))
+            if not self._holds_the_lock(hold) or until is None or until <= now:
+                hold.pop("bonus_until", None)
+                changed = True
+                continue
+            if bonus_end > now:
+                continue
+            account_id = str(hold.get("account_id"))
+            platform = str(hold.get("platform") or key.split("|", 1)[-1])
+            read_at = (xbox_read_at or {}).get(account_id)
+            state = xbox_overrides.get(account_id)
+            if platform.lower() != "xbox" or read_at is None or read_at < bonus_end:
+                continue
+            if not isinstance(state, dict):
+                continue
+            if state.get("type") == NO_OVERRIDE:
+                self.entry.async_create_background_task(
+                    self.hass,
+                    self._async_relock_after_bonus(key, account_id, platform, until),
+                    f"{DOMAIN} relock {platform} after extra time",
+                )
+                continue
+            hold.pop("bonus_until", None)
+            changed = True
+        if changed:
+            await self._async_save_platform_holds()
+
+    async def _async_relock_after_bonus(
+        self, key: str, account_id: str, platform: str, until: datetime
+    ) -> None:
+        """Place the hold's lock again after our extra time (see above)."""
+        async with self._hold_lock(key):
+            hold = self._platform_holds.get(key)
+            if (
+                hold is None
+                or not hold.get("bonus_until")
+                or parse_utc(hold.get("until")) != until
+            ):
+                return  # unlocked, locked again or given more time meanwhile
+            bonus_end = parse_utc(hold.get("bonus_until"))
+            if bonus_end is not None and bonus_end > dt_util.utcnow():
+                return
+            try:
+                await self._async_write_platform_override(
+                    self._roster_id(account_id), platform, True, until
+                )
+            except Exception as err:  # noqa: BLE001 - tried again on the next poll
+                _LOGGER.warning(
+                    "Could not put the %s lock of %s back after its extra time: %s",
+                    platform, account_id, err,
+                )
+                return
+            hold.pop("bonus_until", None)
+            hold["confirmed_at"] = iso_utc(dt_util.utcnow())
+            await self._async_save_platform_holds()
+            if self._time_bonuses.pop(key, None) is not None:
+                await self._async_save_time_bonuses()
+        _LOGGER.info(
+            "The %s extra time of %s has ended; the lock was put back until %s",
+            platform, account_id, iso_utc(until),
+        )
 
     async def _async_reassert_hold(
         self, key: str, account_id: str, platform: str, until: datetime
@@ -1550,6 +1691,8 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         * ``parent``: an override is in force that is not ours (a lock or
           extra time from the Family Safety app), or we hold a lock but
           Microsoft shows it cancelled or ending at another time.
+        * ``bonus_ours``: the extra time in force is the one add_time_bonus
+          gave (over a lock of ours, or not).
         * ``none``: nothing in force and no hold of ours.
 
         The Xbox override is the one the poll read from xapprove (unknown
@@ -1579,6 +1722,14 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if hold is not None and kind == BLOCK_UNTIL and (
             current.get("valid_until") is None or self._is_own_lock(hold, current)
         ):
+            who = "ours"
+        elif kind == ALLOW_UNTIL and self._own_bonus(
+            self._hold_key(account_id, platform), current
+        ):
+            # Extra time this integration gave (add_time_bonus).
+            who = "bonus_ours"
+        elif hold is not None and kind == NO_OVERRIDE and hold.get("bonus_until"):
+            # Our extra time over our lock has ended; the lock is being put back.
             who = "ours"
         elif kind in (BLOCK_UNTIL, ALLOW_UNTIL):
             who = "parent"
@@ -1994,6 +2145,57 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         until: datetime,
         replace_lock: bool = False,
     ) -> dict[str, Any]:
+        """Give a child extra time on Windows or the Xbox until ``until``, and record it.
+
+        The extra time is recorded as this integration's, so the platform's
+        ``hold`` reads ``bonus_ours`` (not ``parent``) while it is in force.
+        Given over a lock this integration holds (``replace_lock``), the hold
+        is kept: strict mode does not lock over the extra time, and the lock
+        is put back once the extra time ends (or is cancelled) while the hold
+        still runs. The answer then has ``hold_kept: true``.
+        """
+        roster_id = self._roster_id(account_id)
+        platform = self._bonus_platform(platform)
+        key = self._hold_key(roster_id, platform)
+        async with self._hold_lock(key):
+            await self._async_load_platform_holds()
+            hold = self._platform_holds.get(key)
+            now = dt_util.utcnow()
+            if hold is not None and not (
+                self._holds_the_lock(hold) and self._hold_in_force(hold, now)
+            ):
+                hold = None
+            result = await self._async_add_time_bonus(
+                account_id, platform, until, replace_lock, hold
+            )
+            given = parse_utc(result.get("until"))
+            self._time_bonuses[key] = {
+                "account_id": str(roster_id),
+                "platform": platform,
+                "until": iso_utc(given) if given else None,
+                "given": iso_utc(now),
+            }
+            await self._async_save_time_bonuses()
+            hold_kept = False
+            if hold is not None and given is not None and (
+                result.get("own_lock_replaced") or hold.get("bonus_until")
+            ):
+                hold["bonus_until"] = iso_utc(given)
+                await self._async_save_platform_holds()
+                hold_kept = True
+            result.pop("own_lock_replaced", None)
+            result["applied_until"] = result.get("until")
+            result["hold_kept"] = hold_kept
+            return result
+
+    async def _async_add_time_bonus(
+        self,
+        account_id: str,
+        platform: str,
+        until: datetime,
+        replace_lock: bool,
+        hold: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         """Give a child extra time on Windows or the Xbox until ``until``.
 
         Windows: see _async_add_windows_time_bonus. Xbox: the Xbox Family
@@ -2004,7 +2206,9 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         extra time ending when asked and no lock left in force.
         """
         if str(platform).lower() == "windows":
-            return await self._async_add_windows_time_bonus(account_id, until, replace_lock)
+            return await self._async_add_windows_time_bonus(
+                account_id, until, replace_lock, hold
+            )
         xuid = await self._async_bonus_xuid(account_id, platform)
         until = dt_util.as_utc(until)
         current = await self._async_xbox_overrides(xuid, "no extra time was given")
@@ -2041,9 +2245,53 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "added": True,
             "until": dt_util.as_local(valid_until).isoformat(),
             "replaced_lock": lock is not None,
+            "own_lock_replaced": (
+                lock is not None
+                and hold is not None
+                and self._is_own_lock(hold, parse_xbox_override(current))
+            ),
         }
 
+    @_updates_listeners
     async def async_cancel_time_bonus(self, account_id: str, platform: str) -> dict[str, Any]:
+        """Cancel the extra time in force; put back a lock of ours it replaced.
+
+        When the extra time was given over a lock this integration still
+        holds, that lock goes back on until the hold's end once the extra time
+        is cancelled (``lock_restored`` with ``lock_until`` in the answer).
+        """
+        roster_id = self._roster_id(account_id)
+        platform = self._bonus_platform(platform)
+        key = self._hold_key(roster_id, platform)
+        async with self._hold_lock(key):
+            await self._async_load_platform_holds()
+            result = await self._async_cancel_time_bonus(account_id, platform)
+            if self._time_bonuses.pop(key, None) is not None:
+                await self._async_save_time_bonuses()
+            hold = self._platform_holds.get(key)
+            if not result.get("cancelled") or hold is None or not hold.get("bonus_until"):
+                return result
+            hold.pop("bonus_until", None)
+            until = parse_utc(hold.get("until"))
+            if (
+                not self._holds_the_lock(hold)
+                or until is None
+                or until <= dt_util.utcnow()
+                or result.get("lock_in_force")
+            ):
+                await self._async_save_platform_holds()
+                return result
+            await self._async_write_platform_override(roster_id, platform, True, until)
+            hold["confirmed_at"] = iso_utc(dt_util.utcnow())
+            await self._async_save_platform_holds()
+            return {
+                **result,
+                "lock_in_force": True,
+                "lock_restored": True,
+                "lock_until": dt_util.as_local(until).isoformat(),
+            }
+
+    async def _async_cancel_time_bonus(self, account_id: str, platform: str) -> dict[str, Any]:
         """Cancel the extra time in force on Windows or the Xbox, and nothing else.
 
         Windows: see _async_cancel_windows_time_bonus. Xbox: the Xbox Family
@@ -2107,6 +2355,14 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """A lock in force on a mobile platform entry, if any (see mobile_lock_of)."""
         return mobile_lock_of(entry)
 
+    @staticmethod
+    def _bonus_platform(platform: str) -> str:
+        """``Windows`` or ``Xbox`` for add_time_bonus / cancel_time_bonus."""
+        name = {"windows": "Windows", "xbox": "Xbox"}.get(str(platform).lower())
+        if name is None:
+            raise HomeAssistantError("Extra time can only be given on Windows or the Xbox.")
+        return name
+
     def _windows_bonus_child(self, account_id: str) -> str:
         if not any(str(key) == str(account_id) for key in self._accounts):
             raise ValueError(f"Account {account_id} not found")
@@ -2131,6 +2387,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         account_id: str,
         until: datetime,
         replace_lock: bool,
+        hold: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Give extra time on Windows through the mobile device-limits overrides.
 
@@ -2189,6 +2446,13 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "added": True,
                 "until": dt_util.as_local(valid_until).isoformat(),
                 "replaced_lock": lock is not None,
+                "own_lock_replaced": (
+                    lock is not None
+                    and hold is not None
+                    and self._is_own_lock(
+                        hold, parse_mobile_override({"lockablePlatforms": [before]}, "Windows")
+                    )
+                ),
             }
         if confirmed:
             await self.async_request_refresh()
@@ -3396,6 +3660,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._accounts = new_accounts
             try:
                 await self._async_prune_platform_holds()
+                await self._async_resume_after_bonus(xbox_overrides, xbox_read_at)
                 await self._async_enforce_holds(xbox_overrides, xbox_read_at)
             except Exception as err:  # noqa: BLE001 - never fail the poll for it
                 _LOGGER.debug("Platform hold check failed: %r", err)
