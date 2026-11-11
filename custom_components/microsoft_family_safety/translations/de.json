@@ -191,6 +191,24 @@
         }
       }
     },
+    "probe_windows_extra_time": {
+      "name": "Windows-Extrazeit testen",
+      "description": "Diagnose (nur Administratoren): Schreibt für ein Kind, bei dem unter Windows nichts aktiv ist, eine kurze AllowUntil-Ausnahme über die mobile API, liest sie zurück, hebt sie auf und liest erneut. Gibt jede Anfrage mit Status und Antwort von Microsoft zurück.",
+      "fields": {
+        "account_id": {
+          "name": "Konto-ID",
+          "description": "Die Benutzer-ID des Kinderkontos."
+        },
+        "confirm_risk": {
+          "name": "Risiko bestätigen",
+          "description": "Muss aktiv sein. Das Kind bekommt bis zur Aufhebung einige Minuten Extrazeit unter Windows."
+        },
+        "minutes": {
+          "name": "Minuten",
+          "description": "Dauer der Test-Extrazeit (1 bis 10, Standard 2)."
+        }
+      }
+    },
     "cancel_time_bonus": {
       "name": "Extrazeit aufheben",
       "description": "Hebt die laufende Extrazeit auf der Xbox oder unter Windows eines Kindes auf. Nur Extrazeit wird aufgehoben: Schlägt fehl, solange die Plattform gesperrt ist (eine Sperre wird nie gelöst), und tut nichts, wenn keine Extrazeit läuft. Kann mit cancelled und reason oder lock_in_force antworten.",

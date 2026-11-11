@@ -1686,6 +1686,32 @@ class FamilySafetyWebAPI:
             extra_headers={"Plat-Info": "ALL"},
         )
 
+    async def mobile_raw_request(
+        self,
+        method: str,
+        path: str,
+        json_data: dict | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Diagnostic: one mobile API request, answered as {status, body}; never raises."""
+        try:
+            await self._ensure_session()
+            await self._ensure_auth()
+            headers = self._build_headers()
+            if extra_headers:
+                headers.update(extra_headers)
+            async with self._session.request(
+                method, f"{_BASE_URL}{path}", headers=headers, json=json_data
+            ) as resp:
+                text = await resp.text()
+                try:
+                    body: Any = json.loads(text) if text else None
+                except ValueError:
+                    body = text
+                return {"status": resp.status, "body": body}
+        except Exception as err:  # noqa: BLE001 - reported, not raised
+            return {"status": None, "error": f"{type(err).__name__}: {err}"}
+
     # Each platform has its OWN override endpoint.  They are not one endpoint
     # parameterised by platformType -- Xbox lives under an /xbox/ path segment,
     # and posting an Xbox override to the Windows path is accepted, stored, and

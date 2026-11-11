@@ -1470,6 +1470,72 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         return {"cancelled": True, "lock_in_force": lock is not None}
 
+    async def async_probe_windows_extra_time(
+        self, account_id: str, minutes: int = 2
+    ) -> dict[str, Any]:
+        """Diagnostic: a short AllowUntil on Windows, read back, cancelled, read back.
+
+        Nothing is written while any override is in force on Windows. Every
+        request and Microsoft's raw answer (status and body) are returned.
+        """
+        child = self._windows_bonus_child(account_id)
+        path = FamilySafetyWebAPI.MOBILE_OVERRIDES_PATH.format(child_id=child)
+        all_platforms = {"Plat-Info": "ALL"}
+        steps: list[dict[str, Any]] = []
+
+        async def step(
+            name: str,
+            method: str,
+            req_path: str,
+            body: dict | None = None,
+            headers: dict | None = all_platforms,
+        ) -> dict[str, Any]:
+            answer = await self.web_api.mobile_raw_request(method, req_path, body, headers)
+            steps.append({
+                "step": name, "method": method, "path": req_path,
+                "headers": headers, "sent": body, **answer,
+            })
+            return answer
+
+        def fmt(moment: datetime) -> str:
+            return dt_util.as_utc(moment).strftime("%Y-%m-%dT%H:%M:%S.000%z")
+
+        await step("read_v1", "GET", f"/v1/devicelimits/{child}/overrides", headers=None)
+        before = await step("read_before", "GET", path)
+        entry = self._mobile_windows_entry(before.get("body"))
+        result: dict[str, Any] = {"steps": steps}
+        if entry is None:
+            result["aborted"] = "Microsoft lists no Windows entry; nothing was written."
+            return result
+        if self._override_in_force(entry.get("overrides"), lambda _: True) is not None:
+            result["aborted"] = "An override is in force on Windows; nothing was written."
+            return result
+        target = str(entry.get("appliesTo"))
+        until = dt_util.utcnow() + timedelta(minutes=minutes)
+        result.update({"target": target, "asked_until": fmt(until)})
+        try:
+            await step("write_allow", "POST", path, {
+                "target": target, "overrideType": MOBILE_OVERRIDE_ALLOW,
+                "validUntil": fmt(until), "culture": "en-US",
+            })
+            after = await step("read_after_write", "GET", path)
+            allow = self._mobile_allow_of(self._mobile_windows_entry(after.get("body")))
+            listed = self._xapprove_until((allow or {}).get("validUntil"))
+            result["allow_listed"] = allow
+            result["confirmed"] = (
+                listed is not None and abs(listed - until) <= self._BONUS_TOLERANCE
+            )
+        finally:
+            await step("cancel", "POST", path, {
+                "target": target, "overrideType": MOBILE_OVERRIDE_CANCEL,
+                "validUntil": fmt(dt_util.utcnow()), "culture": "en-US",
+            })
+            last = await step("read_after_cancel", "GET", path)
+            left = self._mobile_windows_entry(last.get("body"))
+            result["left_after_cancel"] = (left or {}).get("overrides")
+            await self.async_request_refresh()
+        return result
+
     # --- Xbox Family Settings API (xapprove) ---------------------------------
     @property
     def _xapprove_active(self) -> bool:

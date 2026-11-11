@@ -120,6 +120,7 @@ SERVICE_UNLOCK_ACCOUNT: Final = "unlock_account"
 SERVICE_REQUEST_REAUTH: Final = "request_reauth"
 SERVICE_ADD_TIME_BONUS: Final = "add_time_bonus"
 SERVICE_CANCEL_TIME_BONUS: Final = "cancel_time_bonus"
+SERVICE_PROBE_WINDOWS_EXTRA_TIME: Final = "probe_windows_extra_time"
 
 ALL_SERVICES: Final = [
     SERVICE_BLOCK_APP,
@@ -143,6 +144,7 @@ ALL_SERVICES: Final = [
     SERVICE_REQUEST_REAUTH,
     SERVICE_ADD_TIME_BONUS,
     SERVICE_CANCEL_TIME_BONUS,
+    SERVICE_PROBE_WINDOWS_EXTRA_TIME,
 ]
 
 # Platforms

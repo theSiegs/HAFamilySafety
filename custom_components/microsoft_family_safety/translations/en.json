@@ -191,6 +191,24 @@
         }
       }
     },
+    "probe_windows_extra_time": {
+      "name": "Probe Windows Extra Time",
+      "description": "Diagnostic (administrators only): for one child with nothing in force on Windows, writes a short AllowUntil override on the mobile API, reads it back, cancels it and reads again. Returns every request with Microsoft's raw status and body.",
+      "fields": {
+        "account_id": {
+          "name": "Account ID",
+          "description": "The user ID of the child account."
+        },
+        "confirm_risk": {
+          "name": "Confirm risk",
+          "description": "Must be on. The child gets a few minutes of extra time on Windows until the cancel."
+        },
+        "minutes": {
+          "name": "Minutes",
+          "description": "Length of the test extra time (1 to 10, default 2)."
+        }
+      }
+    },
     "cancel_time_bonus": {
       "name": "Cancel Extra Time",
       "description": "Cancel the extra time in force on a child's Xbox or Windows. Only extra time is cancelled: fails while the platform is locked (a lock is never lifted), and does nothing when no extra time is in force. Can answer with cancelled and reason or lock_in_force.",
