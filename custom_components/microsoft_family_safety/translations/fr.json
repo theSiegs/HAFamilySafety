@@ -137,7 +137,7 @@
     },
     "lock_platform": {
       "name": "Verrouiller une plateforme",
-      "description": "Verrouille une plateforme (Windows/Xbox/Mobile) pour un compte enfant jusqu'à une heure donnée. Le premier verrouillage mémorise le verrouillage ou le temps supplémentaire en vigueur chez Microsoft, pour que unlock_platform puisse rétablir un verrouillage ; un verrouillage déjà en vigueur qui se termine plus tard est conservé. Répond avec l'état antérieur mémorisé et le verrouillage appliqué.",
+      "description": "Verrouille une plateforme (Windows/Xbox/Mobile) pour un compte enfant jusqu'à une heure donnée. Le premier verrouillage mémorise le verrouillage ou le temps supplémentaire en vigueur chez Microsoft, pour que unlock_platform puisse rétablir un verrouillage ; un verrouillage déjà en vigueur qui se termine plus tard est conservé. Répond avec l'état antérieur mémorisé et le verrouillage appliqué. Pour la Xbox, la connexion Xbox Family Settings doit être liée.",
       "fields": {
         "account_id": {
           "name": "ID du compte",
@@ -153,7 +153,7 @@
         },
         "until": {
           "name": "Jusqu'à",
-          "description": "Fin du verrouillage, à la place de duration_hours. Une heure sans décalage horaire est l'heure locale de Home Assistant."
+          "description": "Fin du verrouillage, à la place de duration_hours. Une heure sans décalage horaire est l'heure locale de Home Assistant. Au plus 168 heures plus tard."
         }
       }
     },

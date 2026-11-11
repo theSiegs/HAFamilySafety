@@ -41,8 +41,11 @@ def _coordinator(hass, xbox, mobile, strict: bool):
     return _make(hass, entry, xbox, mobile)
 
 
-async def _locked(coord, xbox, mobile, platform="Xbox"):
+async def _locked(coord, xbox, mobile, platform="Xbox", age=timedelta(minutes=11)):
+    """A lock of ours, placed ``age`` ago (past the cooldown by default)."""
     await coord.async_lock_platform(CHILD, platform, dt_util.utcnow() + timedelta(hours=2))
+    hold = coord._platform_holds[coord._hold_key(CHILD, platform)]
+    hold["confirmed_at"] = iso_utc(dt_util.utcnow() - age)
     xbox.writes.clear()
     mobile.writes.clear()
 
@@ -121,8 +124,9 @@ async def test_windows_lock_is_read_back_from_the_mobile_api(hass, xbox, mobile)
 
 async def test_a_read_taken_before_the_lock_does_not_count(hass, xbox, mobile):
     coord = _coordinator(hass, xbox, mobile, strict=True)
-    read_at = dt_util.utcnow() - timedelta(seconds=5)  # the poll read xapprove...
-    await _locked(coord, xbox, mobile)  # ...then the lock was placed
+    await _locked(coord, xbox, mobile)
+    confirmed = dt_util.parse_datetime(coord.platform_hold(CHILD, "Xbox")["confirmed_at"])
+    read_at = confirmed - timedelta(seconds=5)  # the poll read xapprove before the lock
 
     await coord._async_enforce_holds({CHILD: NONE}, {CHILD: read_at})
     await hass.async_block_till_done()
@@ -151,3 +155,29 @@ def _answer(value):
     async def answer(*args, **kwargs):
         return value
     return answer
+
+
+async def test_no_relock_right_after_our_own_write(hass, xbox, mobile):
+    """A read that does not show a fresh lock yet waits for the cooldown."""
+    coord = _coordinator(hass, xbox, mobile, strict=True)
+    await _locked(coord, xbox, mobile, "Windows", age=timedelta(minutes=2))
+    mobile.platforms["Windows"] = []  # the read misses our lock
+
+    await coord._async_enforce_holds({})
+    await hass.async_block_till_done()
+    assert mobile.writes == []
+
+    hold = coord._platform_holds[coord._hold_key(CHILD, "Windows")]
+    hold["confirmed_at"] = iso_utc(dt_util.utcnow() - timedelta(minutes=11))
+    await coord._async_enforce_holds({})
+    await hass.async_block_till_done()
+    assert [name for name, _ in mobile.writes] == ["Windows"]
+
+
+async def test_a_superseded_hold_is_not_placed_again(hass, xbox, mobile):
+    coord = _coordinator(hass, xbox, mobile, strict=True)
+    await _locked(coord, xbox, mobile)
+    coord._platform_holds[coord._hold_key(CHILD, "Xbox")]["superseded"] = True
+    await coord._async_enforce_holds({CHILD: NONE})
+    await hass.async_block_till_done()
+    assert xbox.writes == []

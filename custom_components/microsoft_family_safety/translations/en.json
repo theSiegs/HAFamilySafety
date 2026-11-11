@@ -137,7 +137,7 @@
     },
     "lock_platform": {
       "name": "Lock Platform",
-      "description": "Lock a platform (Windows/Xbox/Mobile) for a child account until a time. The first lock saves the lock or extra time Microsoft had in force so unlock_platform can put a lock back; a lock already in force that ends later is kept. Answers with the saved prior state and the lock applied.",
+      "description": "Lock a platform (Windows/Xbox/Mobile) for a child account until a time. The first lock saves the lock or extra time Microsoft had in force so unlock_platform can put a lock back; a lock already in force that ends later is kept. Answers with the saved prior state and the lock applied. Xbox needs the Xbox Family Settings sign-in linked.",
       "fields": {
         "account_id": {
           "name": "Account ID",
@@ -153,7 +153,7 @@
         },
         "until": {
           "name": "Until",
-          "description": "When the lock ends, instead of duration_hours. A time without an offset is Home Assistant's local time."
+          "description": "When the lock ends, instead of duration_hours. A time without an offset is Home Assistant's local time. At most 168 hours away."
         }
       }
     },

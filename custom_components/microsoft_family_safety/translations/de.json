@@ -137,7 +137,7 @@
     },
     "lock_platform": {
       "name": "Plattform sperren",
-      "description": "Eine Plattform (Windows/Xbox/Mobile) für ein Kinderkonto bis zu einem Zeitpunkt sperren. Die erste Sperre merkt sich die Sperre oder Extrazeit, die bei Microsoft gerade gilt, damit unlock_platform eine Sperre wiederherstellen kann; eine bereits geltende Sperre, die später endet, bleibt bestehen. Antwortet mit dem gemerkten vorherigen Zustand und der gesetzten Sperre.",
+      "description": "Eine Plattform (Windows/Xbox/Mobile) für ein Kinderkonto bis zu einem Zeitpunkt sperren. Die erste Sperre merkt sich die Sperre oder Extrazeit, die bei Microsoft gerade gilt, damit unlock_platform eine Sperre wiederherstellen kann; eine bereits geltende Sperre, die später endet, bleibt bestehen. Antwortet mit dem gemerkten vorherigen Zustand und der gesetzten Sperre. Für die Xbox muss die Xbox Family Settings-Anmeldung verknüpft sein.",
       "fields": {
         "account_id": {
           "name": "Konto-ID",
@@ -153,7 +153,7 @@
         },
         "until": {
           "name": "Bis",
-          "description": "Wann die Sperre endet, anstelle von duration_hours. Eine Zeit ohne Zeitzonenangabe gilt als lokale Zeit von Home Assistant."
+          "description": "Wann die Sperre endet, anstelle von duration_hours. Eine Zeit ohne Zeitzonenangabe gilt als lokale Zeit von Home Assistant. Höchstens 168 Stunden entfernt."
         }
       }
     },

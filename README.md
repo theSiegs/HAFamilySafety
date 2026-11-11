@@ -105,7 +105,7 @@ Poll loop (default every 5 min)
 Service call / entity write
   ├─ Mobile API   → schedules, account lock, app blocking and app limits,
   │                 websites, age rating, ask-to-buy, requests, Xbox limits
-  └─ Web API      → Xbox lock (Xbox ticked only)
+  └─ Xbox Family Settings → Xbox lock (lock_platform, Xbox lock switch)
 ```
 
 ### Legacy add-on mode
@@ -204,7 +204,7 @@ When on, a lock placed by `microsoft_family_safety.lock_platform` that Microsoft
 
 #### Xbox and the web session
 
-Xbox play time and the Xbox lock are the only features that still need the Microsoft **web session**, which some accounts must renew with an interactive sign-in every 24 hours ([#52](https://github.com/noiwid/HAFamilySafety/issues/52)). Everything else, Xbox daily limits included, runs on the mobile token.
+Xbox play time and the Xbox lock are the only features that still need the Microsoft **web session**, which some accounts must renew with an interactive sign-in every 24 hours ([#52](https://github.com/noiwid/HAFamilySafety/issues/52)). Everything else, Xbox daily limits included, runs on the mobile token. Placing or lifting the Xbox lock (`lock_platform`, the Xbox lock switch) goes through the Xbox Family Settings service and needs its sign-in linked (option **Link the Xbox Family Settings sign-in**).
 
 - **Xbox ticked** among the monitored platforms: the sign-in captures both the web session and the mobile token, and the Xbox entities are created. Installs made before 2.0.22 keep this behaviour (the options show Xbox ticked) until you untick it.
 - **Xbox unticked** (the default for new installs): the integration runs on the mobile token only. The sign-in is the short one of the Family Safety app, no browser cookies are stored, the connection sensor no longer reports `degraded` for a missing web session, and no Xbox entities are created (Xbox lock, Xbox schedule switch, Xbox daily limits).
@@ -322,7 +322,7 @@ A typical single-child setup with a full app list lands around 85-90 entities.
 | Xbox Screen Time Limits | `switch.{prefix}_xbox_screen_time_limits` | Turns the child's separate Xbox schedule on or off (the days are kept). Once it is on, seven `number.{prefix}_xbox_{day}_limit` entities set the daily Xbox allowance the console enforces. Not created without Xbox among the monitored platforms. |
 | App Limits | `switch.{prefix}_app_limits` | The "App, feature, and game limits" toggle above the app list. While it is OFF, the per-app time limits are kept but not enforced. |
 | App Block | `switch.{prefix}_app_{appname}` | ON = app blocked. One switch per application. |
-| Platform Lock | `switch.{prefix}_{platform}_lock` | ON = platform locked. Locks one platform (e.g. Windows) through a Microsoft device override. For Windows the integration tries a web-API time override first, then falls back to the mobile API. Use **Account Lock** to lock every platform at once. Turning it off cancels whatever lock is in force (it does not put back an earlier one, unlike `unlock_platform`). Attributes `user_id`, `platform`, `blocked`, and who decides the lock: `hold` (`ours`, `parent` or `none`), `override` (`blockUntil`, `allowUntil`, `none`, or null when unreadable), `override_until` and `allow_until` (local ISO time or null), see [below](#platform-locks-and-a-parents-own-changes). |
+| Platform Lock | `switch.{prefix}_{platform}_lock` | ON = platform locked. Locks one platform (e.g. Windows) through a Microsoft device override. Windows and Mobile go through the mobile API; Xbox through the Xbox Family Settings service (its sign-in must be linked, otherwise the lock is refused). Use **Account Lock** to lock every platform at once. Turning it off cancels whatever lock is in force (it does not put back an earlier one, unlike `unlock_platform`). Attributes `user_id`, `platform`, `blocked`, and who decides the lock: `hold` (`ours`, `parent` or `none`), `override` (`blockUntil`, `allowUntil`, `none`, or null when unreadable), `override_until` and `allow_until` (local ISO time or null), see [below](#platform-locks-and-a-parents-own-changes). |
 
 ### Buttons — Per Child Account
 
@@ -393,9 +393,9 @@ data:
 
 `lock_platform` and `unlock_platform` are safe to call from automations while a parent also uses the Family Safety app:
 
-- The **first** `lock_platform` of a child's platform reads the override Microsoft has in force (a parent's own lock, extra time, or nothing) and saves it, with the fact that the integration now holds a lock there. Repeated locks keep that first saved state, also after a restart or a failed call. A lock already in force that ends later is kept, never shortened.
-- `unlock_platform` puts the saved lock back if it has not run out yet, otherwise cancels. Saved extra time is not granted again. It only undoes a lock that is still the integration's own: if a parent changed it in the Family Safety app since (another lock, extra time, or an unlock), it is left alone.
-- The override in force is read from the Xbox Family Settings service for Xbox and from the mobile API for Windows and Mobile. Without the Xbox Family Settings sign-in linked, the Xbox state cannot be read: the lock still works, but `unlock_platform` simply cancels.
+- The **first** `lock_platform` of a child's platform reads the override Microsoft has in force (a parent's own lock, extra time, or nothing) and saves it, with the fact that the integration now holds a lock there. Repeated locks keep that first saved state, also after a restart or a failed call. A lock already in force that ends later is kept, never shortened. If a parent extended the lock in the app since, a repeat lock leaves the parent's lock in force and does not take it over.
+- `unlock_platform` puts the saved lock back if it has not run out yet, otherwise cancels. Saved extra time is not granted again. It only undoes a lock that is still the integration's own: if a parent put another lock or extra time in force since, it is left alone. When Microsoft shows nothing in force although the integration holds the lock, or the state cannot be read, the cancel is still sent (harmless if nothing is there), so a child is never left locked by a read that missed the lock.
+- The override in force is read from the Xbox Family Settings service for Xbox and from the mobile API for Windows and Mobile, and written the same way; the web session is not used. A failed read is tried once more; if it still fails the lock goes ahead with the prior state "unknown", and `unlock_platform` then only cancels a lock it can identify as its own.
 
 Both actions can answer with what they did (`response_variable`), `{prior, applied}`:
 
@@ -404,8 +404,11 @@ Both actions can answer with what they did (`response_variable`), `{prior, appli
 | `{type: blockUntil, valid_until}` | A lock was sent (by `lock_platform`, or a saved lock put back by `unlock_platform`) |
 | `{type: none}` | The lock was cancelled (`not_restored` lists saved extra time that was not granted again) |
 | `"left_parent_override"` | Someone changed the lock since; nothing was sent. `current: {type, valid_until, override_until, allow_until}` tells what is in force |
+| `"parent_lock_kept"` | (`lock_platform`) A longer lock that is not the integration's is in force; nothing was sent, see `current` |
 | `"hold_expired"` | The integration's lock had already run out; nothing was sent |
 | `"not_locked"` | The integration's lock never went through; nothing was sent |
+
+`unlock_platform` adds `prior_unknown: true` when the state before the lock could not be read, and `state_unknown: true` when the state at unlock could not be read. `until` may be at most 168 hours away, like `duration_hours`.
 
 ```yaml
 - action: microsoft_family_safety.unlock_platform

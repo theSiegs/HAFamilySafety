@@ -228,6 +228,9 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
     await hass.config_entries.async_reload(entry.entry_id)
 
 
+#: The longest platform lock, as for duration_hours.
+_MAX_LOCK_HOURS = 168
+
 #: Services that answer with what they did (``{"prior", "applied"}``).
 _RESPONSE_SERVICES = frozenset({SERVICE_LOCK_PLATFORM, SERVICE_UNLOCK_PLATFORM})
 
@@ -244,6 +247,10 @@ def _lock_until(data: dict) -> datetime:
         until = until.replace(tzinfo=dt_util.get_default_time_zone())
     if until <= dt_util.now():
         raise ServiceValidationError(f"until ({until.isoformat()}) is not in the future.")
+    if until > dt_util.now() + timedelta(hours=_MAX_LOCK_HOURS):
+        raise ServiceValidationError(
+            f"until ({until.isoformat()}) is more than {_MAX_LOCK_HOURS} hours away."
+        )
     return until
 
 
@@ -348,10 +355,16 @@ def _register_services(hass: HomeAssistant) -> None:
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Delete the Xbox Family Settings refresh token kept for this entry."""
+    """Delete the Xbox Family Settings refresh token and the platform holds of this entry."""
+    from homeassistant.helpers.storage import Store
+
+    from .coordinator import PLATFORM_HOLD_STORAGE_KEY, STORAGE_VERSION
     from .xbox_family_api import XboxFamilyAPI
 
     await XboxFamilyAPI(hass, entry.entry_id).async_unlink()
+    await Store(
+        hass, STORAGE_VERSION, f"{PLATFORM_HOLD_STORAGE_KEY}.{entry.entry_id}"
+    ).async_remove()
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

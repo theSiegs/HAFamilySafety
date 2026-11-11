@@ -24,8 +24,11 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.util import dt as dt_util
 
-from custom_components.microsoft_family_safety import _register_services
-from custom_components.microsoft_family_safety.const import DOMAIN
+from custom_components.microsoft_family_safety import (
+    _register_services,
+    async_remove_entry,
+)
+from custom_components.microsoft_family_safety.const import CONF_STRICT_MODE, DOMAIN
 from custom_components.microsoft_family_safety.coordinator import (
     PLATFORM_HOLD_STORAGE_KEY,
     FamilySafetyDataUpdateCoordinator,
@@ -47,6 +50,7 @@ from custom_components.microsoft_family_safety.xbox_family_api import (
 )
 
 CHILD = "1234567890123456"
+NONE = {"type": "none", "valid_until": None}
 XUID = "2535400000000001"
 
 
@@ -299,24 +303,67 @@ async def test_int_roster_ids_and_str_service_ids_meet(coordinator, xbox):
     assert coordinator.platform_hold(CHILD, "Xbox") is None
 
 
-async def test_xbox_without_the_xapprove_link_saves_an_unknown_prior(coordinator, xbox):
-    """Only the web session could read the Xbox override then: nothing is read."""
+async def test_xbox_without_the_xapprove_link_is_refused_without_the_web(coordinator, xbox):
+    """No Xbox Family Settings link: refused, never sent through the web session."""
     xbox.linked = False
-    web = MagicMock(has_web_cookies=True)
+    web = _web_session(coordinator)
+
+    with pytest.raises(HomeAssistantError, match="Xbox Family Settings"):
+        await coordinator.async_lock_platform(CHILD, "Xbox", _hours(2))
+    # The refused lock never went through: nothing to undo.
+    assert (await coordinator.async_unlock_platform(CHILD, "Xbox"))["applied"] == "not_locked"
+    with pytest.raises(HomeAssistantError, match="Xbox Family Settings"):
+        await coordinator.async_unlock_platform(CHILD, "Xbox")
+
+    assert web.method_calls == []
+    assert xbox.writes == []
+
+
+def _web_session(coordinator) -> MagicMock:
+    """A live Family web session, to prove the lock paths never use it."""
+    web = MagicMock(has_web_cookies=True, family_context_state="ready")
     web.set_platform_time_override = AsyncMock(return_value=True)
-    web.get_xbox_screentime_policy = AsyncMock()
-    web.get_device_overrides = AsyncMock()
     coordinator.web_api = web
     coordinator._has_web_credentials = True
+    return web
 
-    result = await coordinator.async_lock_platform(CHILD, "Xbox", _hours(2))
-    assert result["prior"]["type"] == "unknown"
-    unlocked = await coordinator.async_unlock_platform(CHILD, "Xbox")
 
-    assert unlocked["applied"]["type"] == "none"
-    web.get_xbox_screentime_policy.assert_not_called()
-    web.get_device_overrides.assert_not_called()
-    assert xbox.writes == []
+@pytest.mark.parametrize("platform", ["Xbox", "Windows"])
+async def test_no_write_goes_through_the_web_session(hass, platform):
+    """Lock, restore, unlock, release and a strict-mode re-lock: mobile API or xapprove only."""
+    entry = MockConfigEntry(
+        domain=DOMAIN, data={"refresh_token": "x"}, options={CONF_STRICT_MODE: True}
+    )
+    entry.add_to_hass(hass)
+    xbox, mobile = FakeXbox(), FakeMobile()
+    coord = _make(hass, entry, xbox, mobile)
+    web = _web_session(coord)
+    writes = xbox.writes if platform == "Xbox" else mobile.writes
+    parent = _hours(1)
+    if platform == "Xbox":
+        xbox.overrides = [_xbox(OVERRIDE_BLOCK, parent)]
+    else:
+        mobile.platforms["Windows"] = [
+            {"overrideType": "BlockUntil", "validUntil": iso_utc(parent)}
+        ]
+
+    await coord.async_lock_platform(CHILD, platform, _hours(3))
+    restored = await coord.async_unlock_platform(CHILD, platform)  # the parent lock back
+    assert restored["applied"]["type"] == "blockUntil"
+    await coord.async_lock_platform(CHILD, platform, _hours(3))
+    key = coord._hold_key(CHILD, platform)
+    coord._platform_holds[key]["confirmed_at"] = iso_utc(_hours(-1))
+    xbox.overrides = []
+    mobile.platforms["Windows"] = []
+    before = len(writes)
+    await coord._async_enforce_holds({CHILD: NONE})  # cancelled elsewhere: placed again
+    await hass.async_block_till_done()
+    assert len(writes) == before + 1
+    await coord.async_unlock_platform(CHILD, platform)
+    await coord.async_release_platform(CHILD, platform)
+
+    assert len(writes) == 6
+    assert web.method_calls == []
 
 
 # --- Windows and Mobile: read from the mobile API -------------------------------
@@ -375,6 +422,15 @@ def test_override_parsers():
     assert parse_xbox_override({"overrides": [{"overrideType": 7, "validUntil": later}]}) is None
     assert parse_xbox_override({"overrides": [{"overrideType": 2}]}) is None
     assert parse_xbox_override(None) is None
+    # Two of a kind: the one ending last.
+    latest = iso_utc(now + timedelta(hours=5))
+    assert parse_xbox_override({"overrides": [
+        {"overrideType": 2, "validUntil": later}, {"overrideType": 2, "validUntil": latest},
+    ]})["valid_until"] == latest
+    assert parse_mobile_override({"lockablePlatforms": [{"appliesTo": "Windows", "overrides": [
+        {"overrideType": "BlockUntil", "validUntil": latest},
+        {"overrideType": "BlockUntil", "validUntil": later},
+    ]}]}, "Windows")["valid_until"] == latest
 
 
 # --- unlock only touches a lock that is still ours ------------------------------
@@ -399,7 +455,6 @@ async def test_unlock_after_our_hold_ran_out_writes_nothing(coordinator, xbox):
     [
         (lambda: [_xbox(OVERRIDE_BLOCK, _hours(8))], "blockUntil"),  # a longer lock
         (lambda: [_xbox(OVERRIDE_ALLOW, _hours(1))], "allowUntil"),  # extra time
-        (lambda: [], "none"),  # released from the app
     ],
 )
 async def test_unlock_leaves_a_parent_change_alone(coordinator, xbox, parent, kind):
@@ -424,6 +479,109 @@ async def test_unlock_when_the_state_cannot_be_read_still_unlocks(coordinator, x
 
     assert xbox.writes[-1][0] == OVERRIDE_REVOKE
     assert result["applied"]["type"] == "none"
+    assert result["state_unknown"] is True
+
+
+@pytest.mark.parametrize("platform", ["Xbox", "Windows"])
+async def test_unlock_cancels_when_the_read_shows_nothing(coordinator, xbox, mobile, platform):
+    """Released in the app, or a read that misses our lock: cancel anyway."""
+    await coordinator.async_lock_platform(CHILD, platform, _hours(3))
+    xbox.overrides = []
+    mobile.platforms[platform] = []
+    xbox.writes.clear()
+    mobile.writes.clear()
+
+    result = await coordinator.async_unlock_platform(CHILD, platform)
+
+    assert result["applied"]["type"] == "none"
+    if platform == "Xbox":
+        assert [kind for kind, _ in xbox.writes] == [OVERRIDE_REVOKE]
+    else:
+        assert mobile.writes == [("Windows", "Cancel")]
+    assert coordinator.platform_hold(CHILD, platform) is None
+
+
+async def test_a_parent_extension_is_not_taken_over_by_a_repeat_lock(coordinator, xbox):
+    await coordinator.async_lock_platform(CHILD, "Xbox", _hours(2))
+    parent_until = _hours(8)
+    xbox.overrides = [_xbox(OVERRIDE_BLOCK, parent_until)]  # extended in the app
+    xbox.writes.clear()
+
+    again = await coordinator.async_lock_platform(CHILD, "Xbox", _hours(2))
+
+    assert again["applied"] == "parent_lock_kept"
+    assert parse_utc(again["current"]["valid_until"]) == parse_utc(iso_utc(parent_until))
+    hold = coordinator.platform_hold(CHILD, "Xbox")
+    assert hold["superseded"] is True
+    assert parse_utc(hold["until"]) < _hours(2.1)
+    unlocked = await coordinator.async_unlock_platform(CHILD, "Xbox")
+    assert unlocked["applied"] == "left_parent_override"
+    assert xbox.writes == []  # the parent's extension stays
+
+
+async def test_an_unreadable_prior_still_locks_and_unlock_only_cancels_its_own(
+    coordinator, xbox
+):
+    xbox.overrides = None  # both reads fail
+    result = await coordinator.async_lock_platform(CHILD, "Xbox", _hours(2))
+    assert result["prior"]["type"] == "unknown"
+    assert result["applied"]["type"] == "blockUntil"
+
+    # A parent's other lock is in force now: left alone.
+    xbox.overrides = [_xbox(OVERRIDE_BLOCK, _hours(6))]
+    xbox.writes.clear()
+    left = await coordinator.async_unlock_platform(CHILD, "Xbox")
+    assert left["applied"] == "left_parent_override"
+    assert left["prior_unknown"] is True
+    assert xbox.writes == []
+
+    # Our own lock is identifiable: cancelled.
+    xbox.overrides = None
+    await coordinator.async_lock_platform(CHILD, "Xbox", _hours(2))
+    xbox.writes.clear()
+    ours = await coordinator.async_unlock_platform(CHILD, "Xbox")
+    assert ours["applied"]["type"] == "none"
+    assert ours["prior_unknown"] is True
+    assert [kind for kind, _ in xbox.writes] == [OVERRIDE_REVOKE]
+
+
+async def test_the_prior_is_read_a_second_time_when_the_first_read_fails(coordinator, xbox):
+    reads = []
+    original = xbox.async_get_overrides
+
+    async def flaky(xuid):
+        reads.append(xuid)
+        if len(reads) == 1:
+            raise XboxFamilyError("timeout")
+        return await original(xuid)
+
+    xbox.async_get_overrides = flaky
+    xbox.overrides = [_xbox(OVERRIDE_BLOCK, _hours(1))]
+    result = await coordinator.async_lock_platform(CHILD, "Xbox", _hours(3))
+    assert len(reads) == 2
+    assert result["prior"]["type"] == "blockUntil"
+
+
+async def test_expired_holds_are_pruned_a_day_after_their_end(coordinator):
+    await coordinator.async_lock_platform(CHILD, "Xbox", _hours(2))
+    await coordinator.async_lock_platform(CHILD, "Windows", _hours(2))
+    holds = coordinator._platform_holds
+    holds[coordinator._hold_key(CHILD, "Xbox")]["until"] = iso_utc(_hours(-25))
+    holds[coordinator._hold_key(CHILD, "Windows")]["until"] = iso_utc(_hours(-1))
+
+    await coordinator._async_prune_platform_holds()
+
+    assert coordinator.platform_hold(CHILD, "Xbox") is None
+    # Ended an hour ago: kept, so an unlock still knows it ran out.
+    assert coordinator.platform_hold(CHILD, "Windows") is not None
+
+
+async def test_removing_the_entry_deletes_the_holds(hass, entry, coordinator, hass_storage):
+    await coordinator.async_lock_platform(CHILD, "Xbox", _hours(2))
+    key = f"{PLATFORM_HOLD_STORAGE_KEY}.{entry.entry_id}"
+    assert key in hass_storage
+    await async_remove_entry(hass, entry)
+    assert key not in hass_storage
 
 
 async def test_the_lock_switch_off_cancels_without_restoring(coordinator, entry, xbox):
@@ -489,6 +647,8 @@ async def test_service_refuses_both_and_the_past(hass, service):
         await _call(hass, duration_hours=2, until=(dt_util.now() + timedelta(hours=1)).isoformat())
     with pytest.raises(ServiceValidationError, match="future"):
         await _call(hass, until=(dt_util.now() - timedelta(hours=1)).isoformat())
+    with pytest.raises(ServiceValidationError, match="168 hours"):
+        await _call(hass, until=(dt_util.now() + timedelta(hours=169)).isoformat())
     service.async_lock_platform.assert_not_awaited()
 
 

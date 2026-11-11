@@ -694,87 +694,6 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         account_data["blocked_platforms"] = blocked
         account_data["xbox_lock_known"] = key[0] in self._xbox_lock_known
 
-    async def _async_send_platform_lock(
-        self, account_id: str, platform: str, valid_until: datetime | None = None
-    ) -> None:
-        """Send a lock as it is; async_lock_platform keeps the hold around it."""
-        account = self._accounts.get(account_id)
-        if account is None:
-            raise ValueError(f"Account {account_id} not found")
-        until = valid_until or (dt_util.now() + timedelta(hours=24))
-
-        if platform.lower() == "xbox" and (xuid := await self._xapprove_xuid_for(account_id)):
-            try:
-                result = await self.xbox_family.async_create_override(
-                    xuid, OVERRIDE_BLOCK, until
-                )
-            except XboxFamilyError as err:
-                _LOGGER.warning("xapprove Xbox lock failed, trying the web path: %s", err)
-            else:
-                if any(
-                    o.get("overrideType") == OVERRIDE_BLOCK
-                    for o in result.get("overrides") or []
-                ):
-                    self._platform_override_until[(str(account_id), "xbox")] = dt_util.as_utc(until)
-                    self._xbox_lock_known.add(str(account_id))
-                    await self.async_request_refresh()
-                    return
-                _LOGGER.warning(
-                    "xapprove accepted the Xbox lock but reports no block; trying the web path"
-                )
-
-        # Windows AND Xbox both have a working web override endpoint; they are
-        # separate paths, not one endpoint parameterised by platform (see
-        # FamilySafetyWebAPI.supports_platform_override).
-        #
-        # Xbox previously fell straight through to the pyfamilysafety mobile
-        # aggregator below.  That aggregator still ACCEPTS and STORES an Xbox
-        # override -- and reports it back via blocked_platforms -- but Microsoft
-        # stopped honouring it on the console, the same regression that forced
-        # Xbox *usage* onto the web report-v3 endpoint around 2026-08-20.  The
-        # result was a lock that read as applied and did nothing.
-        if (
-            FamilySafetyWebAPI.supports_platform_override(platform)
-            and self._native_web_auth
-            and self.web_api is not None
-            and self.web_api.has_web_cookies
-        ):
-            until_utc = dt_util.as_utc(until)
-            date_time = until_utc.isoformat(timespec="milliseconds").replace("+00:00", "Z")
-            try:
-                await self.web_api.set_platform_time_override(
-                    account_id, platform, "blockUntil", date_time
-                )
-            except Exception as err:
-                if platform.lower() in self._WEB_LOCK_STATE_PLATFORMS:
-                    raise HomeAssistantError(
-                        f"Could not lock {platform}: the Family web request failed ({err})"
-                    ) from err
-                _LOGGER.debug(
-                    "%s web override unavailable; falling back to mobile API: %s",
-                    platform, err,
-                )
-            else:
-                self._platform_override_until[(str(account_id), platform.lower())] = until_utc
-                if platform.lower() in self._WEB_LOCK_STATE_PLATFORMS:
-                    self._xbox_lock_known.add(str(account_id))
-                await self.async_request_refresh()
-                return
-
-        # The mobile API still accepts an Xbox override but the console ignores
-        # it, so reporting success here would tell automations the console is
-        # locked when it is not.
-        if platform.lower() in self._WEB_LOCK_STATE_PLATFORMS:
-            raise HomeAssistantError(
-                f"Cannot lock {platform}: it can only be locked through the Family "
-                "web session, which is not available. Re-authenticate the integration."
-            )
-        # pyfamilysafety formats the value with a literal "Z": give it real UTC.
-        await self._override_platform_mobile(
-            account, account_id, platform, OverrideType.UNTIL,
-            dt_util.as_utc(until).replace(tzinfo=None),
-        )
-
     async def _override_platform_mobile(
         self,
         account: Account,
@@ -791,8 +710,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except AggregatorException as err:
             # Seen on 2026-11-05: HTTP 500 "aggregator error", override applied anyway.
             await self.async_refresh()
-            accounts = (self.data or {}).get("accounts", {})
-            blocked = accounts.get(str(account_id), {}).get("blocked_platforms", [])
+            blocked = (self._account_data(account_id) or {}).get("blocked_platforms", [])
             if (platform in blocked) != (override == OverrideType.UNTIL):
                 raise HomeAssistantError(
                     f"Microsoft answered an error and {platform} has not changed yet; "
@@ -801,78 +719,6 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.info("Microsoft answered 500 but the %s override was applied", platform)
             return
         await self.async_request_refresh()
-
-    async def _async_send_platform_unlock(self, account_id: str, platform: str) -> None:
-        """Send an unlock as it is; async_unlock_platform keeps the hold around it."""
-        account = self._accounts.get(account_id)
-        if account is None:
-            raise ValueError(f"Account {account_id} not found")
-
-        if platform.lower() == "xbox" and (xuid := await self._xapprove_xuid_for(account_id)):
-            # The Xbox app's "revoke" (type 100) is the only release captured so
-            # far; the read-back decides whether it lifted a block too.
-            try:
-                result = await self.xbox_family.async_create_override(
-                    xuid, OVERRIDE_REVOKE, dt_util.utcnow() + timedelta(minutes=10)
-                )
-            except XboxFamilyError as err:
-                _LOGGER.warning("xapprove Xbox unlock failed, trying the web path: %s", err)
-            else:
-                if not any(
-                    o.get("overrideType") == OVERRIDE_BLOCK
-                    for o in result.get("overrides") or []
-                ):
-                    self._platform_override_until.pop((str(account_id), "xbox"), None)
-                    self._xbox_lock_known.add(str(account_id))
-                    await self.async_request_refresh()
-                    return
-                _LOGGER.warning(
-                    "xapprove revoke left the Xbox block in place; trying the web path"
-                )
-
-        if (
-            FamilySafetyWebAPI.supports_platform_override(platform)
-            and self._native_web_auth
-            and self.web_api is not None
-            and self.web_api.has_web_cookies
-        ):
-            until = self._platform_override_until.get(
-                (str(account_id), platform.lower()), dt_util.utcnow()
-            )
-            date_time = dt_util.as_utc(until).isoformat(timespec="milliseconds").replace(
-                "+00:00", "Z"
-            )
-            try:
-                await self.web_api.set_platform_time_override(
-                    account_id, platform, "cancel", date_time
-                )
-            except Exception as err:
-                if platform.lower() in self._WEB_LOCK_STATE_PLATFORMS:
-                    raise HomeAssistantError(
-                        f"Could not unlock {platform}: the Family web request failed ({err})"
-                    ) from err
-                _LOGGER.debug(
-                    "%s web cancel unavailable; falling back to mobile API: %s",
-                    platform, err,
-                )
-            else:
-                self._platform_override_until.pop((str(account_id), platform.lower()), None)
-                if platform.lower() in self._WEB_LOCK_STATE_PLATFORMS:
-                    self._xbox_lock_known.add(str(account_id))
-                await self.async_request_refresh()
-                return
-
-        # As for the lock: a mobile-API Xbox cancel does nothing on the console,
-        # so fail and keep the lock state as it is rather than report "unlocked".
-        if platform.lower() in self._WEB_LOCK_STATE_PLATFORMS:
-            raise HomeAssistantError(
-                f"Cannot unlock {platform}: it can only be unlocked through the Family "
-                "web session, which is not available. Re-authenticate the integration."
-            )
-        await self._override_platform_mobile(
-            account, account_id, platform, OverrideType.CANCEL
-        )
-        self._platform_override_until.pop((str(account_id), platform.lower()), None)
 
     # ------------------------------------------------------------------
     # lock_platform / unlock_platform: save the override in force, put it back
@@ -887,14 +733,15 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # future) or cancels, then forgets the hold; it only undoes a lock that
     # is still ours.
     #
-    # The override in force is read from the Xbox Family Settings service
-    # (xapprove) for Xbox and from the mobile API for Windows and Mobile.
-    # An Xbox without the Xbox Family Settings link reads as unknown: the
-    # lock still works, but nothing is restored on unlock.
+    # Xbox is read and written through the Xbox Family Settings service
+    # (xapprove), Windows and Mobile through the mobile API.
 
     #: How far Microsoft's blockUntil may sit from the end we recorded and
     #: still be ours (it stores the value sent, give or take rounding).
     _OWN_LOCK_TOLERANCE = timedelta(minutes=2)
+    #: A hold whose lock ended is kept this long, so an unlock soon after
+    #: still knows the lock ran out (and sends nothing), then pruned.
+    _HOLD_KEEP_AFTER_END = timedelta(days=1)
 
     @staticmethod
     def _hold_key(account_id: Any, platform: str) -> str:
@@ -915,6 +762,21 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_save_platform_holds(self) -> None:
         await self._hold_store.async_save(self._platform_holds)
+
+    async def _async_prune_platform_holds(self) -> None:
+        """Forget holds whose lock ended more than a day ago (run on each poll)."""
+        await self._async_load_platform_holds()
+        limit = dt_util.utcnow() - self._HOLD_KEEP_AFTER_END
+        stale = [
+            key for key, hold in self._platform_holds.items()
+            if (until := parse_utc(hold.get("until"))) is not None and until <= limit
+            and not self._hold_lock(key).locked()
+        ]
+        for key in stale:
+            self._platform_holds.pop(key, None)
+            self._last_reassert.pop(key, None)
+        if stale:
+            await self._async_save_platform_holds()
 
     def platform_hold(self, account_id: Any, platform: str) -> dict[str, Any] | None:
         """The lock this integration holds on a child's platform, if any."""
@@ -948,7 +810,6 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if platform.lower() == "xbox":
                 xuid = await self._xapprove_xuid_for(account_id)
                 if xuid is None:
-                    # Only the Family web session could tell: left unknown.
                     return None
                 return parse_xbox_override(await self.xbox_family.async_get_overrides(xuid))
             account = self._accounts.get(self._roster_id(account_id))
@@ -962,20 +823,88 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return None
         return parse_mobile_override((response or {}).get("json"), platform)
 
+    async def _async_read_platform_override_retry(
+        self, account_id: Any, platform: str
+    ) -> dict[str, Any] | None:
+        """The override in force, read a second time when the first read fails."""
+        current = await self._async_read_platform_override(account_id, platform)
+        if current is None:
+            current = await self._async_read_platform_override(account_id, platform)
+        return current
+
     async def _async_write_platform_override(
         self, account_id: Any, platform: str, block: bool, until: datetime | None = None
     ) -> None:
-        """Send a blockUntil (until ``until``) or a cancel for one platform."""
-        if block:
-            await self._async_send_platform_lock(account_id, platform, until)
+        """Send a blockUntil (until ``until``) or a cancel for one platform.
+
+        Xbox goes through the Xbox Family Settings service only, Windows and
+        Mobile through the mobile API; a failure is raised, never retried on
+        another path.
+        """
+        key = (str(account_id), platform.lower())
+        if platform.lower() == "xbox":
+            await self._async_write_xbox_override(account_id, block, until)
         else:
-            await self._async_send_platform_unlock(account_id, platform)
+            account = self._accounts[self._roster_id(account_id)]
+            if block:
+                # pyfamilysafety formats the value with a literal "Z": give it real UTC.
+                await self._override_platform_mobile(
+                    account, account_id, platform, OverrideType.UNTIL,
+                    dt_util.as_utc(until).replace(tzinfo=None),
+                )
+            else:
+                await self._override_platform_mobile(
+                    account, account_id, platform, OverrideType.CANCEL
+                )
+        if block:
+            self._platform_override_until[key] = dt_util.as_utc(until)
+        else:
+            self._platform_override_until.pop(key, None)
+
+    async def _async_write_xbox_override(
+        self, account_id: Any, block: bool, until: datetime | None
+    ) -> None:
+        """Lock (override 2) or release (override 100) an Xbox through xapprove."""
+        action = "lock" if block else "unlock"
+        xuid = await self._xapprove_xuid_for(account_id)
+        if xuid is None:
+            raise HomeAssistantError(
+                f"Cannot {action} the Xbox: it needs the Xbox Family Settings sign-in. "
+                "Link it in the integration options (Link the Xbox Family Settings "
+                "sign-in)."
+            )
+        try:
+            # The Xbox app's "revoke" (type 100) is the release captured so far.
+            result = await self.xbox_family.async_create_override(
+                xuid,
+                OVERRIDE_BLOCK if block else OVERRIDE_REVOKE,
+                until if block else dt_util.utcnow() + timedelta(minutes=10),
+            )
+        except XboxFamilyError as err:
+            raise HomeAssistantError(f"Could not {action} the Xbox: {err}") from err
+        blocked = any(
+            o.get("overrideType") == OVERRIDE_BLOCK
+            for o in (result or {}).get("overrides") or []
+            if isinstance(o, dict)
+        )
+        if blocked != block:
+            raise HomeAssistantError(
+                f"The Xbox Family Settings service accepted the {action} but "
+                f"{'reports no block' if block else 'still reports a block'}."
+            )
+        self._xbox_lock_known.add(str(account_id))
+        await self.async_request_refresh()
 
     @staticmethod
     def _hold_in_force(hold: dict[str, Any], now: datetime) -> bool:
         """A hold whose lock has not run out yet (or was never sent)."""
         until = parse_utc(hold.get("until"))
         return until is None or until > now
+
+    @staticmethod
+    def _holds_the_lock(hold: dict[str, Any]) -> bool:
+        """Our lock went through and no one else's lock has replaced it since."""
+        return bool(hold.get("confirmed")) and not hold.get("superseded")
 
     def _is_own_lock(self, hold: dict[str, Any], current: dict[str, Any] | None) -> bool:
         """Microsoft still shows the blockUntil this hold sent."""
@@ -997,6 +926,11 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         Returns ``{"prior": ..., "applied": ...}``: the override saved on the
         first lock (kept unchanged by later ones) and the one now sent. A
         blockUntil already in force that ends later is kept, never shortened.
+
+        On a later lock, a longer block that is not ours (a parent extended
+        it in the app) is left in force and not taken over: the hold is
+        marked ``superseded``, nothing is sent (``applied:
+        "parent_lock_kept"``, with ``current``), and unlock leaves it alone.
         """
         roster_id = self._roster_id(account_id)
         requested = dt_util.as_utc(valid_until or (dt_util.now() + timedelta(hours=24)))
@@ -1009,8 +943,19 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # Our earlier lock has run out on its own: a new hold starts.
                 self._platform_holds.pop(key, None)
                 hold = None
-            current = await self._async_read_platform_override(roster_id, platform)
+            current = await self._async_read_platform_override_retry(roster_id, platform)
+            current_block = (
+                active_until(current, now)
+                if (current or {}).get("type") == BLOCK_UNTIL
+                else None
+            )
             if hold is None:
+                if current is None:
+                    _LOGGER.info(
+                        "Could not read the %s override of %s before locking; the lock "
+                        "goes ahead, and unlock only cancels a lock it can tell is ours",
+                        platform, roster_id,
+                    )
                 hold = {
                     "account_id": str(roster_id),
                     "platform": platform,
@@ -1021,18 +966,33 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 }
                 self._platform_holds[key] = hold
                 await self._async_save_platform_holds()
-            target = requested
-            current_block = (
-                active_until(current, now)
-                if (current or {}).get("type") == BLOCK_UNTIL
-                else None
-            )
-            for later in (current_block, parse_utc(hold.get("until"))):
-                if later is not None and later > target:
-                    target = later
+            sent = hold.get("until") is not None
+            own = sent and self._is_own_lock(hold, current)
+            if (
+                sent
+                and current_block is not None
+                and current_block > requested
+                and not own
+            ):
+                # Someone else's longer lock replaced ours: leave it, do not adopt it.
+                hold["superseded"] = True
+                await self._async_save_platform_holds()
+                return {
+                    "prior": dict(hold["prior"]),
+                    "applied": "parent_lock_kept",
+                    "current": self._override_details(current),
+                }
+            if not sent:
+                # First lock: a block already in force that ends later is kept.
+                target = max(requested, current_block or requested)
+            else:
+                # Ours, or unreadable (nothing says otherwise): never shortened.
+                ours = parse_utc(hold.get("until")) if (current is None or own) else None
+                target = max(requested, ours or requested)
             # Recorded before the write: should Microsoft apply it and the
             # call still fail, a retry knows the blockUntil it reads is ours.
             hold["until"] = iso_utc(target)
+            hold.pop("superseded", None)
             await self._async_save_platform_holds()
             await self._async_write_platform_override(roster_id, platform, True, target)
             hold["confirmed"] = True
@@ -1046,15 +1006,21 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         * No hold: cancel, as before this integration tracked its locks.
         * Our hold has run out: forget it; nothing is sent
           (``applied: "hold_expired"``).
-        * Microsoft still shows our blockUntil (or cannot be read): put back a
-          saved blockUntil still in the future, else cancel. Saved extra time
-          (allowUntil) is not written back, so that also cancels.
-        * Someone changed it since (another blockUntil, extra time, or a
-          cancel): leave it and forget the hold (``applied:
-          "left_parent_override"``, with ``current``, what is in force now),
-          or ``"not_locked"`` when our lock never went through.
+        * Microsoft still shows our blockUntil: put back a saved blockUntil
+          still in the future, else cancel. Saved extra time (allowUntil) is
+          not written back, so that also cancels.
+        * Microsoft shows nothing in force although we hold the lock (a
+          release in the app, or a read that misses our lock): cancel anyway,
+          which is harmless if nothing is there. The same when the state
+          cannot be read at all (``state_unknown: true`` in the answer).
+        * Someone else's lock or extra time is in force (or ours was
+          replaced): leave it, forget the hold (``applied:
+          "left_parent_override"`` with ``current``), or ``"not_locked"``
+          when our lock never went through.
 
-        Returns ``{"prior": ..., "applied": ...}``.
+        With an unknown prior (it could not be read before the lock), only a
+        lock that is identifiably ours is cancelled; the answer then has
+        ``prior_unknown: true``. Returns ``{"prior": ..., "applied": ...}``.
         """
         roster_id = self._roster_id(account_id)
         key = self._hold_key(roster_id, platform)
@@ -1066,14 +1032,31 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if hold and isinstance(hold.get("prior"), dict)
                 else None
             )
+            flags: dict[str, Any] = {}
+            if prior is not None and prior.get("type") == UNKNOWN:
+                flags["prior_unknown"] = True
+            restore = True
             if hold is not None:
                 left: str | None = None
                 current: dict[str, Any] | None = None
                 if hold.get("until") and not self._hold_in_force(hold, dt_util.utcnow()):
                     left = "hold_expired"
                 else:
-                    current = await self._async_read_platform_override(roster_id, platform)
-                    if current is not None and not self._is_own_lock(hold, current):
+                    current = await self._async_read_platform_override_retry(
+                        roster_id, platform
+                    )
+                    holding = self._holds_the_lock(hold)
+                    if current is None:
+                        flags["state_unknown"] = True
+                        if not holding:
+                            left = "left_parent_override" if hold.get("confirmed") else "not_locked"
+                    elif self._is_own_lock(hold, current) and not hold.get("superseded"):
+                        pass  # ours: restore or cancel below
+                    elif current.get("type") == NO_OVERRIDE and holding:
+                        # Released elsewhere, or the read misses our lock: cancel
+                        # anyway (harmless) rather than leave a child locked.
+                        restore = False
+                    else:
                         # An unconfirmed hold is a lock that never went through.
                         left = "left_parent_override" if hold.get("confirmed") else "not_locked"
                         _LOGGER.info(
@@ -1087,12 +1070,12 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         self._platform_override_until.pop(
                             (str(roster_id), platform.lower()), None
                         )
-                    result: dict[str, Any] = {"prior": prior, "applied": left}
-                    if left == "left_parent_override":
+                    result: dict[str, Any] = {"prior": prior, "applied": left, **flags}
+                    if left == "left_parent_override" and current is not None:
                         # What is in force now, so a caller can match it.
                         result["current"] = self._override_details(current)
                     return result
-            restore_until = active_until(prior)
+            restore_until = active_until(prior) if restore else None
             if restore_until is not None and prior["type"] == BLOCK_UNTIL:
                 await self._async_write_platform_override(
                     roster_id, platform, True, restore_until
@@ -1111,7 +1094,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if hold is not None:
                 self._platform_holds.pop(key, None)
                 await self._async_save_platform_holds()
-            return {"prior": prior, "applied": applied}
+            return {"prior": prior, "applied": applied, **flags}
 
     async def async_release_platform(self, account_id: str, platform: str) -> None:
         """Cancel any lock on the platform and forget the hold: the lock switch's off.
@@ -1135,13 +1118,17 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     ) -> None:
         """Strict mode: put back a lock of ours that Microsoft reports as cancelled.
 
-        Only a hold this integration confirmed, whose end is still ahead, and
-        only on an explicit "nothing in force" read-back: an unreadable answer
-        never triggers a write. The Xbox read-back is the xapprove answer this
-        poll already fetched (``xbox_overrides``); a lock confirmed after that
-        read (``xbox_read_at``) is not judged by it, since the read predates
-        the lock. Other platforms read the mobile API now. The write runs in
-        the background, after this poll, so its refresh does not nest.
+        Only a hold this integration confirmed and still holds, whose end is
+        still ahead, and only on an explicit "nothing in force" read-back: an
+        unreadable answer never triggers a write. The Xbox read-back is the
+        xapprove answer this poll already fetched (``xbox_overrides``); a lock
+        confirmed after that read (``xbox_read_at``) is not judged by it,
+        since the read predates the lock. Other platforms read the mobile API
+        now. A lock is placed again at most every 10 minutes, counted from
+        our last write of it (the lock itself or a previous re-lock), so a
+        read that does not show a fresh lock yet cannot trigger a second one.
+        The write runs in the background, after this poll, so its refresh
+        does not nest.
         """
         if not self._strict_mode:
             return
@@ -1150,7 +1137,13 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         candidates: list[tuple[str, str, str, datetime]] = []
         for key, hold in list(self._platform_holds.items()):
             until = parse_utc(hold.get("until"))
-            if not hold.get("confirmed") or until is None or until <= now:
+            if not self._holds_the_lock(hold) or until is None or until <= now:
+                continue
+            written = [
+                t for t in (self._last_reassert.get(key), parse_utc(hold.get("confirmed_at")))
+                if t is not None
+            ]
+            if written and now - max(written) < _STRICT_REASSERT_COOLDOWN:
                 continue
             account_id = str(hold.get("account_id"))
             platform = str(hold.get("platform") or key.split("|", 1)[-1])
@@ -1178,9 +1171,6 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         for (key, account_id, platform, until), state in zip(candidates, states):
             if not isinstance(state, dict) or state.get("type") != NO_OVERRIDE:
-                continue
-            last = self._last_reassert.get(key)
-            if last is not None and now - last < _STRICT_REASSERT_COOLDOWN:
                 continue
             self._last_reassert[key] = now
             self.entry.async_create_background_task(
@@ -2508,9 +2498,10 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self._async_sync_roster_notification(accounts_data)
             self._accounts = new_accounts
             try:
+                await self._async_prune_platform_holds()
                 await self._async_enforce_holds(xbox_overrides, xbox_read_at)
             except Exception as err:  # noqa: BLE001 - never fail the poll for it
-                _LOGGER.debug("Strict mode check failed: %r", err)
+                _LOGGER.debug("Platform hold check failed: %r", err)
             self._devices = new_devices
             pending = getattr(self.api, "pending_requests", None) or []
             self._is_retrying_auth = False

@@ -77,17 +77,23 @@ def _entry(kind: str | None, valid_until: Any, now: datetime) -> dict[str, Any] 
     return override(kind, until)
 
 
+_RANK = {NO_OVERRIDE: 0, ALLOW_UNTIL: 1, BLOCK_UNTIL: 2}
+_NEVER = datetime.min.replace(tzinfo=dt_util.UTC)
+
+
+def _weight(entry: dict[str, Any]) -> tuple[int, datetime]:
+    return _RANK[entry["type"]], parse_utc(entry["valid_until"]) or _NEVER
+
+
 def _strongest(entries: list[dict[str, Any] | None]) -> dict[str, Any] | None:
-    """A lock wins over extra time, extra time over nothing; any unreadable entry is unknown."""
-    found = override(NO_OVERRIDE)
-    for entry in entries:
-        if entry is None:
-            return None
-        if entry["type"] == BLOCK_UNTIL:
-            return entry
-        if entry["type"] == ALLOW_UNTIL:
-            found = entry
-    return found
+    """The override in force among several.
+
+    A lock wins over extra time, extra time over nothing, and of two of a
+    kind the one ending last; any unreadable entry makes it unknown.
+    """
+    if any(entry is None for entry in entries):
+        return None
+    return max(entries, key=_weight, default=override(NO_OVERRIDE))
 
 
 def parse_mobile_override(
