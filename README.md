@@ -369,6 +369,7 @@ One start/end pair per day of the week, editable from the UI with optimistic upd
 |-------|------|------|
 | `microsoft_family_safety_request` | A new pending request (more time, an app) appears. Checked on every update; the first update after a start only sets the baseline, and a request must be missing for three updates in a row before it counts as new again | `entry_id`, `account_id`, `first_name`, `request_id`, `type`, `platform`, `app_id`, `app_name`, `requested_time` (as Microsoft gives it) |
 | `microsoft_family_safety_app_usage` | An app's minutes today grew between two updates (at least 0.5 min). Only with **App usage sensors per child** above 0. The first update of a day, or after a restart, only sets the baseline | `entry_id`, `account_id`, `first_name`, `app_id`, `app_name`, `platform`, `grew_minutes`, `today_minutes` |
+| `microsoft_family_safety_request_resolved` | A pending request left the list. Answered with `approve_request` / `deny_request`: on the next update, with `via: service`, `outcome` (`approved` / `denied`) and `minutes`. Answered elsewhere (the Family Safety app): once it has been gone for three updates in a row, with `via: app` and `outcome: unknown` (the mobile API does not say how) | `entry_id`, `account_id`, `request_id`, `outcome`, `minutes`, `via` |
 
 ```yaml
 automation:

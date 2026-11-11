@@ -95,6 +95,7 @@ from .const import (
     LEGACY_WEB_AUTH_KEYS,
     EVENT_REQUEST,
     SCREENTIME_PLATFORMS,
+    EVENT_REQUEST_RESOLVED,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -372,6 +373,13 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: An id is forgotten only after _REQUEST_FORGET_POLLS misses, so one
         #: empty or failed read does not make every open request "new" again.
         self._seen_request_ids: dict[str, int] | None = None
+        #: request id -> its child's account id, as last listed.
+        self._request_accounts: dict[str, str | None] = {}
+        #: request id -> (outcome, minutes) of an approve_request /
+        #: deny_request sent from here, for the resolved event.
+        self._handled_requests: dict[str, tuple[str, int | None]] = {}
+        #: Request ids a resolved event was fired for (oldest first, capped).
+        self._resolved_requests: dict[str, None] = {}
         #: How many of each child's most used apps get a usage sensor; 0 = off.
         self.app_usage_sensors = int(
             entry.options.get(CONF_APP_USAGE_SENSORS, DEFAULT_APP_USAGE_SENSORS) or 0
@@ -1774,22 +1782,26 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self.api is None:
             return False
         try:
-            return await self.api.approve_pending_request(
+            result = await self.api.approve_pending_request(
                 request_id, extension_time * 10
             )
         except ValueError as err:
             await self._async_request_gone("approve", request_id, err)
-        return False
+            return False
+        self._handled_requests[str(request_id)] = ("approved", int(extension_time) // 60)
+        return result
 
     async def async_deny_request(self, request_id: str) -> bool:
         """Deny a pending screen time request."""
         if self.api is None:
             return False
         try:
-            return await self.api.deny_pending_request(request_id)
+            result = await self.api.deny_pending_request(request_id)
         except ValueError as err:
             await self._async_request_gone("deny", request_id, err)
-        return False
+            return False
+        self._handled_requests[str(request_id)] = ("denied", None)
+        return result
 
     async def _async_request_gone(
         self, action: str, request_id: str, err: ValueError
@@ -3927,6 +3939,20 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         requests = [r for r in pending if isinstance(r, dict) and r.get("id") is not None]
         ids = {str(r["id"]) for r in requests}
         seen = self._seen_request_ids
+        for request in requests:
+            puid = request.get("puid")
+            self._request_accounts[str(request["id"])] = str(puid) if puid is not None else None
+        if seen is not None:
+            # Gone from the list: resolved. One answered from here counts at
+            # once; any other only once it has been missing as long as it
+            # takes to be forgotten, so a failed or empty read is no answer.
+            for request_id, misses in seen.items():
+                if request_id in ids:
+                    continue
+                if (misses == 0 and request_id in self._handled_requests) or (
+                    misses + 1 >= _REQUEST_FORGET_POLLS
+                ):
+                    self._fire_request_resolved(request_id)
         tracked: dict[str, int] = {request_id: 0 for request_id in ids}
         for request_id, misses in (seen or {}).items():
             if request_id not in ids and misses + 1 < _REQUEST_FORGET_POLLS:
@@ -3954,6 +3980,35 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "requested_time": request.get("requestedTime"),
                 },
             )
+
+    _RESOLVED_MEMORY = 500
+
+    def _fire_request_resolved(self, request_id: str) -> None:
+        """Fire microsoft_family_safety_request_resolved once for a request that left the list.
+
+        ``via`` is ``service`` when approve_request / deny_request answered it
+        from here (``outcome`` approved or denied, ``minutes`` granted), else
+        ``app`` with ``outcome`` unknown: the mobile API does not say how a
+        request answered elsewhere was decided.
+        """
+        if request_id in self._resolved_requests:
+            return
+        self._resolved_requests[request_id] = None
+        while len(self._resolved_requests) > self._RESOLVED_MEMORY:
+            self._resolved_requests.pop(next(iter(self._resolved_requests)))
+        handled = self._handled_requests.pop(request_id, None)
+        outcome, minutes = handled if handled else ("unknown", None)
+        self.hass.bus.async_fire(
+            EVENT_REQUEST_RESOLVED,
+            {
+                "entry_id": self.entry.entry_id,
+                "account_id": self._request_accounts.pop(request_id, None),
+                "request_id": request_id,
+                "outcome": outcome,
+                "minutes": minutes,
+                "via": "service" if handled else "app",
+            },
+        )
 
     def _fire_app_usage_events(self, accounts_data: dict[str, Any]) -> None:
         """Fire microsoft_family_safety_app_usage for each app that grew since the last poll."""
