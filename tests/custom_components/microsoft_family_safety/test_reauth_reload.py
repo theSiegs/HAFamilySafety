@@ -21,7 +21,11 @@ async def test_finished_sign_in_reloads_the_entry(source: str) -> None:
     flow.hass = MagicMock()
     flow.context = {"source": source}
     flow._pending_data = {"refresh_token": "new", "xbox_refresh_token": "xbox"}
-    entry = MagicMock(entry_id="entry-1", options={})
+    entry = MagicMock(
+        entry_id="entry-1",
+        options={},
+        data={"refresh_token": "old", "auth_user_id": "parent", "web_cookies": [{"name": "x"}]},
+    )
 
     with (
         patch.object(flow, "_get_existing_entry", return_value=entry),
@@ -30,6 +34,8 @@ async def test_finished_sign_in_reloads_the_entry(source: str) -> None:
         result = flow._async_finish_reauth()
 
     assert result == {"type": "abort"}
-    updates = update.call_args.kwargs["data_updates"]
-    assert updates == {"refresh_token": "new", "xbox_refresh_token": "xbox"}
+    # The new tokens replace the old one, and an earlier web session goes.
+    assert update.call_args.kwargs["data"] == {
+        "refresh_token": "new", "auth_user_id": "parent", "xbox_refresh_token": "xbox"
+    }
     flow.hass.config_entries.async_schedule_reload.assert_called_once_with("entry-1")

@@ -61,11 +61,11 @@ The integration no longer keeps a Microsoft Family **web session** (the `account
 
 Existing entries keep working on their mobile token, without a new sign-in: the stored cookies are deleted from the entry at the first start. What changes:
 
-- **Xbox lock and Xbox play time** come only from the [Xbox Family Settings sign-in](#xbox). It is linked during the Microsoft sign-in when Microsoft allows it, otherwise from the integration options. Without it, the Xbox lock switch reports an error instead of locking, and the Xbox play time is not added to the screen time.
+- **Xbox lock and Xbox play time** come only from the [Xbox Family Settings sign-in](#xbox). It is linked during the Microsoft sign-in when Microsoft allows it, otherwise from the integration options. Without it, the Xbox lock switch reports an error instead of locking, the Xbox play time is not added to the screen time, and a repair issue asks you to link it.
 - **Windows platform lock** always uses the mobile API's device override (the web time override is gone).
-- **Reauthentication** is only asked when Microsoft refuses the integration's refresh token, or the Xbox Family Settings sign-in. A lapsed web session, the Family dashboard asking for a sign-in, or missing cookies no longer start one.
-- **Connection sensor**: the web-session attributes are gone (see [Sensor — Per Integration](#sensor--per-integration)); `degraded` now means the Xbox Family Settings sign-in was refused.
-- **Sign-in**: every entry signs in through the Family Safety app's own page. "Stay signed in?" no longer matters, and an HTTP-only instance can always use the manual redirect step.
+- **Reauthentication** is only asked when Microsoft refuses the integration's refresh token. A lapsed web session, the Family dashboard asking for a sign-in, or missing cookies no longer start one. A refused Xbox Family Settings sign-in raises a repair issue asking for a new Xbox link instead.
+- **Connection sensor**: the web-session attributes are gone (see [Sensor — Per Integration](#sensor--per-integration)); `degraded` now means the Xbox Family Settings link is missing or refused while Xbox is ticked.
+- **Sign-in**: every entry signs in through the Family Safety app's own page. "Stay signed in?" no longer matters, and an HTTP-only instance can always use the manual redirect step, for a reauthentication too.
 
 ### The add-on is no longer used
 
@@ -161,7 +161,7 @@ Service call / entity write
 3. Set the **update interval** and the **monitored platforms** (Windows, Xbox, Mobile). Tick **Xbox** only if your children use one. Click **Submit**
 4. Home Assistant shows an **Open website** button. Click it: a browser window opens on the Microsoft sign-in page, served through Home Assistant's temporary authentication proxy
 5. Sign in with your **Microsoft parent account** (the family organizer, not a child account) and complete MFA if prompted
-6. As soon as Microsoft hands back the token, the window closes itself and the integration is created. With Xbox ticked, Home Assistant also tries to link the Xbox Family Settings sign-in in the same step (see [Xbox](#xbox))
+6. As soon as Microsoft hands back the token, the window closes itself; Home Assistant shows a short progress screen while it fetches the tokens, then creates the integration. With Xbox ticked, Home Assistant also tries to link the Xbox Family Settings sign-in in the same step (see [Xbox](#xbox))
 7. The integration discovers all child accounts and devices automatically. Screen-time entities can read `unknown` for up to one update interval (5 minutes by default) while the first data pull completes; that is expected
 
 > The old flow — copy an auth URL, sign in, paste the redirect URL back — is gone in the normal case. It survives as a fallback on HTTP-only instances.
@@ -194,7 +194,7 @@ Give the child a **non-administrator** account and tick the parents: an administ
 
 The Xbox lock, the Xbox limits and Xbox play time go through the **Xbox Family Settings** app's service, on its own refresh token. Microsoft moved the Xbox settings there: its per-day limits are the ones the console enforces, and an Xbox override stored by the Family Safety mobile API is accepted but ignored by the console.
 
-- **Xbox ticked** among the monitored platforms: the Xbox entities are created (Xbox lock, Xbox schedule switch, Xbox daily limits). The Xbox Family Settings sign-in is linked during the Microsoft sign-in when Microsoft allows it. If the Connection sensor shows `xbox_family: not_linked`, open the options, tick **Link the Xbox Family Settings sign-in**, open the link shown, sign in with the parent account and paste the address of the blank page you end up on.
+- **Xbox ticked** among the monitored platforms: the Xbox entities are created (Xbox lock, Xbox schedule switch, Xbox daily limits). The Xbox Family Settings sign-in is linked during the Microsoft sign-in when Microsoft allows it. Otherwise a repair issue appears (and the Connection sensor shows `xbox_family: not_linked`): open the options, tick **Link the Xbox Family Settings sign-in**, open the link shown, sign in with the parent account and paste the address of the blank page you end up on. If Microsoft later refuses that sign-in, it is retried every 6 hours and a repair issue asks you to link it again the same way.
 - **Xbox unticked** (the default for new installs): no Xbox entities are created and no Xbox Family Settings link is made.
 
 Without the link, the Xbox daily limits and the Xbox schedule switch still work through the mobile API, but the Xbox lock fails with an error (the mobile API's Xbox override does nothing on the console) and the Xbox play time is not read. Children are matched to their Xbox account by first name and surname; a child whose names differ between Microsoft and Xbox is reported in `xbox_family_unmatched_children` and has no Xbox lock.
@@ -214,7 +214,7 @@ Use it for testing, or on a network you fully trust. Setting up HTTPS is the bet
 
 ### Re-authenticating
 
-The mobile refresh token is long-lived and renewed by the integration on its own; you are not asked to sign in again as long as Microsoft accepts it. When Microsoft refuses it (password change, security review, revoked sign-in), or refuses the Xbox Family Settings sign-in, Home Assistant raises a **repair / reauthentication** prompt (plus a persistent notification for the Xbox case). You can also start it yourself at any time with the `microsoft_family_safety.request_reauth` service (handy from a dashboard button). Re-authenticating runs the same sign-in, renews the refresh token and, with Xbox ticked and the Xbox link missing or refused, links the Xbox Family Settings sign-in again.
+The mobile refresh token is long-lived and renewed by the integration on its own; you are not asked to sign in again as long as Microsoft accepts it. When Microsoft refuses it (password change, security review, revoked sign-in), Home Assistant raises a **repair / reauthentication** prompt. A refused Xbox Family Settings sign-in does not: it only affects the Xbox features, and a repair issue asks you to link it again from the options (see [Xbox](#xbox)). You can also start a reauthentication yourself at any time with the `microsoft_family_safety.request_reauth` service (handy from a dashboard button). Re-authenticating runs the same sign-in, renews the refresh token and, with Xbox ticked and the Xbox link missing or refused, links the Xbox Family Settings sign-in again.
 
 Reauthentication must use the **same Microsoft account** — signing in with a different one aborts with *"A different Microsoft account was used"*.
 
@@ -275,7 +275,7 @@ A typical single-child setup with a full app list lands around 85-90 entities.
 |--------|-----------|-------|----------------|
 | Connection | `sensor.microsoft_family_safety_connection` | connected / degraded / disconnected | `mobile_api`, `roster_errors`, `screentime_policy_status`, `xbox_features`, `xbox_family`, `xbox_family_linked_via`, `xbox_family_last_error`, `xbox_family_matched_children`, `xbox_family_unmatched_children`, `reauth_required`, `reauth_reason`, `last_update_success` |
 
-`connected` means the mobile API answers. `degraded` means it does, but Microsoft refused the Xbox Family Settings sign-in: only the Xbox lock, the Xbox limits and Xbox play time are affected, and a reauthentication is started. `disconnected` means the mobile API does not answer. `screentime_policy_status` is `ok`, `no_policy_data`, `network_error` or `error` for the last Windows schedule read. This is a **diagnostic** entity; enable it in the entity list if it is hidden.
+`connected` means the mobile API answers. `degraded` means it does, but with Xbox ticked the Xbox Family Settings link is missing (`xbox_family: not_linked`) or refused (`xbox_family: auth_failed`): only the Xbox lock and Xbox play time are affected, and a repair issue says how to link it. `disconnected` means the mobile API does not answer. `screentime_policy_status` is `ok`, `no_policy_data`, `network_error` or `error` for the last Windows schedule read. This is a **diagnostic** entity; enable it in the entity list if it is hidden.
 
 ### Switches — Per Child Account
 

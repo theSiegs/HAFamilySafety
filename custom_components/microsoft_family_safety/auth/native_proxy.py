@@ -1381,14 +1381,16 @@ _APP_RETURN_URL = (
 _RENOTIFY_MAX_SECONDS = 600.0
 _RENOTIFY_INTERVAL_SECONDS = 3.0
 #: Steps on which the flow waits for the frontend to fetch or configure it.
-_FRONTEND_WAIT_STEPS = frozenset({"check_mobile_proxy", "finish_mobile_proxy"})
+_FRONTEND_WAIT_STEPS = frozenset(
+    {"check_mobile_proxy", "finish_mobile_proxy", "finish_sign_in"}
+)
 
 
 #: Steps the server may advance by itself once the frontend has left them alone
 #: for _AUTO_ADVANCE_AFTER_SECONDS. The Home Assistant Android app closes the
 #: setup dialog when it opens the sign-in in its in-app browser, so nobody is
 #: left to fetch the next step and the sign-in was lost (#50).
-_AUTO_ADVANCE_STEPS = frozenset({"finish_mobile_proxy"})
+_AUTO_ADVANCE_STEPS = frozenset({"finish_mobile_proxy", "finish_sign_in"})
 _AUTO_ADVANCE_AFTER_SECONDS = 20.0
 
 

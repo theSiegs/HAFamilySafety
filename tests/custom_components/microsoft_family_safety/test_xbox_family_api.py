@@ -284,6 +284,7 @@ async def test_xbox_lock_without_the_xbox_sign_in_fails_and_never_uses_the_mobil
 ):
     # The mobile API accepts an Xbox override the console ignores: no fallback.
     coordinator.xbox_family.linked = False
+    coordinator.xbox_family.usable = False
     account = coordinator._accounts[CHILD]
     account.override_device = AsyncMock()
     with pytest.raises(HomeAssistantError, match="not linked"):
@@ -298,17 +299,6 @@ async def test_child_without_an_xbox_reads_as_unlocked(coordinator):
     coordinator._apply_xbox_lock_state("42", account_data, None, no_xbox=True)
     assert account_data["xbox_lock_known"] is True
     assert "Xbox" not in account_data["blocked_platforms"]
-
-
-async def test_refused_xbox_sign_in_asks_for_a_new_sign_in(coordinator):
-    coordinator.xbox_family.async_get_schedule = AsyncMock(
-        side_effect=XboxFamilyAuthError("invalid_grant")
-    )
-    coordinator._create_auth_notification = AsyncMock()
-    coordinator.entry.async_start_reauth = MagicMock()
-    assert await coordinator._async_fetch_xapprove(coordinator._accounts[CHILD], {}) is None
-    coordinator.entry.async_start_reauth.assert_called_once()
-    assert coordinator.connection_state()["reauth_reason"] == "xbox_auth_failed"
 
 
 @pytest.mark.parametrize(

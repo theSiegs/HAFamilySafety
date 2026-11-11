@@ -16,9 +16,11 @@ from pyfamilysafety.device import Device
 from pyfamilysafety.enum import OverrideTarget, OverrideType
 from pyfamilysafety.exceptions import AggregatorException, HttpException
 
+from homeassistant.components import persistent_notification
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
@@ -56,6 +58,8 @@ STORAGE_VERSION = 1
 AUTH_STORAGE_VERSION = 1
 AUTH_NOTIFICATION_ID = "familysafety_auth_expired"
 ROSTER_NOTIFICATION_ID = "familysafety_roster_error"
+#: How long a refused Xbox Family Settings token is left alone before retrying.
+_XBOX_RETRY_SECONDS = 6 * 60 * 60
 #: Keys kept in the runtime credential store (the rotated mobile refresh token).
 _RUNTIME_AUTH_KEYS = frozenset({"anchor", CONF_REFRESH_TOKEN, "updated_at"})
 
@@ -201,6 +205,12 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: names that differ between the Xbox profile and the Microsoft account).
         self._xbox_unmatched: set[str] = set()
         self._xbox_auth_warned = False
+        #: monotonic time before which a refused Xbox Family Settings token is
+        #: not tried again (a new link from the options retries at once).
+        self._xbox_retry_at = 0.0
+        #: Whether the first successful update has run (it clears a stale
+        #: "Authentication Required" notification left by a reauthentication).
+        self._first_update_done = False
 
     @property
     def xbox_features(self) -> bool:
@@ -266,8 +276,12 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         auth_state = await self._auth_store.async_load()
         self._runtime_auth_state = {}
         if isinstance(auth_state, dict):
-            anchor = auth_state.get("anchor")
-            if anchor in (self._entry_auth_anchor(), self._legacy_entry_auth_anchor()):
+            anchors = {self._entry_auth_anchor()}
+            # The anchor of earlier versions (it hashed the web session) only
+            # counts for an entry that has not signed in since.
+            if CONF_SIGNED_IN_AT not in self.entry.data:
+                anchors.add(self._legacy_entry_auth_anchor())
+            if auth_state.get("anchor") in anchors:
                 # Earlier versions also kept the Family web session (cookies,
                 # antiforgery token) here: keep only the rotated refresh token,
                 # under the current anchor, before the entry drops those keys.
@@ -276,6 +290,10 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._runtime_auth_state = kept
                 if kept != auth_state:
                     await self._auth_store.async_save(kept)
+            elif set(auth_state) - _RUNTIME_AUTH_KEYS:
+                # Superseded by a new sign-in, and still holding an old web
+                # session: nothing in it is usable any more.
+                await self._auth_store.async_remove()
         self._async_drop_legacy_web_auth()
 
     def _async_drop_legacy_web_auth(self) -> None:
@@ -609,6 +627,9 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 reason = (
                     "the Xbox Family Settings sign-in is not linked; link it from "
                     "the integration options"
+                    if not self.xbox_family.linked
+                    else "Microsoft refused the Xbox Family Settings sign-in; link it "
+                    "again from the integration options"
                 )
             elif str(account_id) in self._xbox_unmatched:
                 reason = "no child of the Xbox family has this child's name"
@@ -856,7 +877,8 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # --- Xbox Family Settings API (xapprove) ---------------------------------
     @property
     def _xapprove_active(self) -> bool:
-        return self.xbox_features and self.xbox_family.linked
+        """Xbox features on and an Xbox Family Settings token Microsoft has not refused."""
+        return self.xbox_features and self.xbox_family.usable
 
     async def _async_xbox_xuid(self, account: Account) -> str | None:
         """The child's Xbox user id, matched by name on the Xbox family roster."""
@@ -902,9 +924,13 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         Puts the schedule on ``xbox_screentime_policy`` (what the Xbox numbers
         and switch read) and returns the usage and the override as the policy
         _apply_xbox_lock_state reads, or None when xapprove is not in use or
-        did not answer. A refused Xbox sign-in asks for a new sign-in.
+        did not answer. A refused token is retried every
+        _XBOX_RETRY_SECONDS; the repair issue (see _async_sync_xbox_issue)
+        asks for a new link, never for a new Microsoft sign-in.
         """
-        if not self._xapprove_active:
+        if not self.xbox_features or not self.xbox_family.linked:
+            return None
+        if not self.xbox_family.usable and time.monotonic() < self._xbox_retry_at:
             return None
         try:
             xuid = await self._async_xbox_xuid(account)
@@ -921,24 +947,22 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.debug("Could not read Xbox usage from xapprove: %s", err)
                 usage = None
         except XboxFamilyAuthError as err:
+            # The mobile token still works: a full reauthentication would not
+            # necessarily fix this (the Xbox link from the sign-in can need
+            # consent) and would only loop. Ask for a new Xbox link instead.
+            self._xbox_retry_at = time.monotonic() + _XBOX_RETRY_SECONDS
             if not self._xbox_auth_warned:
                 self._xbox_auth_warned = True
                 _LOGGER.warning(
-                    "Xbox Family Settings sign-in no longer works (%s); sign in again "
-                    "(reauthentication) or link it from the integration options",
+                    "Xbox Family Settings sign-in no longer works (%s); link it again "
+                    "from the integration options",
                     err,
                 )
-            await self._create_auth_notification("xbox_auth_failed")
-            self._request_reauth("xbox_auth_failed")
             return None
         except XboxFamilyError as err:
             _LOGGER.debug("Xbox Family Settings read failed this poll: %s", err)
             return None
         self._xbox_auth_warned = False
-        if self._reauth_reason == "xbox_auth_failed":
-            self._reauth_requested = False
-            self._reauth_reason = None
-            await self._dismiss_auth_notification()
         account_data["xbox_screentime_policy"] = schedule_to_policy(schedule)
         account_data["xbox_source"] = "xapprove"
         return {"usage": usage, "lock_policy": overrides_to_policy(overrides)}
@@ -948,6 +972,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._xbox_xuids.clear()
         self._xbox_unmatched.clear()
         self._xbox_auth_warned = False
+        self._xbox_retry_at = 0.0
         self.hass.async_create_task(self.async_request_refresh())
 
     def _set_xbox_policy_field(self, child_id: str, update) -> None:
@@ -1346,10 +1371,10 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def connection_state(self) -> dict[str, Any]:
         mobile_ok = self.api is not None and self.last_update_success
-        # A refused Xbox Family Settings sign-in only takes the Xbox features
-        # down; everything else keeps running on the mobile token.
-        xbox_refused = self.xbox_features and self.xbox_family.state == "auth_failed"
-        state = "disconnected" if not mobile_ok else "degraded" if xbox_refused else "connected"
+        # A missing or refused Xbox Family Settings link only takes the Xbox
+        # features down; everything else keeps running on the mobile token.
+        xbox_down = self.xbox_features and not self.xbox_family.usable
+        state = "disconnected" if not mobile_ok else "degraded" if xbox_down else "connected"
         return {
             "state": state,
             "mobile_api": "ok" if mobile_ok else "error",
@@ -1426,7 +1451,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_request_reauth(self) -> None:
         """Service entry point: open the Microsoft sign-in flow now."""
-        await self._create_auth_notification("manual")
+        await self._create_auth_notification()
         self._request_reauth("manual")
 
     def _transform_account_data(self, account: Account) -> tuple[str, dict[str, Any]]:
@@ -1560,6 +1585,12 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     xbox_policy if xbox_policy is not None else previous.get("xbox_policy")
                 )
             await self._async_sync_roster_notification(accounts_data)
+            self._async_sync_xbox_issue()
+            if not self._first_update_done:
+                self._first_update_done = True
+                # A reauthentication reloads the entry: the notification it
+                # answered was raised by the previous coordinator.
+                self._dismiss_auth_notification()
             self._accounts = new_accounts
             self._devices = new_devices
             pending = getattr(self.api, "pending_requests", None) or []
@@ -1587,17 +1618,10 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     persist_err,
                 )
 
-    async def _create_auth_notification(self, reason: str) -> None:
+    async def _create_auth_notification(self) -> None:
         if self._auth_notification_sent:
             return
         message = (
-            "Microsoft no longer accepts the Xbox Family Settings sign-in, so the "
-            "Xbox lock, Xbox limits and Xbox play time stop updating.\n\n"
-            "Home Assistant has started a reauthentication flow. Open the integration "
-            "or the Repairs page and complete the Microsoft sign-in; linking the Xbox "
-            "Family Settings sign-in again from the integration options works too."
-            if reason == "xbox_auth_failed"
-            else
             "Home Assistant has started a reauthentication flow. Open the integration "
             "or the Repairs page and complete the Microsoft sign-in to renew the "
             "integration's sign-in."
@@ -1610,15 +1634,34 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self._auth_notification_sent = True
 
-    async def _dismiss_auth_notification(self) -> None:
-        if not self._auth_notification_sent:
-            return
-        await self.hass.services.async_call(
-            "persistent_notification",
-            "dismiss",
-            {"notification_id": AUTH_NOTIFICATION_ID},
-        )
+    def _dismiss_auth_notification(self) -> None:
+        persistent_notification.async_dismiss(self.hass, AUTH_NOTIFICATION_ID)
         self._auth_notification_sent = False
+
+    @property
+    def xbox_issue_id(self) -> str:
+        return f"xbox_link_{self.entry.entry_id}"
+
+    def _async_sync_xbox_issue(self) -> None:
+        """Raise a repair issue while the Xbox features lack a working Xbox link.
+
+        Without it the Xbox lock fails and Xbox play time is not read, which
+        an upgraded entry that never got the link would otherwise not notice.
+        """
+        if not self.xbox_features or self.xbox_family.usable:
+            ir.async_delete_issue(self.hass, DOMAIN, self.xbox_issue_id)
+            return
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            self.xbox_issue_id,
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key=(
+                "xbox_link_refused" if self.xbox_family.linked else "xbox_not_linked"
+            ),
+            translation_placeholders={"entry_title": self.entry.title},
+        )
 
     def _roster_errors_by_account(self) -> dict[str, list[str]]:
         """Return {account_id: [endpoint, ...]} for members Microsoft cannot fully resolve."""

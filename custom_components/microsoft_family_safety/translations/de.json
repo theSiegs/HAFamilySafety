@@ -51,8 +51,10 @@
       "native_auth_unavailable": "Die Browser-Anmeldung konnte nicht geladen werden: {error}",
       "native_oauth_failed": "Die Microsoft Family Safety-OAuth-Anmeldung wurde nicht erfolgreich abgeschlossen.",
       "wrong_account": "Es wurde ein anderes Microsoft-Konto verwendet. Bitte melde dasselbe Family Safety-Konto erneut an.",
-      "native_https_required": "Die automatische Browser-Anmeldung erfordert HTTPS. Für lokale Tests kannst du die unsichere HTTP-Anmeldung ausdrücklich aktivieren; Microsoft-Zugangsdaten werden dann im lokalen Netz unverschlüsselt übertragen.",
       "native_http_not_local": "Die unsichere HTTP-Anmeldung ist nur über localhost, .local oder eine private/lokale IP-Adresse erlaubt."
+    },
+    "progress": {
+      "sign_in": "Die Microsoft-Anmeldung ist abgeschlossen. Home Assistant holt jetzt die Tokens der Integration; das dauert ein paar Sekunden."
     }
   },
   "options": {
@@ -83,6 +85,16 @@
     },
     "error": {
       "xbox_link_failed": "Microsoft hat diese Adresse nicht akzeptiert. Melde dich mit dem neuen Link erneut an und füge die Adresse sofort ein."
+    }
+  },
+  "issues": {
+    "xbox_not_linked": {
+      "title": "Xbox-Family-Settings-Anmeldung verknüpfen",
+      "description": "Bei {entry_title} ist Xbox als überwachte Plattform ausgewählt, die Xbox-Family-Settings-Anmeldung ist aber nicht verknüpft: Die Xbox-Sperre funktioniert nicht und die Xbox-Spielzeit wird nicht gelesen.\n\nÖffne **Einstellungen > Geräte & Dienste > Microsoft Family Safety > Konfigurieren**, aktiviere **Xbox-Family-Settings-Anmeldung verknüpfen** und folge den Schritten. Diese Meldung verschwindet, sobald die Verknüpfung funktioniert."
+    },
+    "xbox_link_refused": {
+      "title": "Xbox-Family-Settings-Anmeldung erneut verknüpfen",
+      "description": "Microsoft akzeptiert die Xbox-Family-Settings-Anmeldung für {entry_title} nicht mehr: Die Xbox-Sperre funktioniert nicht und die Xbox-Spielzeit wird nicht gelesen. Alles andere funktioniert weiter.\n\nÖffne **Einstellungen > Geräte & Dienste > Microsoft Family Safety > Konfigurieren**, aktiviere **Xbox-Family-Settings-Anmeldung verknüpfen** und folge den Schritten. Diese Meldung verschwindet, sobald die Verknüpfung funktioniert."
     }
   },
   "services": {

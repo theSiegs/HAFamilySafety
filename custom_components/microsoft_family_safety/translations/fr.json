@@ -51,8 +51,10 @@
       "native_auth_unavailable": "La connexion par navigateur n'a pas pu être chargée : {error}",
       "native_oauth_failed": "La connexion OAuth Microsoft Family Safety ne s'est pas terminée correctement.",
       "wrong_account": "Un compte Microsoft différent a été utilisé. Veuillez ré-authentifier le même compte Family Safety.",
-      "native_https_required": "L'authentification automatique par navigateur nécessite HTTPS. Pour des tests locaux, vous pouvez activer explicitement l'authentification HTTP locale non sécurisée.",
       "native_http_not_local": "L'authentification HTTP non sécurisée n'est autorisée que via localhost, .local ou une adresse IP privée/locale."
+    },
+    "progress": {
+      "sign_in": "La connexion Microsoft est terminée. Home Assistant récupère maintenant les jetons de l'intégration ; cela prend quelques secondes."
     }
   },
   "options": {
@@ -83,6 +85,16 @@
     },
     "error": {
       "xbox_link_failed": "Microsoft n'a pas accepté cette adresse. Reconnectez-vous avec le nouveau lien et collez l'adresse tout de suite."
+    }
+  },
+  "issues": {
+    "xbox_not_linked": {
+      "title": "Lier la connexion Xbox Family Settings",
+      "description": "Xbox fait partie des plateformes surveillées de {entry_title}, mais la connexion Xbox Family Settings n'est pas liée : le verrouillage Xbox ne fonctionne pas et le temps de jeu Xbox n'est pas lu.\n\nOuvrez **Paramètres > Appareils et services > Microsoft Family Safety > Configurer**, cochez **Lier la connexion Xbox Family Settings** et suivez les étapes. Ce problème disparaît dès que la liaison fonctionne."
+    },
+    "xbox_link_refused": {
+      "title": "Lier à nouveau la connexion Xbox Family Settings",
+      "description": "Microsoft n'accepte plus la connexion Xbox Family Settings de {entry_title} : le verrouillage Xbox ne fonctionne pas et le temps de jeu Xbox n'est pas lu. Tout le reste continue de fonctionner.\n\nOuvrez **Paramètres > Appareils et services > Microsoft Family Safety > Configurer**, cochez **Lier la connexion Xbox Family Settings** et suivez les étapes. Ce problème disparaît dès que la liaison fonctionne."
     }
   },
   "services": {

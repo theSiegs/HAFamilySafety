@@ -1,6 +1,7 @@
 """Config flow for Microsoft Family Safety integration."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from ipaddress import ip_address
 from typing import Any
@@ -30,6 +31,7 @@ from .const import (
     CONF_XBOX_LINK,
     CONF_XBOX_REFRESH_TOKEN,
     DEFAULT_XBOX_FEATURES,
+    LEGACY_WEB_AUTH_KEYS,
     AVAILABLE_PLATFORMS,
     CONF_ALLOW_INSECURE_HTTP_AUTH,
     CONF_AUTH_USER_ID,
@@ -161,6 +163,10 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         #: the sign-in then updates it instead of aborting (#50).
         self._update_entry: config_entries.ConfigEntry | None = None
         self._allow_insecure_http_auth: bool = False
+        #: Token exchange (and Xbox link) of a completed browser sign-in; see
+        #: async_step_finish_mobile_proxy.
+        self._finish_task: asyncio.Task[None] | None = None
+        self._finish_abort: str | None = None
 
     def _is_existing_entry_auth_flow(self) -> bool:
         """Return whether this flow updates an existing config entry."""
@@ -468,34 +474,70 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_finish_mobile_proxy(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Exchange the captured OAuth code and store the refresh token."""
-        proxy = self._mobile_proxy
-        if proxy is None or not proxy.complete or not proxy.oauth_redirect_url:
-            return self.async_abort(reason="native_oauth_failed")
+        """Exchange the captured OAuth code (and link Xbox) as one tracked task.
 
-        redirect_url = proxy.oauth_redirect_url
-        cookies = proxy.export_cookies()
+        This step is entered several times for one sign-in: by the frontend,
+        by the re-notification helper, and by Home Assistant when the task
+        ends. Home Assistant has no per-flow lock, so a second entry while the
+        exchange is still running must attach to it: starting again would find
+        the proxy gone and abort a sign-in that is about to succeed (the
+        single-use code is already spent by then).
+        """
+        if self._finish_task is None:
+            proxy = self._mobile_proxy
+            if proxy is None or not proxy.complete or not proxy.oauth_redirect_url:
+                return self.async_abort(reason="native_oauth_failed")
+            self._mobile_proxy = None
+            self._finish_task = self.hass.async_create_task(
+                self._async_complete_sign_in(
+                    proxy, proxy.oauth_redirect_url, proxy.export_cookies()
+                ),
+                "Microsoft Family Safety sign-in completion",
+            )
+        if not self._finish_task.done():
+            return self.async_show_progress(
+                step_id="finish_mobile_proxy",
+                progress_action="sign_in",
+                progress_task=self._finish_task,
+            )
+        return self.async_show_progress_done(next_step_id="finish_sign_in")
+
+    async def _async_complete_sign_in(
+        self, proxy: Any, redirect_url: str, cookies: list[dict[str, Any]]
+    ) -> None:
+        """Turn the captured code into pending entry data; failures become an abort."""
         try:
             from .auth.native_proxy import unregister_native_proxy
 
             await unregister_native_proxy(self.hass, proxy)
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001
             _LOGGER.debug("Could not close mobile OAuth proxy cleanly: %s", err)
-        self._mobile_proxy = None
-
         try:
             info = await validate_redirect_url(self.hass, redirect_url)
+            self._finish_abort = await self._apply_mobile_oauth_info(info)
+            if self._finish_abort is None and (
+                xbox_token := await self._async_xbox_token_from_sign_in(cookies)
+            ):
+                assert self._pending_data is not None
+                self._pending_data[CONF_XBOX_REFRESH_TOKEN] = xbox_token
         except InvalidAuth:
-            return self.async_abort(reason="native_oauth_failed")
+            self._finish_abort = "native_oauth_failed"
+        except Exception:  # noqa: BLE001 - surface as an abort, never a stuck flow
+            _LOGGER.exception("Completing the Microsoft sign-in failed")
+            self._finish_abort = "native_oauth_failed"
 
-        abort_reason = await self._apply_mobile_oauth_info(info)
-        if abort_reason:
-            return self.async_abort(reason=abort_reason)
-        assert self._pending_data is not None
+    async def async_step_finish_sign_in(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Store the result of the completed sign-in."""
+        if self._finish_abort:
+            return self.async_abort(reason=self._finish_abort)
+        return self._async_store_sign_in()
 
-        if xbox_token := await self._async_xbox_token_from_sign_in(cookies):
-            self._pending_data[CONF_XBOX_REFRESH_TOKEN] = xbox_token
-
+    def _async_store_sign_in(self) -> FlowResult:
+        """Create the entry, or update the one this sign-in renews."""
+        if self._pending_data is None:
+            return self.async_abort(reason="native_auth_state_lost")
         if self._is_existing_entry_auth_flow():
             return self._async_finish_reauth()
         if self._update_entry is not None:
@@ -506,6 +548,15 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             options=self._pending_options or {},
         )
 
+    @staticmethod
+    def _renewed_data(
+        entry: config_entries.ConfigEntry, pending: dict[str, Any]
+    ) -> dict[str, Any]:
+        """The entry's data with the new sign-in, without any earlier web session."""
+        data = {k: v for k, v in entry.data.items() if k not in LEGACY_WEB_AUTH_KEYS}
+        data.update(pending)
+        return data
+
     def _async_finish_existing_account_update(self) -> FlowResult:
         """Store a user-flow sign-in into the account's existing entry (#50).
 
@@ -515,7 +566,6 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """
         entry = self._update_entry
         assert entry is not None and self._pending_data is not None
-        updates = dict(self._pending_data)
         for flow in self._async_in_progress(include_uninitialized=True):
             if flow["flow_id"] != self.flow_id and flow["context"].get(
                 "unique_id"
@@ -529,7 +579,7 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # need one too, and core no longer lets the helper do it for us (2026.12).
         result = self.async_update_and_abort(
             entry,
-            data_updates=updates,
+            data=self._renewed_data(entry, self._pending_data),
             options=self._pending_options or entry.options,
             reason="reauth_successful",
         )
@@ -550,7 +600,7 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # need one too, and core no longer lets the helper do it for us.
         result = self.async_update_and_abort(
             entry,
-            data_updates=dict(self._pending_data),
+            data=self._renewed_data(entry, self._pending_data),
             options=self._pending_options or entry.options,
         )
         self.hass.config_entries.async_schedule_reload(entry.entry_id)
@@ -559,7 +609,12 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_auth(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Manual OAuth fallback for HTTP-only Home Assistant installations."""
+        """Manual OAuth fallback for HTTP-only Home Assistant installations.
+
+        Serves new entries, reauthentication and reconfigure alike, with the
+        same account checks as the browser sign-in. There are no sign-in
+        cookies here, so the Xbox Family Settings link is left to the options.
+        """
         errors: dict[str, str] = {}
         if user_input is not None:
             redirect_url = user_input.get(CONF_REDIRECT_URL, "").strip()
@@ -568,21 +623,15 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             else:
                 try:
                     info = await validate_redirect_url(self.hass, redirect_url)
-                    refresh_token = info["refresh_token"]
-                    await self.async_set_unique_id(refresh_token[:20])
-                    self._abort_if_unique_id_configured()
-                    data: dict[str, Any] = {
-                        CONF_REFRESH_TOKEN: refresh_token,
-                        CONF_SIGNED_IN_AT: dt_util.utcnow().isoformat(),
-                    }
-                    return self.async_create_entry(
-                        title=info["title"], data=data, options=self._pending_options or {}
-                    )
                 except InvalidAuth:
                     errors["base"] = ERROR_AUTH_FAILED
                 except Exception:
                     _LOGGER.exception("Unexpected exception during manual authentication")
                     errors["base"] = "unknown"
+                else:
+                    if reason := await self._apply_mobile_oauth_info(info):
+                        return self.async_abort(reason=reason)
+                    return self._async_store_sign_in()
 
         return self.async_show_form(
             step_id="auth",
@@ -669,7 +718,8 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         except NativeAuthLocalHttpRequired:
             return self.async_abort(reason="native_http_not_local")
         except NativeAuthHttpsRequired:
-            return self.async_abort(reason="native_https_required")
+            # The mobile token is all the entry needs: the manual step works.
+            return await self.async_step_auth()
 
 
 class FamilySafetyOptionsFlow(config_entries.OptionsFlow):

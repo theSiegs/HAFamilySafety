@@ -15,7 +15,7 @@
       },
       "auth": {
         "title": "Manual Microsoft Family Safety authentication",
-        "description": "Home Assistant could not use the secure browser-assisted login because no HTTPS Home Assistant URL is configured. Open this Microsoft URL, sign in, and paste the complete resulting redirect URL here:\n\n{auth_url}",
+        "description": "Home Assistant cannot use the browser-assisted sign-in because no HTTPS Home Assistant URL is configured. Open this Microsoft URL, sign in, and paste the complete resulting redirect URL here:\n\n{auth_url}",
         "data": {
           "redirect_url": "Redirect URL"
         }
@@ -51,8 +51,10 @@
       "native_auth_unavailable": "The browser sign-in could not be loaded: {error}",
       "native_oauth_failed": "The Microsoft Family Safety OAuth login did not complete successfully.",
       "wrong_account": "A different Microsoft account was used. Please reauthenticate the same Family Safety account.",
-      "native_https_required": "Automatic browser authentication requires HTTPS. For local testing you can explicitly enable insecure local HTTP authentication.",
       "native_http_not_local": "Insecure HTTP authentication is allowed only through localhost, .local, or a private/local IP address."
+    },
+    "progress": {
+      "sign_in": "The Microsoft sign-in is complete. Home Assistant is fetching the integration's tokens; this takes a few seconds."
     }
   },
   "options": {
@@ -83,6 +85,16 @@
     },
     "error": {
       "xbox_link_failed": "Microsoft did not accept that address. Sign in again with the new link and paste the address straight away."
+    }
+  },
+  "issues": {
+    "xbox_not_linked": {
+      "title": "Link the Xbox Family Settings sign-in",
+      "description": "{entry_title} has Xbox among its monitored platforms, but the Xbox Family Settings sign-in is not linked: the Xbox lock does not work and Xbox play time is not read.\n\nOpen **Settings > Devices & services > Microsoft Family Safety > Configure**, tick **Link the Xbox Family Settings sign-in** and follow the steps. This issue disappears once the link works."
+    },
+    "xbox_link_refused": {
+      "title": "Link the Xbox Family Settings sign-in again",
+      "description": "Microsoft no longer accepts the Xbox Family Settings sign-in of {entry_title}: the Xbox lock does not work and Xbox play time is not read. Everything else keeps working.\n\nOpen **Settings > Devices & services > Microsoft Family Safety > Configure**, tick **Link the Xbox Family Settings sign-in** and follow the steps. This issue disappears once the link works."
     }
   },
   "services": {

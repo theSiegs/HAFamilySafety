@@ -114,7 +114,7 @@ You do **not** copy an authorization URL and you do **not** paste a redirect URL
 
 ### Step 4 -- Let Home Assistant Finish
 
-As soon as Microsoft hands back the authorization code, the window closes itself and Home Assistant exchanges the code for the mobile refresh token. With Xbox ticked it then asks Microsoft, with the cookies of that same sign-in, for a code of the Xbox Family Settings app; when Microsoft answers without another sign-in page, the Xbox link is made with no extra step. Otherwise the Connection sensor shows `xbox_family: not_linked`: link it from **Configure**. The sign-in cookies are not kept.
+As soon as Microsoft hands back the authorization code, the window closes itself and Home Assistant exchanges the code for the mobile refresh token. With Xbox ticked it then asks Microsoft, with the cookies of that same sign-in, for a code of the Xbox Family Settings app; when Microsoft answers without another sign-in page, the Xbox link is made with no extra step. Otherwise a repair issue appears and the Connection sensor shows `xbox_family: not_linked`: link it from **Configure**. The sign-in cookies are not kept.
 
 ### Step 5 -- Finish
 
@@ -147,7 +147,7 @@ While enabled, your Microsoft password and session data travel **unencrypted acr
 
 ### HTTP-only instances
 
-Without an HTTPS URL and without the local HTTP option, the setup offers the manual step instead: open the Microsoft link shown, sign in, and paste the address of the blank page you end up on.
+Without an HTTPS URL and without the local HTTP option, the setup (and a reauthentication) offers the manual step instead: open the Microsoft link shown, sign in, and paste the address of the blank page you end up on. The Xbox Family Settings sign-in is then linked from **Configure**.
 
 ---
 
@@ -155,7 +155,7 @@ Without an HTTPS URL and without the local HTTP option, the setup offers the man
 
 1. Go to **Settings > Devices & Services** and click on **Microsoft Family Safety**.
 2. Confirm devices and entities have been created.
-3. Check the **Connection** diagnostic sensor. It should read `connected`, with `screentime_policy_status: ok`. With Xbox ticked, `xbox_family: ok` (or `linked`) shows the Xbox Family Settings sign-in is in use. `degraded` means Microsoft refused that Xbox sign-in: only the Xbox features are affected.
+3. Check the **Connection** diagnostic sensor. It should read `connected`, with `screentime_policy_status: ok`. With Xbox ticked, `xbox_family: ok` (or `linked`) shows the Xbox Family Settings sign-in is in use. `degraded` means that Xbox link is missing or refused: only the Xbox features are affected, and a repair issue says how to link it.
 4. Go to **Settings > Devices & Services > Entities** and search for your child's name. You should see sensors, switches, buttons, 7 number entities (daily limits) and 14 time entities (7 start + 7 end).
 5. If entities show "unavailable," wait up to one update interval (default 5 minutes) for the first data pull.
 
@@ -211,7 +211,7 @@ Official "NGINX Home Assistant SSL proxy" add-on: in the add-on configuration, e
 
 ### Session Expired / Reauthentication Required
 
-The integration renews its refresh tokens by itself. You are only asked to sign in again when Microsoft refuses the mobile refresh token (password change, security review, revoked sign-in) or the Xbox Family Settings sign-in.
+The integration renews its refresh tokens by itself. You are only asked to sign in again when Microsoft refuses the mobile refresh token (password change, security review, revoked sign-in). A refused Xbox Family Settings sign-in only raises a repair issue: link it again from **Configure**.
 
 1. Go to **Settings > Devices & Services**.
 2. Find **Microsoft Family Safety** -- it shows a **Reauthenticate** button. You can also call the `microsoft_family_safety.request_reauth` service to start the flow without waiting, for example from a dashboard button.
