@@ -2081,6 +2081,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 f"Could not read the Xbox overrides, so {what}: {err}"
             ) from err
 
+    @_updates_listeners
     async def async_add_time_bonus(
         self,
         account_id: str,
@@ -2195,6 +2196,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ),
         }
 
+    @_updates_listeners
     async def async_cancel_time_bonus(self, account_id: str, platform: str) -> dict[str, Any]:
         """Cancel the extra time in force; put back a lock of ours it replaced.
 
