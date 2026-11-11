@@ -37,6 +37,7 @@ from ._pyfamilysafety_compat import apply_patches, is_stale_roster_error
 from . import site_sync
 from .api_client import FamilySafetyWebAPI, FamilySafetyWebAPIError
 from .app_pause import AppPauser
+from .app_policy_probe import async_probe_app_policy
 from .app_usage import EVENT_APP_USAGE, AppUsageGrowthTracker
 from .mobile_overrides import (
     MOBILE_OVERRIDES_PATH,
@@ -2593,6 +2594,12 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 account_id, lock.get("validUntil"),
             )
         return {"cancelled": True, "lock_in_force": lock is not None}
+
+    async def async_probe_app_policy(self, account_id: str, app_id: str) -> dict[str, Any]:
+        """Diagnostic: every candidate read of one app's policy, raw (GETs only)."""
+        if not self.web_api:
+            raise HomeAssistantError("Mobile API not initialized")
+        return await async_probe_app_policy(self.web_api, str(account_id), app_id)
 
     async def async_probe_windows_extra_time(
         self, account_id: str, minutes: int = 2
