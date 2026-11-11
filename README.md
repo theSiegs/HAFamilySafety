@@ -322,7 +322,7 @@ A typical single-child setup with a full app list lands around 85-90 entities.
 | Xbox Screen Time Limits | `switch.{prefix}_xbox_screen_time_limits` | Turns the child's separate Xbox schedule on or off (the days are kept). Once it is on, seven `number.{prefix}_xbox_{day}_limit` entities set the daily Xbox allowance the console enforces. Not created without Xbox among the monitored platforms. |
 | App Limits | `switch.{prefix}_app_limits` | The "App, feature, and game limits" toggle above the app list. While it is OFF, the per-app time limits are kept but not enforced. |
 | App Block | `switch.{prefix}_app_{appname}` | ON = app blocked. One switch per application. |
-| Platform Lock | `switch.{prefix}_{platform}_lock` | ON = platform locked. Locks one platform (e.g. Windows) through a Microsoft device override. For Windows the integration tries a web-API time override first, then falls back to the mobile API. Use **Account Lock** to lock every platform at once. Turning it off cancels whatever lock is in force (it does not put back an earlier one, unlike `unlock_platform`). Attributes `hold` (`ours`, `parent` or `none`), `override`, `override_until` and `allow_until`, see [below](#platform-locks-and-a-parents-own-changes). |
+| Platform Lock | `switch.{prefix}_{platform}_lock` | ON = platform locked. Locks one platform (e.g. Windows) through a Microsoft device override. For Windows the integration tries a web-API time override first, then falls back to the mobile API. Use **Account Lock** to lock every platform at once. Turning it off cancels whatever lock is in force (it does not put back an earlier one, unlike `unlock_platform`). Attributes `user_id`, `platform`, `blocked`, and who decides the lock: `hold` (`ours`, `parent` or `none`), `override` (`blockUntil`, `allowUntil`, `none`, or null when unreadable), `override_until` and `allow_until` (local ISO time or null), see [below](#platform-locks-and-a-parents-own-changes). |
 
 ### Buttons — Per Child Account
 
@@ -420,7 +420,17 @@ Both actions can answer with what they did (`response_variable`), `{prior, appli
         message: "A parent changed the Xbox lock in the Family Safety app; left as it is."
 ```
 
-The platform lock switches show the same with the `hold` attribute: `ours` (the integration's lock, still as it was placed), `parent` (a lock or extra time from somewhere else, or the integration's lock changed elsewhere) or `none`. For Windows and Mobile only the "locked" flag is polled, so extra time there is not seen.
+The platform lock switches show the same as attributes, for automations that must not fight a parent:
+
+| Attribute | Values |
+|-----------|--------|
+| `hold` | `ours` (the integration's lock, still as it was placed), `parent` (a lock or extra time the integration did not place, or its own lock changed elsewhere), `none` (nothing in force, nothing held) |
+| `override` | `blockUntil`, `allowUntil`, `none`, or null when it could not be read |
+| `override_until` | When the lock or extra time in force ends (local ISO time), or null |
+| `allow_until` | When extra time in force ends (local ISO time), or null |
+| `platform` / `user_id` | The platform (`Windows`, `Xbox`, `Mobile`) and the child's account id (a string) |
+
+For Windows and Mobile only the "locked" flag is polled, without an end, so `override_until` stays null there and extra time is not seen. The Xbox values come from the Xbox Family Settings service and are null without its sign-in linked.
 
 ### App Management
 

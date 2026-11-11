@@ -128,3 +128,36 @@ async def test_unlock_left_parent_override_says_what_is_in_force(rig):
     assert current["type"] == "allowUntil"
     assert parse_utc(current["valid_until"]) == parse_utc(iso_utc(extra_until))
     assert current["allow_until"] == current["override_until"]
+
+
+async def test_lock_switch_attributes_for_windows_and_xbox(rig):
+    """Every attribute an automation reads to tell who decides the lock."""
+    coord, entry, xbox = rig
+    # The roster keys children by int; the attribute is still a str.
+    coord.data["accounts"] = {int(CHILD): coord.data["accounts"][CHILD]}
+    coord.data["accounts"][int(CHILD)]["blocked_platforms"] = ["Windows"]
+    xbox.overrides = [_xbox(OVERRIDE_ALLOW, _hours(1))]
+    coord.data["accounts"][int(CHILD)]["xbox_override"] = parse_xbox_override(
+        {"overrides": xbox.overrides}
+    )
+    windows = switch.FamilySafetyPlatformLockSwitch(coord, entry, int(CHILD), "Alex", "Windows")
+    xbox_lock = switch.FamilySafetyPlatformLockSwitch(coord, entry, int(CHILD), "Alex", "Xbox")
+
+    attrs = windows.extra_state_attributes
+    assert attrs["user_id"] == CHILD
+    assert attrs["platform"] == "Windows"
+    assert (attrs["hold"], attrs["override"]) == ("parent", "blockUntil")
+    assert attrs["override_until"] is None  # the mobile flag has no end
+    assert attrs["allow_until"] is None
+
+    attrs = xbox_lock.extra_state_attributes
+    assert attrs["user_id"] == CHILD
+    assert attrs["platform"] == "Xbox"
+    assert (attrs["hold"], attrs["override"]) == ("parent", "allowUntil")
+    assert attrs["allow_until"] == attrs["override_until"]
+    assert dt_util.parse_datetime(attrs["allow_until"]).tzinfo is not None
+
+    # Unreadable: override is None, nothing held, so nobody decides.
+    coord.data["accounts"][int(CHILD)]["xbox_override"] = None
+    attrs = xbox_lock.extra_state_attributes
+    assert (attrs["hold"], attrs["override"], attrs["override_until"]) == ("none", None, None)

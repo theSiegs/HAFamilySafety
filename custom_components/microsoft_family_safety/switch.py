@@ -269,7 +269,7 @@ class FamilySafetyPlatformLockSwitch(CoordinatorEntity, SwitchEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return additional attributes."""
         return {
-            ATTR_USER_ID: self._account_id,
+            ATTR_USER_ID: str(self._account_id),
             ATTR_PLATFORM: self._platform,
             ATTR_BLOCKED: self.is_on,
             # Who decides the lock now (ours / parent / none) and what is in
