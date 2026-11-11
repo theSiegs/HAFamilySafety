@@ -282,7 +282,7 @@ One of each for Windows, and for the Xbox once its schedule has been read. They 
 
 | Entity | Entity ID | State | Key Attributes |
 |--------|-----------|-------|----------------|
-| Allowed Now | `binary_sensor.{prefix}_{platform}_allowed_now` | ON while the platform may be used now | `reason`, `remaining_minutes`, `allowance_minutes`, `used_minutes`, `in_allowed_hours`, `override`, `override_until` |
+| Allowed Now | `binary_sensor.{prefix}_{platform}_allowed_now` | ON while the platform may be used now | `reason`, `remaining_minutes`, `allowance_minutes`, `used_minutes`, `in_allowed_hours`, and the same `hold`, `override`, `override_until`, `allow_until`, `platform`, `user_id` as the Platform Lock switch (see [below](#platform-locks-and-a-parents-own-changes)) |
 | Downtime Active | `binary_sensor.{prefix}_{platform}_downtime_active` | ON outside today's allowed hours | `downtime_start`, `downtime_end` (the current downtime, or the next one, local ISO times) |
 
 **How Allowed Now and Time Remaining decide**, in this order:

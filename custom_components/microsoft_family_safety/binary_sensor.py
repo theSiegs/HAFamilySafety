@@ -91,22 +91,34 @@ class FamilySafetyAllowedNowSensor(
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Why, and the minutes left."""
+        """Why, the minutes left, and who decides the lock (as the lock switch)."""
         status = self.coordinator.platform_status(self._account_id, self._platform)
         current = status.get("override") or {}
         until = current.get("valid_until")
+        # hold, override, override_until and allow_until as on the platform
+        # lock switch, so either entity tells who decides the platform now.
+        hold = self.coordinator.platform_hold_state(self._account_id, self._platform)
         return {
-            ATTR_USER_ID: self._account_id,
+            ATTR_USER_ID: str(self._account_id),
             ATTR_PLATFORM: self._platform,
             "reason": status["reason"],
             "remaining_minutes": status["remaining_minutes"],
             "allowance_minutes": status["allowance_minutes"],
             "used_minutes": status["used_minutes"],
             "in_allowed_hours": status["in_allowed_hours"],
-            "override": current.get("type"),
-            "override_until": (
-                dt_util.as_local(dt_util.parse_datetime(until)).isoformat() if until else None
+            "hold": hold["hold"],
+            "override": (
+                hold["override"] if hold["override"] is not None else current.get("type")
             ),
+            "override_until": (
+                hold["override_until"]
+                if hold["override"] is not None
+                else (
+                    dt_util.as_local(dt_util.parse_datetime(until)).isoformat()
+                    if until else None
+                )
+            ),
+            "allow_until": hold["allow_until"],
         }
 
 
