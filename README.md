@@ -176,6 +176,7 @@ Service call / entity write
 | Update interval (seconds) | 30 – 3600 | 300 (5 min) | |
 | Monitored platforms | Windows / Xbox / Mobile | Windows | One lock switch per platform. Xbox also adds the Xbox entities, see [below](#xbox) |
 | Users allowed to control Microsoft Family Safety | list of Home Assistant users | *(empty: everybody)* | See [Who can control the integration](#who-can-control-the-integration) |
+| App usage sensors per child | 0 – 30 | 0 (off) | How many of each child's most used apps today get an [App Usage](#sensors--per-child-account) sensor; also turns on the [`microsoft_family_safety_app_usage`](#events) event |
 | Strict mode | on / off | off | Places a `lock_platform` lock again when it is cancelled elsewhere; see [Strict mode](#strict-mode) |
 | Allow insecure local HTTP authentication (testing only) | on / off | off | See below |
 | Link the Xbox Family Settings sign-in | on / off | off | Only with Xbox ticked; for when the Connection sensor shows `xbox_family: not_linked`. Opens a Microsoft sign-in through the same temporary proxy as the setup, which picks up the result itself: sign in, close the window, done. Without an HTTPS URL (or the local HTTP option below), or if the sign-in does not finish within 5 minutes, you paste the address of the blank page Microsoft ends on instead |
@@ -247,7 +248,7 @@ For one child with no per-app switches, an account with Windows monitoring enabl
 
 | Platform | Count | What |
 |----------|-------|------|
-| `sensor` | 8 – 11 | Screen Time, Account Info, Applications, Pending Requests, Web Filter, Websites Visited, Screen Time Policy, Windows Time Remaining (+ Balance when the account exposes one, + Xbox Screen Time and Xbox Time Remaining with Xbox data) |
+| `sensor` | 8 – 11 | Screen Time, Account Info, Applications, Pending Requests, Web Filter, Websites Visited, Screen Time Policy, Windows Time Remaining (+ Balance when the account exposes one, + Xbox Screen Time and Xbox Time Remaining with Xbox data, + App Usage sensors when turned on) |
 | `binary_sensor` | 2 (+2 Xbox) | Windows Allowed Now, Windows Downtime Active, plus the same two for the Xbox once its schedule is read |
 | `switch` | 5 + platforms + apps | Account Lock, Screen Time Limits, Xbox Screen Time Limits, App Limits, Web Filtering, one Platform Lock per monitored platform, one per application |
 | `button` | 2 | Approve Request, Deny Request |
@@ -262,9 +263,10 @@ A typical single-child setup with a full app list lands around 85-90 entities.
 
 | Entity | Entity ID | State | Key Attributes |
 |--------|-----------|-------|----------------|
-| Screen Time | `sensor.{prefix}_screen_time` | Minutes used today | `formatted_time`, `hours`, `minutes`, `average_screentime`, `date`, `raw_microsoft_minutes`, `last_api_poll`, `update_interval_seconds` |
+| Screen Time | `sensor.{prefix}_screen_time` | Minutes used today | `formatted_time`, `hours`, `minutes`, `average_screentime`, `date`, `raw_microsoft_minutes`, `last_api_poll`, `update_interval_seconds`, `apps` (the apps used today, see below) |
 | Account Info | `sensor.{prefix}_account_info` | Full name | `user_id`, `first_name`, `surname`, `profile_picture`, `device_count` |
-| Applications | `sensor.{prefix}_applications` | App count | `blocked_count`, `applications` |
+| Applications | `sensor.{prefix}_applications` | App count | `blocked_count`, `blocked_apps` (up to 20 names), `top_apps` (the 5 most used today), `applications` (every app as Microsoft lists it, with icons), `apps` (every app, see below). `applications` and `apps` are not stored in the history database: with icons the list can exceed its size limit |
+| App Usage | `sensor.{prefix}_{app}_usage` | Minutes the app was used today | `app_id`, `app_name`, `platform`, `blocked`. Opt-in: only with **App usage sensors per child** above 0, for each child's most used apps today, up to that number. An app keeps its sensor once it has one |
 | Balance | `sensor.{prefix}_balance` | Account balance | *(monetary sensor, only if available)* |
 | Pending Requests | `sensor.{prefix}_pending_requests` | Request count | `requests` |
 | Web Filter | `sensor.{prefix}_web_filter` | enabled / disabled / unknown | `blockedSites`, `allowedSites`, `blocked_site_count`, `allowed_site_count`, `contentRatingAge`, `content_settings`, `max_age_rating`, `acquisition_policy` |
@@ -291,6 +293,18 @@ One of each for Windows, and for the Xbox once its schedule has been read. They 
 4. Today's allowance used up (`allowance_used`) → off, 0 minutes. Otherwise on (`within_limits`), with the smaller of the allowance left and the time to the end of the current allowed window.
 
 Windows uses the Windows schedule and the minutes of the child's Windows devices; the Xbox uses the Xbox schedule, Xbox play time and the lock or extra time in the Xbox policy. The state is `unknown` (`reason: unknown`) while the schedule or today's usage has not been read, for example for a child without a Windows device. `remaining_minutes` and `used_minutes` are not stored in the history database.
+
+**The `apps` attribute** is a compact list of the child's apps, most used today first, without icons:
+
+```yaml
+apps:
+  - package: "x:1234567890"   # Microsoft's app id; the prefix gives the platform
+    name: "Racing Game"
+    minutes: 42.0             # minutes used today
+    platform: Xbox            # Windows (appx:, win32:), Xbox (x:), Mobile (a:) or null
+```
+
+An app used on two platforms has a different id on each, so it is listed once per platform. The Screen Time sensor lists only the apps used today; the Applications sensor lists every app.
 
 ### Sensors — Per Physical Device
 
@@ -349,6 +363,7 @@ One start/end pair per day of the week, editable from the UI with optimistic upd
 
 | Event | When | Data |
 |-------|------|------|
+| `microsoft_family_safety_app_usage` | An app's minutes today grew between two updates (at least 0.5 min). Only with **App usage sensors per child** above 0. The first update of a day, or after a restart, only sets the baseline | `entry_id`, `account_id`, `first_name`, `app_id`, `app_name`, `platform`, `grew_minutes`, `today_minutes` |
 | `microsoft_family_safety_request` | A new pending request (more time, an app) appears. Checked on every update; the first update after a start only sets the baseline, and a request must be missing for three updates in a row before it counts as new again | `entry_id`, `account_id`, `first_name`, `request_id`, `type`, `platform`, `app_id`, `app_name`, `requested_time` (as Microsoft gives it) |
 
 ```yaml

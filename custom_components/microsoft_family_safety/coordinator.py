@@ -30,6 +30,7 @@ from homeassistant.util import dt as dt_util
 from ._pyfamilysafety_compat import apply_patches, is_stale_roster_error
 from . import site_sync
 from .api_client import FamilySafetyWebAPI
+from .app_usage import EVENT_APP_USAGE, AppUsageGrowthTracker
 from .screen_time import (
     ALLOW_UNTIL,
     BLOCK_UNTIL,
@@ -56,10 +57,12 @@ from .xbox_family_api import (
     usage_today,
 )
 from .const import (
+    CONF_APP_USAGE_SENSORS,
     CONF_SIGNED_IN_AT,
     CONF_STRICT_MODE,
     CONF_XBOX_FEATURES,
     CONF_XBOX_REFRESH_TOKEN,
+    DEFAULT_APP_USAGE_SENSORS,
     DEFAULT_STRICT_MODE,
     DEFAULT_XBOX_FEATURES,
     EVENT_LOCK_REASSERTED,
@@ -266,6 +269,12 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._strict_mode = bool(entry.options.get(CONF_STRICT_MODE, DEFAULT_STRICT_MODE))
         #: hold key -> when strict mode last placed that lock again.
         self._last_reassert: dict[str, datetime] = {}
+        #: How many of each child's most used apps get a usage sensor; 0 = off.
+        self.app_usage_sensors = int(
+            entry.options.get(CONF_APP_USAGE_SENSORS, DEFAULT_APP_USAGE_SENSORS) or 0
+        )
+        self._app_usage_tracker = AppUsageGrowthTracker()
+
 
     @property
     def xbox_features(self) -> bool:
@@ -2626,6 +2635,8 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             except Exception as err:  # noqa: BLE001 - never fail the poll for it
                 _LOGGER.debug("Platform hold check failed: %r", err)
             self._devices = new_devices
+            if self.app_usage_sensors > 0:
+                self._fire_app_usage_events(accounts_data)
             pending = getattr(self.api, "pending_requests", None) or []
             self._fire_request_events(pending, accounts_data)
             self._is_retrying_auth = False
@@ -2692,6 +2703,22 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "requested_time": request.get("requestedTime"),
                 },
             )
+
+    def _fire_app_usage_events(self, accounts_data: dict[str, Any]) -> None:
+        """Fire microsoft_family_safety_app_usage for each app that grew since the last poll."""
+        for account_id, account in accounts_data.items():
+            for grew in self._app_usage_tracker.update(
+                account_id, account.get("screen_time_date") or "", account.get("applications")
+            ):
+                self.hass.bus.async_fire(
+                    EVENT_APP_USAGE,
+                    {
+                        "entry_id": self.entry.entry_id,
+                        "account_id": str(account_id),
+                        "first_name": account.get("first_name"),
+                        **grew,
+                    },
+                )
 
     async def _create_auth_notification(self) -> None:
         if self._auth_notification_sent:
