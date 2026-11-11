@@ -986,6 +986,9 @@ class FamilySafetyScreenTimePolicySensor(FamilySafetyAccountSensor):
                 intervals = day_data.get("allowedIntervals") if isinstance(day_data, dict) else None
                 if isinstance(intervals, list):
                     attrs[f"xbox_{day_name.lower()}_allowed_intervals"] = intervals
+        # Limits and allowed hours changed for today only, by platform, with
+        # the values put back at restores_at (local midnight).
+        attrs["today_only"] = self.coordinator.today_only.pending(self._account_id)
         return attrs
 
 

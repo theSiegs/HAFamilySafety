@@ -261,6 +261,10 @@
       "name": "Set Screen Time Limit",
       "description": "Set the daily screen time allowance for a specific day of the week, for Windows or for the Xbox.",
       "fields": {
+        "platform": {
+          "name": "Platform",
+          "description": "Windows (default) or Xbox. Xbox writes the limit the console enforces, through the Xbox Family Settings service: Xbox must be among the monitored platforms with the Xbox Family Settings sign-in linked."
+        },
         "account_id": {
           "name": "Account ID",
           "description": "The user ID of the child account. Give this or an entity of the child."
@@ -271,7 +275,7 @@
         },
         "day_of_week": {
           "name": "Day of Week",
-          "description": "Day of week (0=Sunday, 1=Monday, ..., 6=Saturday)."
+          "description": "Day of week (0=Sunday, 1=Monday, ..., 6=Saturday). Required unless today_only is set."
         },
         "hours": {
           "name": "Hours",
@@ -281,9 +285,9 @@
           "name": "Minutes",
           "description": "Additional minutes of screen time."
         },
-        "platform": {
-          "name": "Platform",
-          "description": "Windows (default) or Xbox. Xbox writes the limit the console enforces, through the Xbox Family Settings service: Xbox must be among the monitored platforms with the Xbox Family Settings sign-in linked."
+        "today_only": {
+          "name": "Today only",
+          "description": "Change today only. The previous value is put back at local midnight, unless it was changed again in the meantime. day_of_week can be left out."
         }
       }
     },
@@ -291,6 +295,10 @@
       "name": "Set Screen Time Intervals",
       "description": "Set the allowed time window for screen time on a specific day, for Windows or for the Xbox (the Xbox allowed hours).",
       "fields": {
+        "platform": {
+          "name": "Platform",
+          "description": "Windows (default) or Xbox. Xbox sets the allowed hours the console enforces, through the Xbox Family Settings service, and keeps the day's limit: Xbox must be among the monitored platforms with the Xbox Family Settings sign-in linked."
+        },
         "account_id": {
           "name": "Account ID",
           "description": "The user ID of the child account. Give this or an entity of the child."
@@ -301,7 +309,7 @@
         },
         "day_of_week": {
           "name": "Day of Week",
-          "description": "Day of week (0=Sunday, 1=Monday, ..., 6=Saturday)."
+          "description": "Day of week (0=Sunday, 1=Monday, ..., 6=Saturday). Required unless today_only is set."
         },
         "start_hour": {
           "name": "Start Hour",
@@ -319,9 +327,9 @@
           "name": "End Minute",
           "description": "End minute (0 or 30)."
         },
-        "platform": {
-          "name": "Platform",
-          "description": "Windows (default) or Xbox. Xbox sets the allowed hours the console enforces, through the Xbox Family Settings service, and keeps the day's limit: Xbox must be among the monitored platforms with the Xbox Family Settings sign-in linked."
+        "today_only": {
+          "name": "Today only",
+          "description": "Change today only. The previous value is put back at local midnight, unless it was changed again in the meantime. day_of_week can be left out."
         }
       }
     },
@@ -606,6 +614,24 @@
         "apps": {
           "name": "Apps",
           "description": "App IDs to resume; leave empty for every paused app of the child."
+        }
+      }
+    },
+    "restore_today_only": {
+      "name": "Restore Today-Only Changes",
+      "description": "Put back now the values replaced by today-only screen time changes, instead of at midnight. Values changed again in the meantime are kept.",
+      "fields": {
+        "account_id": {
+          "name": "Account ID",
+          "description": "The user ID of the child account. Give this or an entity of the child."
+        },
+        "entity_id": {
+          "name": "Child entity",
+          "description": "Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID."
+        },
+        "platform": {
+          "name": "Platform",
+          "description": "Only this schedule. Omitted = every platform."
         }
       }
     }

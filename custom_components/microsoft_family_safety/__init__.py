@@ -46,7 +46,9 @@ from .const import (
     SERVICE_GET_SITES,
     SERVICE_PAUSE_APP,
     SERVICE_RESUME_APP,
+    SERVICE_RESTORE_TODAY_ONLY,
     CONF_ALLOWED_USERS,
+    SCREENTIME_PLATFORMS,
 )
 from .coordinator import FamilySafetyDataUpdateCoordinator, site_sync_store
 from .permissions import async_require_admin, guard_service
@@ -102,21 +104,24 @@ SERVICE_DENY_REQUEST_SCHEMA = vol.Schema({
 
 # Service schemas for the settings beyond pyfamilysafety
 
+# day_of_week is required unless today_only is set (checked by the coordinator).
 SERVICE_SET_SCREENTIME_LIMIT_SCHEMA = child_schema({
-    vol.Required("day_of_week"): vol.All(vol.Coerce(int), vol.Range(min=0, max=6)),
+    vol.Optional("platform", default="Windows"): vol.In(SCREENTIME_PLATFORMS),
+    vol.Optional("today_only", default=False): cv.boolean,
+    vol.Optional("day_of_week"): vol.All(vol.Coerce(int), vol.Range(min=0, max=6)),
     vol.Required("hours"): vol.All(vol.Coerce(int), vol.Range(min=0, max=24)),
     vol.Optional("minutes", default=0): vol.All(vol.Coerce(int), vol.Range(min=0, max=59)),
-    vol.Optional("platform", default="Windows"): vol.In(["Windows", "Xbox"]),
 })
 
 SERVICE_SET_SCREENTIME_INTERVALS_SCHEMA = child_schema({
-    vol.Required("day_of_week"): vol.All(vol.Coerce(int), vol.Range(min=0, max=6)),
+    vol.Optional("platform", default="Windows"): vol.In(SCREENTIME_PLATFORMS),
+    vol.Optional("today_only", default=False): cv.boolean,
+    vol.Optional("day_of_week"): vol.All(vol.Coerce(int), vol.Range(min=0, max=6)),
     vol.Required("start_hour"): vol.All(vol.Coerce(int), vol.Range(min=0, max=23)),
     vol.Optional("start_minute", default=0): vol.In([0, 30]),
     # 24 = midnight at the end of the day (with end_minute 0).
     vol.Required("end_hour"): vol.All(vol.Coerce(int), vol.Range(min=0, max=24)),
     vol.Optional("end_minute", default=0): vol.In([0, 30]),
-    vol.Optional("platform", default="Windows"): vol.In(["Windows", "Xbox"]),
 })
 
 SERVICE_SET_APP_TIME_LIMIT_SCHEMA = child_schema({
@@ -163,6 +168,11 @@ SERVICE_LOCK_ACCOUNT_SCHEMA = child_schema({})
 SERVICE_UNLOCK_ACCOUNT_SCHEMA = child_schema({})
 
 SERVICE_REQUEST_REAUTH_SCHEMA = vol.Schema({})
+
+SERVICE_RESTORE_TODAY_ONLY_SCHEMA = child_schema({
+    vol.Optional("platform"): vol.In(SCREENTIME_PLATFORMS),
+})
+
 
 _APP_IDS = vol.All(cv.ensure_list, [cv.string], vol.Length(min=1))
 
@@ -247,6 +257,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Put today-only limit changes back at local midnight.
+    entry.async_on_unload(coordinator.today_only.async_start())
 
     # Register services (only once)
     if not hass.services.has_service(DOMAIN, SERVICE_BLOCK_APP):
@@ -345,16 +358,16 @@ def _register_services(hass: HomeAssistant) -> None:
         (SERVICE_SET_SCREENTIME_LIMIT, SERVICE_SET_SCREENTIME_LIMIT_SCHEMA,
          "async_set_screentime_limit",
          lambda d: (
-             d["account_id"], d["day_of_week"], d["hours"], d.get("minutes", 0),
-             d.get("platform", "Windows"),
+             d["account_id"], d.get("day_of_week"), d["hours"], d.get("minutes", 0),
+             d.get("platform", "Windows"), d.get("today_only", False),
          )),
         (SERVICE_SET_SCREENTIME_INTERVALS, SERVICE_SET_SCREENTIME_INTERVALS_SCHEMA,
          "async_set_screentime_intervals",
          lambda d: (
-             d["account_id"], d["day_of_week"],
+             d["account_id"], d.get("day_of_week"),
              d["start_hour"], d.get("start_minute", 0),
              d["end_hour"], d.get("end_minute", 0),
-             d.get("platform", "Windows"),
+             d.get("platform", "Windows"), d.get("today_only", False),
          )),
         (SERVICE_SET_APP_TIME_LIMIT, SERVICE_SET_APP_TIME_LIMIT_SCHEMA,
          "async_set_app_time_limit",
@@ -397,6 +410,9 @@ def _register_services(hass: HomeAssistant) -> None:
          lambda d: (d["account_id"], d["url"], d["max_domains"], d["stop"])),
         (SERVICE_GET_SITES, SERVICE_GET_SITES_SCHEMA, "async_get_sites",
          lambda d: (d["account_id"],)),
+        (SERVICE_RESTORE_TODAY_ONLY, SERVICE_RESTORE_TODAY_ONLY_SCHEMA,
+         "async_restore_today_only",
+         lambda d: (d["account_id"], d.get("platform"))),
     ]
 
     def make_handler(method_name, extract_args, per_child, responds, admin_only):
