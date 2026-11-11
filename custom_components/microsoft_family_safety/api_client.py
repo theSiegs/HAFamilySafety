@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+import json
 import logging
 import time
 from typing import Any
@@ -29,6 +30,7 @@ from .mobile_overrides import MOBILE_OVERRIDES_PATH, MOBILE_OVERRIDES_PLAT_INFO
 _LOGGER = logging.getLogger(__name__)
 
 _BASE_URL = "https://mobileaggregator.family.microsoft.com/api"
+
 _APP_VERSION = "v 1.26.0.1001"
 _USER_AGENT = f"Family Safety-prod/({_APP_VERSION}) Android/33 google/Pixel 4 XL"
 
@@ -355,6 +357,32 @@ class FamilySafetyWebAPI:
             json_data=body,
             extra_headers={"Plat-Info": MOBILE_OVERRIDES_PLAT_INFO},
         )
+
+    async def mobile_raw_request(
+        self,
+        method: str,
+        path: str,
+        json_data: dict | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Diagnostic: one mobile API request, answered as {status, body}; never raises."""
+        try:
+            await self._ensure_session()
+            await self._ensure_auth()
+            headers = self._build_headers()
+            if extra_headers:
+                headers.update(extra_headers)
+            async with self._session.request(
+                method, f"{_BASE_URL}{path}", headers=headers, json=json_data
+            ) as resp:
+                text = await resp.text()
+                try:
+                    body: Any = json.loads(text) if text else None
+                except ValueError:
+                    body = text
+                return {"status": resp.status, "body": body}
+        except Exception as err:  # noqa: BLE001 - reported, not raised
+            return {"status": None, "error": f"{type(err).__name__}: {err}"}
 
     # ------------------------------------------------------------------
     # Mobile schedule API (/v4/devicelimits/schedules), as used by the

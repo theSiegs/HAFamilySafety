@@ -295,3 +295,122 @@ async def test_allowed_now_hold_attributes_for_windows(hass, xbox, mobile):
         assert allowed[name] == lock[name], name
     assert allowed["hold"] == "ours"
     assert allowed["override"] == "blockUntil"
+
+
+# --- Windows: the same, on the mobile API's /v4 overrides ---------------------------
+
+
+class FakeMobileExtra(FakeMobile):
+    """FakeMobile that also takes extra time (AllowUntil)."""
+
+    async def set_mobile_device_override(self, child_id, target, override_type, valid_until):
+        if override_type == "AllowUntil":
+            until = iso_utc(valid_until)
+            self.platforms[target] = [{"overrideType": "AllowUntil", "validUntil": until}]
+            self.writes.append((target, f"allow {until}"))
+            return self.state()
+        return await super().set_mobile_device_override(
+            child_id, target, override_type, valid_until
+        )
+
+
+@pytest.fixture
+def mobile_extra():
+    return FakeMobileExtra()
+
+
+def _windows_polled(coord, mobile) -> None:
+    """What the next poll holds for Windows: only whether it is locked."""
+    blocked = ["Windows"] if any(
+        o["overrideType"] == "BlockUntil" for o in mobile.platforms["Windows"]
+    ) else []
+    coord.data["accounts"][CHILD]["blocked_platforms"] = blocked
+
+
+async def _windows_locked_then_bonus(coord, minutes=30):
+    await coord.async_lock_platform(CHILD, "Windows", _minutes(180))
+    return await coord.async_add_time_bonus(
+        CHILD, "Windows", _minutes(minutes), replace_lock=True
+    )
+
+
+async def test_windows_extra_time_over_our_lock_reads_bonus_ours(hass, xbox, mobile_extra):
+    coord = _coordinator(hass, xbox, mobile_extra)
+    result = await _windows_locked_then_bonus(coord)
+
+    assert result["added"] is True
+    assert result["replaced_lock"] is True
+    assert result["hold_kept"] is True
+    assert coord.platform_hold(CHILD, "Windows")["bonus_until"]
+    _windows_polled(coord, mobile_extra)
+    state = coord.platform_hold_state(CHILD, "Windows")
+    assert state["hold"] == "bonus_ours"
+    assert state["override"] == "allowUntil"
+    assert state["allow_until"] is not None
+
+
+async def test_windows_extra_time_without_a_lock_reads_bonus_ours(hass, xbox, mobile_extra):
+    coord = _coordinator(hass, xbox, mobile_extra)
+    result = await coord.async_add_time_bonus(CHILD, "Windows", _minutes(30))
+    assert result["hold_kept"] is False
+    _windows_polled(coord, mobile_extra)
+    assert coord.platform_hold_state(CHILD, "Windows")["hold"] == "bonus_ours"
+
+
+async def test_windows_lock_is_put_back_when_our_extra_time_has_ended(
+    hass, xbox, mobile_extra
+):
+    coord = _coordinator(hass, xbox, mobile_extra)
+    await _windows_locked_then_bonus(coord)
+    key = f"{CHILD}|windows"
+    hold = coord._platform_holds[key]
+    until = hold["until"]
+    hold["bonus_until"] = iso_utc(_minutes(-1))
+    coord._time_bonuses[key]["until"] = hold["bonus_until"]
+    mobile_extra.platforms["Windows"] = []  # the extra time has run out
+    mobile_extra.writes.clear()
+
+    _windows_polled(coord, mobile_extra)
+    assert coord.platform_hold_state(CHILD, "Windows")["hold"] == "ours"
+
+    await coord._async_resume_after_bonus({}, {})
+    await hass.async_block_till_done()
+    assert mobile_extra.writes == [("Windows", until)]
+    assert "bonus_until" not in coord.platform_hold(CHILD, "Windows")
+    assert key not in coord._time_bonuses
+
+
+async def test_strict_mode_never_locks_windows_over_our_extra_time(hass, xbox, mobile_extra):
+    coord = _coordinator(hass, xbox, mobile_extra, strict=True)
+    await _windows_locked_then_bonus(coord)
+    coord._platform_holds[f"{CHILD}|windows"]["confirmed_at"] = iso_utc(_minutes(-30))
+    mobile_extra.platforms["Windows"] = []
+    mobile_extra.writes.clear()
+
+    await coord._async_enforce_holds({})
+    await hass.async_block_till_done()
+    assert mobile_extra.writes == []
+
+
+async def test_cancelling_windows_extra_time_puts_our_lock_back(hass, xbox, mobile_extra):
+    coord = _coordinator(hass, xbox, mobile_extra)
+    await _windows_locked_then_bonus(coord)
+    until = coord.platform_hold(CHILD, "Windows")["until"]
+    mobile_extra.writes.clear()
+
+    result = await coord.async_cancel_time_bonus(CHILD, "Windows")
+
+    assert result["cancelled"] is True
+    assert result["lock_restored"] is True
+    assert mobile_extra.writes == [("Windows", "Cancel"), ("Windows", until)]
+
+
+async def test_unlock_leaves_our_windows_extra_time_running(hass, xbox, mobile_extra):
+    coord = _coordinator(hass, xbox, mobile_extra)
+    await _windows_locked_then_bonus(coord)
+    mobile_extra.writes.clear()
+
+    result = await coord.async_unlock_platform(CHILD, "Windows")
+    assert result["applied"] == "bonus_kept"
+    assert mobile_extra.writes == []
+    assert coord.platform_hold(CHILD, "Windows") is None

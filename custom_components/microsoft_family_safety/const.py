@@ -149,6 +149,7 @@ SERVICE_GET_SITES: Final = "get_sites"
 SERVICE_PAUSE_APP: Final = "pause_app"
 SERVICE_RESUME_APP: Final = "resume_app"
 SERVICE_RESTORE_TODAY_ONLY: Final = "restore_today_only"
+SERVICE_PROBE_WINDOWS_EXTRA_TIME: Final = "probe_windows_extra_time"
 
 ALL_SERVICES: Final = [
     SERVICE_BLOCK_APP,
@@ -177,6 +178,7 @@ ALL_SERVICES: Final = [
     SERVICE_PAUSE_APP,
     SERVICE_RESUME_APP,
     SERVICE_RESTORE_TODAY_ONLY,
+    SERVICE_PROBE_WINDOWS_EXTRA_TIME,
 ]
 
 # Platforms
