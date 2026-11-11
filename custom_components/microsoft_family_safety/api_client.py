@@ -255,6 +255,17 @@ class FamilySafetyWebAPI:
         #: Set once the mobile /v4 schedule API answered; schedules then no
         #: longer depend on the Family web context.
         self.mobile_schedule_ok = False
+        #: Whether this client may land on Microsoft's sign-in pages and submit
+        #: the silent "Continue" renewal there. The coordinator turns it off
+        #: while nothing depends on the Family web session (schedules on the
+        #: mobile API, Xbox on the Xbox Family Settings sign-in): every visit
+        #: to those pages after the session's 24 h limit counts as a sign-in
+        #: attempt on the account and can send the parent a security code.
+        self.login_pages_allowed = True
+        #: Set when the web session was found expired while login pages were
+        #: not allowed. No request goes to the web session again until a new
+        #: interactive sign-in (the coordinator keeps the flag across restarts).
+        self.web_parked = False
         #: Browser-like Accept-Language; the coordinator sets it from HA's language.
         self.accept_language = "en-US,en;q=0.9"
         #: child id -> (time.monotonic(), payload) of the last schedules GET.
@@ -636,6 +647,10 @@ class FamilySafetyWebAPI:
         if not self._web_cookies:
             self._mark_web_session("missing")
             return None
+        if self._parked_without_login():
+            self.last_web_error_code = "LOGIN_REDIRECT"
+            self._mark_web_session("expired")
+            return None
         headers = {
             "Accept": "text/html,application/xhtml+xml",
             "Accept-Language": self.accept_language,
@@ -665,6 +680,7 @@ class FamilySafetyWebAPI:
                     session, page, final_url
                 ):
                     return await self._warm_web_session(allow_renewal=False)
+                self._park_if_login_not_allowed("account page")
                 self.last_web_error_code = "LOGIN_REDIRECT"
                 self._mark_web_session("expired", status)
                 _LOGGER.warning(
@@ -801,6 +817,8 @@ class FamilySafetyWebAPI:
         password fields) is never submitted; the caller then reports the
         session as expired as before.  Network errors propagate to the caller.
         """
+        if not self.login_pages_allowed:
+            return False
         headers = {
             "Accept": "text/html,application/xhtml+xml",
             "Accept-Language": self.accept_language,
@@ -874,6 +892,23 @@ class FamilySafetyWebAPI:
             )
         return renewed
 
+    def _parked_without_login(self) -> bool:
+        """Whether the web session is known dead and must not be retried now."""
+        return self.web_parked and not self.login_pages_allowed
+
+    def _park_if_login_not_allowed(self, where: str) -> None:
+        """A request ended on a sign-in page while those are off: stop there."""
+        if self.login_pages_allowed or self.web_parked:
+            return
+        self.web_parked = True
+        _LOGGER.info(
+            "Microsoft Family web session has expired (%s). Nothing depends on it "
+            "(schedules run on the mobile API, Xbox on the Xbox Family Settings "
+            "sign-in), so it is left alone until the next interactive sign-in "
+            "instead of going back to Microsoft's sign-in pages",
+            where,
+        )
+
     async def _warm_family_context(self) -> str | None:
         """Load the Family SPA and obtain its request-verification token.
 
@@ -883,6 +918,12 @@ class FamilySafetyWebAPI:
         """
         if not self._web_cookies:
             self.family_context_state = "missing"
+            return None
+
+        if self._parked_without_login():
+            self.family_context_state = "auth_required"
+            self.family_token_source = None
+            self.last_web_error_code = "FAMILY_CONTEXT_AUTH_REQUIRED"
             return None
 
         if time.monotonic() < self._family_auth_required_until:
@@ -940,6 +981,7 @@ class FamilySafetyWebAPI:
                             if await self._async_renew_account_session(session, page, final_url):
                                 pending.insert(0, candidate)
                                 continue
+                        self._park_if_login_not_allowed("Family page")
                         self.family_context_state = "auth_required"
                         self.family_token_source = None
                         self.last_web_error_code = "FAMILY_CONTEXT_AUTH_REQUIRED"

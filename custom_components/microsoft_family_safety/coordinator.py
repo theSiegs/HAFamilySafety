@@ -100,6 +100,14 @@ AUTH_NOTIFICATION_ID = "familysafety_auth_expired"
 ROSTER_NOTIFICATION_ID = "familysafety_roster_error"
 #: Runtime-store flag set when Microsoft rejected the persisted Family token.
 _FAMILY_TOKEN_REJECTED = "web_family_token_rejected"
+#: Runtime-auth key: the web session expired while nothing needed it, so it is
+#: left alone (no sign-in pages) until a new interactive sign-in.
+_WEB_PARKED = "web_session_parked"
+_PARKED_HINT = (
+    " Microsoft only shows the website lists through the Family web session, "
+    "which has expired; it comes back for about a day after you sign in again "
+    "from the integration (Reconfigure)."
+)
 #: Reauth reasons raised by polling for the Family web session.
 _AUTOMATIC_WEB_REAUTH = frozenset(
     {"family_context_auth_required", "web_session_expired", "web_credentials_missing"}
@@ -243,6 +251,9 @@ class FamilySafetyDataUpdateCoordinator(
         self._reauth_reason: str | None = None
         #: Consecutive polls whose Family bootstrap ended on a login page.
         self._family_auth_required_polls = 0
+        #: Polls started since setup; the first one cannot know yet whether the
+        #: mobile schedule API answers.
+        self._polls_started = 0
         auth_url = entry.options.get(CONF_AUTH_URL) or entry.data.get(CONF_AUTH_URL)
         api_key = entry.options.get(CONF_API_KEY) or entry.data.get(CONF_API_KEY)
         self._addon_client = AddonCookieClient(
@@ -343,6 +354,18 @@ class FamilySafetyDataUpdateCoordinator(
         if self.web_api is None or not getattr(self.web_api, "mobile_schedule_ok", False):
             return True
         return self._xbox_needs_web_session
+
+    def _login_pages_allowed(self) -> bool:
+        """Whether the web client may go to Microsoft's sign-in pages this poll.
+
+        Only while something depends on the Family web session: Xbox without a
+        usable Xbox Family Settings sign-in, or schedules the mobile API did not
+        serve. Before the first poll has run, only the Xbox case counts, so a
+        restart alone never sends a request to a sign-in page.
+        """
+        if self._xbox_needs_web_session:
+            return True
+        return self._polls_started > 1 and self._web_session_needed
 
     @property
     def xbox_features(self) -> bool:
@@ -473,6 +496,10 @@ class FamilySafetyDataUpdateCoordinator(
                 self.web_api.family_token_rejected = False
         if family_referer:
             next_state[CONF_WEB_FAMILY_REFERER] = family_referer
+        if self.web_api is not None and self.web_api.web_parked:
+            next_state[_WEB_PARKED] = True
+        else:
+            next_state.pop(_WEB_PARKED, None)
         next_state["updated_at"] = dt_util.now().isoformat()
 
         comparable_old = {k: v for k, v in self._runtime_auth_state.items() if k != "updated_at"}
@@ -612,6 +639,11 @@ class FamilySafetyDataUpdateCoordinator(
                     family_token=str(family_token) if family_token else None,
                     family_referer=str(family_referer) if family_referer else None,
                 )
+                if self._runtime_auth_state.get(_WEB_PARKED):
+                    # Kept across restarts: the session expired while nothing
+                    # needed it, and only a new sign-in (which resets the
+                    # runtime state) brings it back.
+                    self.web_api.web_parked = True
                 _LOGGER.debug(
                     "Loaded Microsoft Family web credentials: cookies=%d "
                     "family_token_present=%s family_referer_path=%s",
@@ -2329,6 +2361,7 @@ class FamilySafetyDataUpdateCoordinator(
             raise HomeAssistantError(
                 "Could not read the child's blocked and allowed websites from Microsoft, "
                 "so nothing was changed."
+                + _PARKED_HINT * bool(getattr(self.web_api, "web_parked", False))
             )
         return lists
 
@@ -2460,6 +2493,7 @@ class FamilySafetyDataUpdateCoordinator(
         if stored is None or hosts is None:
             raise HomeAssistantError(
                 "Could not read the child's blocked and allowed websites from Microsoft."
+                + _PARKED_HINT * bool(getattr(self.web_api, "web_parked", False))
             )
         blocked_hosts = set(hosts[0])
         async with self._site_sync_lock:
@@ -3419,6 +3453,9 @@ class FamilySafetyDataUpdateCoordinator(
             await self._async_setup_api()
         await self._async_load_web_cookies()
         assert self.api is not None
+        self._polls_started += 1
+        if self.web_api is not None:
+            self.web_api.login_pages_allowed = self._login_pages_allowed()
         try:
             # Verify the browser session independently from individual private
             # API endpoints. This makes the Connection sensor authoritative and
