@@ -39,6 +39,7 @@ from .mobile_overrides import (
     mobile_platform_entry,
 )
 from .app_pause import AppPauser
+from .app_policy_probe import async_probe_app_policy
 from .app_usage import EVENT_APP_USAGE, AppUsageGrowthTracker
 from .screen_time import (
     ALLOW_UNTIL,
@@ -2394,6 +2395,12 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 account_id, lock.get("validUntil"),
             )
         return {"cancelled": True, "lock_in_force": lock is not None}
+
+    async def async_probe_app_policy(self, account_id: str, app_id: str) -> dict[str, Any]:
+        """Diagnostic: every candidate read of one app's policy, raw (GETs only)."""
+        if not self.web_api:
+            raise HomeAssistantError("Mobile API not initialized")
+        return await async_probe_app_policy(self.web_api, str(account_id), app_id)
 
     async def async_probe_windows_extra_time(
         self, account_id: str, minutes: int = 2

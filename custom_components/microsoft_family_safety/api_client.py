@@ -17,6 +17,7 @@ import time
 from typing import Any
 
 import aiohttp
+from yarl import URL
 
 from homeassistant.util import dt as dt_util
 
@@ -364,16 +365,26 @@ class FamilySafetyWebAPI:
         path: str,
         json_data: dict | None = None,
         extra_headers: dict[str, str] | None = None,
+        *,
+        params: dict[str, str] | None = None,
+        encoded: bool = False,
     ) -> dict[str, Any]:
-        """Diagnostic: one mobile API request, answered as {status, body}; never raises."""
+        """Diagnostic: one mobile API request, answered as {status, body}; never raises.
+
+        ``encoded``: the path is sent exactly as given (already percent-encoded).
+        """
         try:
             await self._ensure_session()
             await self._ensure_auth()
             headers = self._build_headers()
             if extra_headers:
                 headers.update(extra_headers)
+            url: str | URL = f"{_BASE_URL}{path}"
+            if encoded:
+                url = URL(url, encoded=True)
             async with self._session.request(
-                method, f"{_BASE_URL}{path}", headers=headers, json=json_data
+                method, url, headers=headers, json=json_data, params=params,
+                timeout=self._MOBILE_TIMEOUT,
             ) as resp:
                 text = await resp.text()
                 try:

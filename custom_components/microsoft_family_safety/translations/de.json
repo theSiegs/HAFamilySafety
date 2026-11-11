@@ -233,6 +233,20 @@
         }
       }
     },
+    "probe_app_policy": {
+      "name": "App-Richtlinie testen",
+      "description": "Diagnose (nur Administratoren): Liest die Limit-Richtlinie einer App auf jede Art, die die mobile API beantworten könnte (Richtlinie, Liste, Einstellungen und Aktivitätsbericht; keine Schreibzugriffe), und gibt jede Anfrage mit Status und Antwort von Microsoft zurück.",
+      "fields": {
+        "account_id": {
+          "name": "Konto-ID",
+          "description": "Die Benutzer-ID des Kinderkontos."
+        },
+        "app_id": {
+          "name": "App-ID",
+          "description": "Die ID der App, wie sie der Sensor „Anwendungen“ aufführt, z. B. appx:windowsplt:example_1234abcd oder x:1234567890."
+        }
+      }
+    },
     "cancel_time_bonus": {
       "name": "Extrazeit aufheben",
       "description": "Hebt die laufende Extrazeit auf der Xbox oder unter Windows eines Kindes auf. Nur Extrazeit wird aufgehoben: Schlägt fehl, solange die Plattform gesperrt ist (eine Sperre wird nie gelöst), und tut nichts, wenn keine Extrazeit läuft. Kann mit cancelled und reason oder lock_in_force antworten.",

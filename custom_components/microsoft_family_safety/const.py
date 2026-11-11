@@ -150,6 +150,7 @@ SERVICE_PAUSE_APP: Final = "pause_app"
 SERVICE_RESUME_APP: Final = "resume_app"
 SERVICE_RESTORE_TODAY_ONLY: Final = "restore_today_only"
 SERVICE_PROBE_WINDOWS_EXTRA_TIME: Final = "probe_windows_extra_time"
+SERVICE_PROBE_APP_POLICY: Final = "probe_app_policy"
 
 ALL_SERVICES: Final = [
     SERVICE_BLOCK_APP,
@@ -179,6 +180,7 @@ ALL_SERVICES: Final = [
     SERVICE_RESUME_APP,
     SERVICE_RESTORE_TODAY_ONLY,
     SERVICE_PROBE_WINDOWS_EXTRA_TIME,
+    SERVICE_PROBE_APP_POLICY,
 ]
 
 # Platforms
