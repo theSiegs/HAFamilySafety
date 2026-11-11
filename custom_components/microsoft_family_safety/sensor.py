@@ -554,9 +554,19 @@ class FamilySafetyApplicationCountSensor(FamilySafetyAccountSensor):
             return {}
 
         applications = account_data.get("applications", [])
+        names = {app.get("app_id"): app.get("app_name") for app in applications}
+
         return {
             **usage_summary(applications),
             "applications": applications,
+            # Apps pause_app paused: "ours" while still blocked, "parent"
+            # once someone unblocked them in the meantime.
+            "paused_apps": [
+                {"app_id": app_id, "app_name": names.get(app_id) or app_id, "paused": who}
+                for app_id, who in sorted(
+                    self.coordinator.paused_apps(self._account_id).items()
+                )
+            ],
             # Every app in the compact shape, used today or not.
             "apps": apps_attribute(applications),
         }

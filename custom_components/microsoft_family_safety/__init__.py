@@ -44,6 +44,8 @@ from .const import (
     SERVICE_CANCEL_TIME_BONUS,
     SERVICE_SYNC_SITE_LIST,
     SERVICE_GET_SITES,
+    SERVICE_PAUSE_APP,
+    SERVICE_RESUME_APP,
     CONF_ALLOWED_USERS,
 )
 from .coordinator import FamilySafetyDataUpdateCoordinator, site_sync_store
@@ -160,6 +162,16 @@ SERVICE_UNLOCK_ACCOUNT_SCHEMA = child_schema({})
 
 SERVICE_REQUEST_REAUTH_SCHEMA = vol.Schema({})
 
+_APP_IDS = vol.All(cv.ensure_list, [cv.string], vol.Length(min=1))
+
+SERVICE_PAUSE_APP_SCHEMA = child_schema({
+    vol.Required("apps"): _APP_IDS,
+})
+
+SERVICE_RESUME_APP_SCHEMA = child_schema({
+    vol.Optional("apps"): _APP_IDS,
+})
+
 SERVICE_SYNC_SITE_LIST_SCHEMA = child_schema({
     vol.Required("url"): https_url,
     vol.Optional("max_domains", default=MAX_SYNC_DOMAINS): vol.All(
@@ -172,7 +184,8 @@ SERVICE_GET_SITES_SCHEMA = child_schema({})
 
 #: Services that answer (response_variable): lock_platform / unlock_platform
 #: with ``{"prior", "applied"}``, the extra time actions with what they gave
-#: or cancelled, sync_site_list with what it did, get_sites with what it read.
+#: or cancelled, sync_site_list with what it did, get_sites with what it read,
+#: pause_app / resume_app with what they did per app.
 _RESPONSE_SERVICES = {
     SERVICE_LOCK_PLATFORM: SupportsResponse.OPTIONAL,
     SERVICE_UNLOCK_PLATFORM: SupportsResponse.OPTIONAL,
@@ -180,6 +193,8 @@ _RESPONSE_SERVICES = {
     SERVICE_CANCEL_TIME_BONUS: SupportsResponse.OPTIONAL,
     SERVICE_SYNC_SITE_LIST: SupportsResponse.OPTIONAL,
     SERVICE_GET_SITES: SupportsResponse.ONLY,
+    SERVICE_PAUSE_APP: SupportsResponse.OPTIONAL,
+    SERVICE_RESUME_APP: SupportsResponse.OPTIONAL,
 }
 #: Services for administrators only, whatever the allowed-users option says:
 #: sync_site_list downloads a URL from inside Home Assistant, and get_sites
@@ -214,6 +229,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Load persisted screentime policies (for lock/unlock survival across
     # restarts) and the rotated refresh token.
     await coordinator.async_load_saved_screentime()
+    # And the app states pause_app saved, for resume_app.
+    await coordinator.app_pauser.async_load()
 
     try:
         await coordinator.async_config_entry_first_refresh()
@@ -366,6 +383,10 @@ def _register_services(hass: HomeAssistant) -> None:
          lambda d: (d["account_id"],)),
         (SERVICE_REQUEST_REAUTH, SERVICE_REQUEST_REAUTH_SCHEMA, "async_request_reauth",
          lambda d: ()),
+        (SERVICE_PAUSE_APP, SERVICE_PAUSE_APP_SCHEMA, "async_pause_app",
+         lambda d: (d["account_id"], d["apps"])),
+        (SERVICE_RESUME_APP, SERVICE_RESUME_APP_SCHEMA, "async_resume_app",
+         lambda d: (d["account_id"], d.get("apps"))),
         (SERVICE_SYNC_SITE_LIST, SERVICE_SYNC_SITE_LIST_SCHEMA, "async_sync_site_list",
          lambda d: (d["account_id"], d["url"], d["max_domains"], d["stop"])),
         (SERVICE_GET_SITES, SERVICE_GET_SITES_SCHEMA, "async_get_sites",
@@ -418,10 +439,12 @@ def _register_services(hass: HomeAssistant) -> None:
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Delete what this entry keeps: the Xbox token, the platform holds and the site-list sync record."""
+    """Delete what this entry keeps: the Xbox token, the platform holds, the
+    site-list sync record and the paused apps."""
     from homeassistant.helpers import issue_registry as ir
     from homeassistant.helpers.storage import Store
 
+    from .app_pause import AppPauser
     from .coordinator import PLATFORM_HOLD_STORAGE_KEY, STORAGE_VERSION
     from .xbox_family_api import XboxFamilyAPI
 
@@ -431,6 +454,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
         hass, STORAGE_VERSION, f"{PLATFORM_HOLD_STORAGE_KEY}.{entry.entry_id}"
     ).async_remove()
     await site_sync_store(hass, entry.entry_id).async_remove()
+    await AppPauser(hass, entry.entry_id).async_remove()
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
