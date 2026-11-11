@@ -103,11 +103,6 @@ _FAMILY_TOKEN_REJECTED = "web_family_token_rejected"
 #: Runtime-auth key: the web session expired while nothing needed it, so it is
 #: left alone (no sign-in pages) until a new interactive sign-in.
 _WEB_PARKED = "web_session_parked"
-_PARKED_HINT = (
-    " Microsoft only shows the website lists through the Family web session, "
-    "which has expired; it comes back for about a day after you sign in again "
-    "from the integration (Reconfigure)."
-)
 #: Reauth reasons raised by polling for the Family web session.
 _AUTOMATIC_WEB_REAUTH = frozenset(
     {"family_context_auth_required", "web_session_expired", "web_credentials_missing"}
@@ -2361,7 +2356,6 @@ class FamilySafetyDataUpdateCoordinator(
             raise HomeAssistantError(
                 "Could not read the child's blocked and allowed websites from Microsoft, "
                 "so nothing was changed."
-                + _PARKED_HINT * bool(getattr(self.web_api, "web_parked", False))
             )
         return lists
 
@@ -2493,7 +2487,6 @@ class FamilySafetyDataUpdateCoordinator(
         if stored is None or hosts is None:
             raise HomeAssistantError(
                 "Could not read the child's blocked and allowed websites from Microsoft."
-                + _PARKED_HINT * bool(getattr(self.web_api, "web_parked", False))
             )
         blocked_hosts = set(hosts[0])
         async with self._site_sync_lock:
