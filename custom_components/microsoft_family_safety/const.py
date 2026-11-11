@@ -129,6 +129,8 @@ SERVICE_SET_ACQUISITION_POLICY: Final = "set_acquisition_policy"
 SERVICE_LOCK_ACCOUNT: Final = "lock_account"
 SERVICE_UNLOCK_ACCOUNT: Final = "unlock_account"
 SERVICE_REQUEST_REAUTH: Final = "request_reauth"
+SERVICE_ADD_TIME_BONUS: Final = "add_time_bonus"
+SERVICE_CANCEL_TIME_BONUS: Final = "cancel_time_bonus"
 
 ALL_SERVICES: Final = [
     SERVICE_BLOCK_APP,
@@ -150,6 +152,8 @@ ALL_SERVICES: Final = [
     SERVICE_LOCK_ACCOUNT,
     SERVICE_UNLOCK_ACCOUNT,
     SERVICE_REQUEST_REAUTH,
+    SERVICE_ADD_TIME_BONUS,
+    SERVICE_CANCEL_TIME_BONUS,
 ]
 
 # Platforms
