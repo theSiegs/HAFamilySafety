@@ -40,6 +40,7 @@ from .app_usage import EVENT_APP_USAGE, AppUsageGrowthTracker
 from . import site_sync
 from .auth.addon_client import AddonCookieClient
 from .xbox_family_api import (
+    OVERRIDE_ALLOW,
     OVERRIDE_BLOCK,
     OVERRIDE_REVOKE,
     XboxFamilyAPI,
@@ -1207,8 +1208,14 @@ class FamilySafetyDataUpdateCoordinator(
         if account is None:
             raise ValueError(f"Account {account_id} not found")
         self._check_platform_lockable(platform)
-        self._check_xbox_bonus_possible(platform, "give")
         until = dt_util.as_utc(until)
+        if platform.lower() == "xbox" and (xuid := await self._xapprove_xuid_for(account_id)):
+            # The Xbox Family Settings app's own "add time" (xapprove override 1): no
+            # Family web session needed. Falls back to the web path below.
+            answer = await self._async_xapprove_bonus(account_id, xuid, until)
+            if answer is not None:
+                return answer
+        self._check_xbox_bonus_possible(platform, "give")
         key = self._hold_key(account_id, platform)
         async with self._hold_lock(key):
             await self._async_load_platform_holds()
@@ -1272,6 +1279,10 @@ class FamilySafetyDataUpdateCoordinator(
         if account is None:
             raise ValueError(f"Account {account_id} not found")
         self._check_platform_lockable(platform)
+        if platform.lower() == "xbox" and (xuid := await self._xapprove_xuid_for(account_id)):
+            answer = await self._async_xapprove_cancel_bonus(account_id, xuid)
+            if answer is not None:
+                return answer
         self._check_xbox_bonus_possible(platform, "cancel")
         key = self._hold_key(account_id, platform)
         async with self._hold_lock(key):
@@ -1298,6 +1309,86 @@ class FamilySafetyDataUpdateCoordinator(
             "cancelled": True,
             "read_back": self._override_details(current),
         }
+
+    @staticmethod
+    def _xapprove_override(result: dict[str, Any], override_type: int) -> dict[str, Any] | None:
+        """The override of [override_type] in an xapprove overrides answer, if any."""
+        for override in (result or {}).get("overrides") or []:
+            if isinstance(override, dict) and override.get("overrideType") == override_type:
+                return override
+        return None
+
+    async def _async_xapprove_bonus(
+        self, account_id: str, xuid: str, until: datetime
+    ) -> dict[str, Any] | None:
+        """Xbox extra time through xapprove, confirmed by its answer; None to try the web path."""
+        try:
+            result = await self.xbox_family.async_create_override(xuid, OVERRIDE_ALLOW, until)
+        except XboxFamilyError as err:
+            _LOGGER.warning("xapprove Xbox extra time failed, trying the web path: %s", err)
+            return None
+        override = self._xapprove_override(result, OVERRIDE_ALLOW)
+        valid_until = parse_utc(override.get("validUntil")) if override else None
+        if valid_until is None or abs(valid_until - until) > self._OWN_LOCK_TOLERANCE:
+            _LOGGER.warning(
+                "xapprove did not confirm the Xbox extra time (read back %s); trying the web path",
+                override,
+            )
+            return None
+        key = self._hold_key(account_id, "Xbox")
+        async with self._hold_lock(key):
+            await self._async_load_bonuses()
+            # Microsoft keeps one override: the extra time replaced a lock of ours
+            released = self._platform_override_until.pop((str(account_id), "xbox"), None) is not None
+            self._bonuses[key] = {"account_id": str(account_id), "platform": "Xbox", "until": iso_utc(until)}
+            await self._bonus_store.async_save(self._bonuses)
+        self._xbox_lock_known.add(str(account_id))
+        await self.async_request_refresh()
+        return {
+            "platform": "Xbox",
+            "applied_until": dt_util.as_local(until).isoformat(),
+            "read_back": {"type": ALLOW_UNTIL, "valid_until": iso_utc(valid_until)},
+            "released_hold": released,
+            "path": "xapprove",
+        }
+
+    async def _async_xapprove_cancel_bonus(self, account_id: str, xuid: str) -> dict[str, Any] | None:
+        """Cancel Xbox extra time through xapprove (the app's revoke); a lock is never touched. None to try
+        the web path."""
+        try:
+            current = await self.xbox_family.async_get_overrides(xuid)
+        except XboxFamilyError as err:
+            _LOGGER.warning("xapprove Xbox overrides unreadable, trying the web path: %s", err)
+            return None
+        key = self._hold_key(account_id, "Xbox")
+        if self._xapprove_override(current, OVERRIDE_ALLOW) is None:
+            async with self._hold_lock(key):
+                await self._async_load_bonuses()
+                if self._bonuses.pop(key, None) is not None:
+                    await self._bonus_store.async_save(self._bonuses)
+            block = self._xapprove_override(current, OVERRIDE_BLOCK)
+            return {
+                "platform": "Xbox",
+                "cancelled": False,
+                "reason": "no extra time in force (blockUntil)" if block else "no extra time in force",
+                "path": "xapprove",
+            }
+        try:
+            result = await self.xbox_family.async_create_override(
+                xuid, OVERRIDE_REVOKE, dt_util.utcnow() + timedelta(minutes=10)
+            )
+        except XboxFamilyError as err:
+            _LOGGER.warning("xapprove Xbox revoke failed, trying the web path: %s", err)
+            return None
+        if self._xapprove_override(result, OVERRIDE_ALLOW) is not None:
+            _LOGGER.warning("xapprove revoke left the Xbox extra time in place; trying the web path")
+            return None
+        async with self._hold_lock(key):
+            await self._async_load_bonuses()
+            if self._bonuses.pop(key, None) is not None:
+                await self._bonus_store.async_save(self._bonuses)
+        await self.async_request_refresh()
+        return {"platform": "Xbox", "cancelled": True, "path": "xapprove"}
 
     async def async_release_platform(self, account_id: str, platform: str) -> None:
         """Cancel any lock on the platform and forget the hold: the lock switch's off.

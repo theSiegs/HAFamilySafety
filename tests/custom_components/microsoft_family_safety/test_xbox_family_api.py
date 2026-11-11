@@ -25,7 +25,9 @@ from custom_components.microsoft_family_safety.coordinator import (
     FamilySafetyDataUpdateCoordinator,
 )
 from custom_components.microsoft_family_safety.xbox_family_api import (
+    OVERRIDE_ALLOW,
     OVERRIDE_BLOCK,
+    OVERRIDE_REVOKE,
     XboxFamilyAPI,
     XboxFamilyAuthError,
     overrides_to_policy,
@@ -377,3 +379,54 @@ async def test_removing_the_entry_deletes_the_xbox_token(hass, hass_storage):
     await async_remove_entry(hass, entry)
     await hass.async_block_till_done()
     assert f"{DOMAIN}.xbox.{entry.entry_id}" not in hass_storage
+
+
+# --- extra time through xapprove ------------------------------------------------
+def _bonus_store(coordinator):
+    coordinator._bonus_store = MagicMock(async_save=AsyncMock(), async_load=AsyncMock(return_value={}))
+    coordinator._async_load_bonuses = AsyncMock()
+    coordinator._bonuses = {}
+
+
+async def test_xbox_extra_time_through_xapprove_without_the_web_session(coordinator):
+    _bonus_store(coordinator)
+    until = (dt_util.utcnow() + timedelta(minutes=30)).replace(microsecond=0)
+    coordinator._platform_override_until[(CHILD, "xbox")] = until
+    coordinator.xbox_family.async_create_override.return_value = {
+        "overrides": [{"overrideType": OVERRIDE_ALLOW, "validUntil": until.isoformat()}]
+    }
+    coordinator.web_api.set_platform_time_override = AsyncMock()
+    answer = await coordinator.async_add_time_bonus(CHILD, "Xbox", until)
+    assert coordinator.xbox_family.async_create_override.await_args.args[1] == OVERRIDE_ALLOW
+    assert answer["path"] == "xapprove" and answer["released_hold"] is True
+    assert (CHILD, "xbox") not in coordinator._platform_override_until
+    coordinator.web_api.set_platform_time_override.assert_not_called()
+
+
+async def test_xbox_extra_time_not_confirmed_falls_back(coordinator):
+    _bonus_store(coordinator)
+    until = dt_util.utcnow() + timedelta(minutes=30)
+    coordinator.xbox_family.async_create_override.return_value = {"overrides": []}
+    # With the web session down the fallback says so instead of claiming success
+    coordinator._xbox_web_unavailable = MagicMock(return_value=True)
+    with pytest.raises(Exception):
+        await coordinator.async_add_time_bonus(CHILD, "Xbox", until)
+
+
+async def test_cancelling_xbox_extra_time_revokes_it_and_leaves_a_lock_alone(coordinator):
+    _bonus_store(coordinator)
+    coordinator.xbox_family.async_get_overrides.return_value = {
+        "overrides": [{"overrideType": OVERRIDE_ALLOW, "validUntil": "2099-01-01T00:00:00Z"}]
+    }
+    coordinator.xbox_family.async_create_override.return_value = {"overrides": []}
+    answer = await coordinator.async_cancel_time_bonus(CHILD, "Xbox")
+    assert answer == {"platform": "Xbox", "cancelled": True, "path": "xapprove"}
+    assert coordinator.xbox_family.async_create_override.await_args.args[1] == OVERRIDE_REVOKE
+
+    coordinator.xbox_family.async_create_override.reset_mock()
+    coordinator.xbox_family.async_get_overrides.return_value = {
+        "overrides": [{"overrideType": OVERRIDE_BLOCK, "validUntil": "2099-01-01T00:00:00Z"}]
+    }
+    answer = await coordinator.async_cancel_time_bonus(CHILD, "Xbox")
+    assert answer["cancelled"] is False
+    coordinator.xbox_family.async_create_override.assert_not_called()
