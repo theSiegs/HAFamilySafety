@@ -78,8 +78,11 @@ def _updates_listeners(func):
     """Push the entities again once a hold change is done.
 
     The write inside refreshes the entities before the hold it changes is
-    saved, so without this they show the hold from before (a lock of ours
-    read as ``parent``) until the next poll.
+    saved, and that refresh is put off when a poll ran moments ago, so
+    without this they show the hold from before (a lock of ours read as
+    ``parent``) until the next poll. The lock state the write left is
+    taken into the polled data first, so the push does not pair the new
+    hold with a lock state from before the write.
     """
 
     @functools.wraps(func)
@@ -87,6 +90,7 @@ def _updates_listeners(func):
         try:
             return await func(self, *args, **kwargs)
         finally:
+            self._sync_blocked_platforms()
             self.async_update_listeners()
 
     return wrapper
@@ -810,6 +814,23 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if str(key) == str(account_id):
                 return key
         raise ValueError(f"Account {account_id} not found")
+
+    def _sync_blocked_platforms(self) -> None:
+        """Put the Xbox lock state our writes left into the polled data.
+
+        Only the Xbox entry: it comes from the overrides this integration
+        tracks, the other platforms from the last poll.
+        """
+        now = dt_util.utcnow()
+        for key in self._accounts:
+            data = self._account_data(key)
+            if data is None:
+                continue
+            blocked = [p for p in (data.get("blocked_platforms") or []) if p != "Xbox"]
+            until = self._platform_override_until.get((str(key), "xbox"))
+            if until is not None and until > now:
+                blocked.append("Xbox")
+            data["blocked_platforms"] = blocked
 
     def _account_data(self, account_id: Any) -> dict[str, Any] | None:
         """A child's polled data, whether the id comes as int or str."""

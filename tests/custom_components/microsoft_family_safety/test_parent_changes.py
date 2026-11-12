@@ -164,20 +164,24 @@ async def test_lock_switch_attributes_for_windows_and_xbox(rig):
 
 
 async def test_entities_are_told_once_the_hold_is_saved(rig):
-    """The write refreshes before the hold is confirmed; a last push follows."""
+    """The write refreshes before the hold is confirmed; a last push follows.
+
+    The push also carries the lock state the write left, not the last poll's.
+    """
     coord, _, _ = rig
-    seen: list[tuple[str, bool | None]] = []
+    seen: list[tuple[bool | None, bool]] = []
 
     def listener() -> None:
         hold = coord.platform_hold(CHILD, "Xbox")
-        seen.append(("lock", None if hold is None else bool(hold.get("confirmed"))))
+        blocked = "Xbox" in (coord.data["accounts"][CHILD].get("blocked_platforms") or [])
+        seen.append((None if hold is None else bool(hold.get("confirmed")), blocked))
 
     unsub = coord.async_add_listener(listener)
     try:
         await coord.async_lock_platform(CHILD, "Xbox", _hours(2))
-        assert seen and seen[-1] == ("lock", True)
+        assert seen and seen[-1] == (True, True)
         seen.clear()
         await coord.async_unlock_platform(CHILD, "Xbox")
-        assert seen
+        assert seen and seen[-1][1] is False
     finally:
         unsub()
