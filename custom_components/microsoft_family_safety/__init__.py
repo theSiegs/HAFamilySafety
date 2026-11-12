@@ -55,6 +55,7 @@ from .const import (
     SERVICE_PROBE_WINDOWS_EXTRA_TIME,
     SERVICE_SYNC_SITE_LIST,
     SERVICE_PROBE_APP_POLICY,
+    SERVICE_PROBE_XBOX_SCHEDULE,
     CONF_ALLOWED_USERS,
     SCREENTIME_PLATFORMS,
 )
@@ -116,6 +117,10 @@ SERVICE_PROBE_WINDOWS_EXTRA_TIME_SCHEMA = vol.Schema({
     vol.Required("account_id"): cv.string,
     vol.Required("confirm_risk"): vol.All(cv.boolean, True),
     vol.Optional("minutes", default=2): vol.All(vol.Coerce(int), vol.Range(min=1, max=10)),
+})
+
+SERVICE_PROBE_XBOX_SCHEDULE_SCHEMA = vol.Schema({
+    vol.Required("account_id"): cv.string,
 })
 
 SERVICE_PROBE_APP_POLICY_SCHEMA = vol.Schema({
@@ -500,6 +505,19 @@ def _register_services(hass: HomeAssistant) -> None:
     async_register_admin_service(
         hass, DOMAIN, SERVICE_PROBE_APP_POLICY, probe_app_policy,
         schema=SERVICE_PROBE_APP_POLICY_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
+    )
+
+    async def probe_xbox_schedule(call: ServiceCall) -> dict:
+        """Diagnostic: the raw xapprove schedule of one child (GET only)."""
+        coordinator = _get_coordinator(hass, call.data["account_id"])
+        if coordinator is None:
+            raise HomeAssistantError("No Microsoft Family Safety coordinator available")
+        return await coordinator.async_probe_xbox_schedule(call.data["account_id"])
+
+    async_register_admin_service(
+        hass, DOMAIN, SERVICE_PROBE_XBOX_SCHEDULE, probe_xbox_schedule,
+        schema=SERVICE_PROBE_XBOX_SCHEDULE_SCHEMA,
         supports_response=SupportsResponse.ONLY,
     )
 

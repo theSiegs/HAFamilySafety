@@ -154,6 +154,7 @@ SERVICE_RESTORE_TODAY_ONLY: Final = "restore_today_only"
 SERVICE_PROBE_WINDOWS_EXTRA_TIME: Final = "probe_windows_extra_time"
 SERVICE_SYNC_SITE_LIST: Final = "sync_site_list"
 SERVICE_PROBE_APP_POLICY: Final = "probe_app_policy"
+SERVICE_PROBE_XBOX_SCHEDULE: Final = "probe_xbox_schedule"
 
 ALL_SERVICES: Final = [
     SERVICE_BLOCK_APP,
@@ -184,6 +185,7 @@ ALL_SERVICES: Final = [
     SERVICE_PROBE_WINDOWS_EXTRA_TIME,
     SERVICE_SYNC_SITE_LIST,
     SERVICE_PROBE_APP_POLICY,
+    SERVICE_PROBE_XBOX_SCHEDULE,
 ]
 
 # Platforms
