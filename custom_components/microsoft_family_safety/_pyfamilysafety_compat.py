@@ -24,25 +24,10 @@ that surface on Home Assistant, especially on Python 3.14:
 4. In 1.1.2 ``Authenticator.access_token`` is the raw token value. Newer
    releases expose the complete ``MSAuth1.0`` Authorization value instead.
    Code written against the newer API can therefore send a raw token to the
-   mobile aggregator and receive ``Authentication.BadCompactTicket``.
+   mobile aggregator and receive ``Authentication.BadCompactTicket``;
+   ``authenticator_authorization_header`` builds the right value for both.
 
-5. The combined client preferred slow private web endpoints for data that is
-   also available from the authenticated mobile aggregator. A web timeout could
-   therefore hide otherwise readable policy data and make every coordinator
-   cycle take more than a minute.
-
-6. The supplied browser HAR proves that the active Windows/per-device screen-
-   time schedule is read directly from ``/family/api/st?childId=...``. Earlier
-   compatibility code guessed that the mobile PATCH schedule resource might
-   also support GET, which Microsoft rejects with HTTP 400.
-
-7. Runtime logs show intermittent ``Timeout while contacting DNS servers``
-   errors from aiohttp's resolver path, including for both account.microsoft.com
-   and the mobile aggregator. The Family web client therefore uses an explicit
-   threaded system resolver with IPv4, matching the successful browser HAR's
-   IPv4 transport while leaving the rest of Home Assistant untouched.
-
-8. ``Account.update`` lets a single Microsoft 404
+5. ``Account.update`` lets a single Microsoft 404
    ``Family.UnableToFindTargetResource`` / ``RosterError`` abort the whole
    roster load, so one child whose node Microsoft cannot resolve (a reset
    device, or a school/work Entra ID account on the same machine, issue #42)
@@ -69,7 +54,6 @@ import asyncio
 from datetime import datetime, timedelta
 import inspect
 import logging
-import time
 from typing import Any
 
 import aiohttp
@@ -103,10 +87,6 @@ _LOGGER = logging.getLogger(__name__)
 _REQUEST_PATCH_MARKER = "_hafs_shared_session_patch"
 _REFRESH_PATCH_MARKER = "_hafs_refresh_validation_patch"
 _API_PATCH_MARKER = "_hafs_unauthorized_retry_patch"
-_WEB_API_HEADER_PATCH_MARKER = "_hafs_mobile_authorization_header_patch"
-_DATA_SOURCE_PATCH_MARKER = "_hafs_mobile_first_data_sources_patch"
-_WEB_PROBE_PATCH_MARKER = "_hafs_web_probe_backoff_patch"
-_CONNECTION_STATE_PATCH_MARKER = "_hafs_connection_state_diagnostics_patch"
 _ROSTER_TOLERANCE_PATCH_MARKER = "_hafs_roster_tolerance_patch"
 _APP_PLATFORM_PATCH_MARKER = "_hafs_app_platform_patch"
 _APP_NAME_PATCH_MARKER = "_hafs_app_display_name_patch"
@@ -119,10 +99,6 @@ _V4_OVERRIDES_ENDPOINT = "hafs_get_override_device_restrictions_v4"
 _OVERRIDES_UNREAD_ATTR = "_hafs_overrides_unread"
 #: Recorded in roster_errors when the overrides answer has no platform list.
 _NO_PLATFORM_LIST = "The device-limits overrides answer has no platform list"
-
-# Back off private account.microsoft.com probes after transport failures. Mobile
-# data continues to refresh normally during the backoff window.
-_WEB_BACKOFF_SECONDS = 30 * 60
 
 #: Fragments of Microsoft's "node not found" answer on the mobile aggregator.
 #: The token is valid; Microsoft simply cannot resolve one family member's
@@ -409,302 +385,6 @@ async def _patched_send_request(
         return result
 
 
-def _patch_combined_client_mobile_header() -> bool:
-    """Normalize the combined client's mobile Authorization header."""
-    try:
-        from .api_client import FamilySafetyWebAPI
-    except (ImportError, AttributeError):
-        return False
-
-    original = FamilySafetyWebAPI._build_headers
-    if getattr(original, _WEB_API_HEADER_PATCH_MARKER, False):
-        return False
-
-    def _patched_build_headers(self) -> dict[str, str]:
-        headers = original(self)
-        current = headers.get("Authorization", "")
-        normalized = authenticator_authorization_header(self._authenticator)
-        headers["Authorization"] = normalized
-        if current != normalized and not getattr(
-            self, "_legacy_mobile_auth_header_logged", False
-        ):
-            _LOGGER.debug(
-                "Normalized legacy pyfamilysafety raw mobile access token to "
-                "MSAuth1.0 Authorization format"
-            )
-            self._legacy_mobile_auth_header_logged = True
-        return headers
-
-    setattr(_patched_build_headers, _WEB_API_HEADER_PATCH_MARKER, True)
-    FamilySafetyWebAPI._build_headers = _patched_build_headers
-    return True
-
-
-def _patch_web_probe_backoff() -> bool:
-    """Back off browser-session probes after transport failures."""
-    try:
-        from .api_client import FamilySafetyWebAPI
-    except (ImportError, AttributeError):
-        return False
-
-    original = FamilySafetyWebAPI.async_check_web_session
-    if getattr(original, _WEB_PROBE_PATCH_MARKER, False):
-        return False
-
-    async def _patched_check_web_session(self) -> bool:
-        now = time.monotonic()
-        backoff_until = float(getattr(self, "_web_probe_backoff_until", 0.0) or 0.0)
-        if backoff_until > now:
-            error = str(getattr(self, "_web_probe_backoff_error", "TIMEOUT"))
-            self.web_session_state = "error"
-            self.last_web_error_code = error
-            _LOGGER.debug(
-                "Skipping Microsoft account web-session probe during transport backoff "
-                "(error=%s remaining=%ds)",
-                error,
-                int(backoff_until - now),
-            )
-            return False
-
-        result = await original(self)
-        if self.web_session_state == "error" and self.last_web_error_code in {
-            "TIMEOUT",
-            "NETWORK_ERROR",
-        }:
-            self._web_probe_backoff_until = time.monotonic() + _WEB_BACKOFF_SECONDS
-            self._web_probe_backoff_error = self.last_web_error_code
-            _LOGGER.debug(
-                "Backing off Microsoft account web-session probes for %d seconds "
-                "after %s",
-                _WEB_BACKOFF_SECONDS,
-                self.last_web_error_code,
-            )
-        elif self.web_session_state == "authenticated":
-            self._web_probe_backoff_until = 0.0
-            self._web_probe_backoff_error = None
-        return result
-
-    setattr(_patched_check_web_session, _WEB_PROBE_PATCH_MARKER, True)
-    FamilySafetyWebAPI.async_check_web_session = _patched_check_web_session
-    return True
-
-
-def _patch_combined_client_data_sources() -> bool:
-    """Prefer authenticated mobile reads and HAR-confirmed policy reads."""
-    try:
-        from .api_client import FamilySafetyWebAPI
-    except (ImportError, AttributeError):
-        return False
-
-    original_web_browsing = FamilySafetyWebAPI.get_web_browsing_settings
-    original_content_settings = FamilySafetyWebAPI.get_content_settings
-    original_screentime_policy = FamilySafetyWebAPI.get_screentime_policy
-    if getattr(original_web_browsing, _DATA_SOURCE_PATCH_MARKER, False):
-        return False
-
-    async def _patched_get_web_browsing_settings(self, child_id: str):
-        self.web_browsing_source = None
-        self.web_browsing_status = "checking"
-        try:
-            # Without exceptions=true the blocked/allowed sites come back as an
-            # empty list (the Family Safety app always asks for them, #64).
-            result = await self._request(
-                "GET", f"/v1/WebRestrictions/{child_id}", params={"exceptions": "true"}
-            )
-        except Exception as err:
-            self.web_browsing_status = "mobile_error"
-            _LOGGER.debug(
-                "Mobile WebRestrictions read failed for child=%s; trying web fallback: %r",
-                child_id,
-                err,
-            )
-        else:
-            if isinstance(result, dict):
-                exceptions = result.get("exceptions")
-                if isinstance(exceptions, list):
-                    sites = [e for e in exceptions if isinstance(e, dict) and e.get("website")]
-                    result.setdefault(
-                        "blockedSites", [e["website"] for e in sites if not e.get("allowed")]
-                    )
-                    result.setdefault(
-                        "allowedSites", [e["website"] for e in sites if e.get("allowed")]
-                    )
-                self.web_browsing_source = "mobile"
-                self.web_browsing_status = "ok"
-                _LOGGER.debug(
-                    "Loaded web browsing restrictions from mobile API for child=%s",
-                    child_id,
-                )
-                return result
-            self.web_browsing_status = "mobile_no_data"
-
-        if not self.has_web_cookies:
-            return None
-
-        try:
-            result = await original_web_browsing(self, child_id)
-        except Exception as err:
-            self.web_browsing_source = "web"
-            self.web_browsing_status = "web_error"
-            _LOGGER.debug("Family web WebRestrictions fallback failed: %r", err)
-            return None
-        self.web_browsing_source = "web"
-        if isinstance(result, dict):
-            self.web_browsing_status = "ok"
-            return result
-        self.web_browsing_status = str(
-            self.last_web_error_code or "web_no_data"
-        ).lower()
-        return None
-
-    async def _patched_get_content_settings(self, child_id: str):
-        self.content_settings_source = "mobile"
-        self.content_settings_status = "checking"
-        try:
-            result = await original_content_settings(self, child_id)
-        except Exception:
-            self.content_settings_status = "error"
-            raise
-        self.content_settings_status = "ok" if isinstance(result, dict) else "no_data"
-        return result
-
-    async def _patched_get_screentime_policy(
-        self, child_id: str, platform: str = "Windows",
-        *, require_child_match: bool = False,
-    ):
-        """Read the Windows policy: mobile API first, Family web /st as fallback."""
-        self.screentime_policy_status = "checking"
-        self.screentime_policy_source = None
-
-        try:
-            policy = await self.get_mobile_screentime_policy(child_id, platform)
-        except Exception as err:  # noqa: BLE001 - fall back to the web path
-            _LOGGER.debug("Mobile screen-time schedule read failed: %r", err)
-            policy = None
-        if policy is not None:
-            self.screentime_policy_status = "ok"
-            self.screentime_policy_source = "mobile_v4"
-            return policy
-
-        now = time.monotonic()
-        backoff_until = float(getattr(self, "_family_web_backoff_until", 0.0) or 0.0)
-        if backoff_until > now:
-            self.screentime_policy_status = "web_api_backoff"
-            self.web_api_state = "backoff"
-            _LOGGER.debug(
-                "Skipping Family web screen-time policy request during backoff "
-                "(remaining=%ds)",
-                int(backoff_until - now),
-            )
-            return None
-
-        st_url = f"{self.WEB_API_BASE}/family/api/st"
-        result = await self._web_request(
-            "GET", st_url, params={"childId": str(child_id)}
-        )
-        policy = self._normalize_screentime_policy(
-            result, child_id, require_child_match=require_child_match
-        )
-        if policy is not None:
-            self.screentime_policy_status = "ok"
-            self.screentime_policy_source = "st_har"
-            self._family_web_backoff_until = 0.0
-            _LOGGER.info(
-                "Loaded screen-time weekday policy from HAR-confirmed Family /st endpoint "
-                "for child=%s",
-                child_id,
-            )
-            return policy
-
-        st_error = self.last_web_error_code
-        if st_error == "LOGIN_REDIRECT":
-            self.screentime_policy_status = "session_expired"
-            return None
-        if st_error in {"TIMEOUT", "NETWORK_ERROR"}:
-            self.screentime_policy_status = (
-                "web_api_timeout" if st_error == "TIMEOUT" else "web_api_network_error"
-            )
-            self._family_web_backoff_until = time.monotonic() + _WEB_BACKOFF_SECONDS
-            _LOGGER.debug(
-                "Backing off Family web policy requests for %d seconds after %s on /st",
-                _WEB_BACKOFF_SECONDS,
-                st_error,
-            )
-            return None
-
-        policy = await original_screentime_policy(
-            self, child_id, platform, require_child_match=require_child_match
-        )
-        if policy is not None:
-            self._family_web_backoff_until = 0.0
-            return policy
-
-        if self.last_web_error_code in {"TIMEOUT", "NETWORK_ERROR"}:
-            self._family_web_backoff_until = time.monotonic() + _WEB_BACKOFF_SECONDS
-            _LOGGER.debug(
-                "Backing off Family web policy requests for %d seconds after %s",
-                _WEB_BACKOFF_SECONDS,
-                self.last_web_error_code,
-            )
-        return None
-
-    setattr(_patched_get_web_browsing_settings, _DATA_SOURCE_PATCH_MARKER, True)
-    FamilySafetyWebAPI.get_web_browsing_settings = _patched_get_web_browsing_settings
-    FamilySafetyWebAPI.get_content_settings = _patched_get_content_settings
-    FamilySafetyWebAPI.get_screentime_policy = _patched_get_screentime_policy
-    return True
-
-
-def _patch_connection_state_diagnostics() -> bool:
-    """Expose per-dataset sources and do not recommend reauth for timeouts."""
-    try:
-        from .coordinator import FamilySafetyDataUpdateCoordinator
-    except (ImportError, AttributeError):
-        return False
-
-    original = FamilySafetyDataUpdateCoordinator.connection_state
-    if getattr(original, _CONNECTION_STATE_PATCH_MARKER, False):
-        return False
-
-    def _patched_connection_state(self) -> dict[str, Any]:
-        state = original(self)
-        web_error = state.get("web_last_error_code")
-        if web_error in {"TIMEOUT", "NETWORK_ERROR"} and not state.get(
-            "reauth_required"
-        ):
-            state["reauth_recommended"] = False
-
-        api = getattr(self, "web_api", None)
-        state.update(
-            {
-                "web_browsing_source": getattr(api, "web_browsing_source", None),
-                "web_browsing_status": getattr(api, "web_browsing_status", "unknown"),
-                "content_settings_source": getattr(api, "content_settings_source", None),
-                "content_settings_status": getattr(api, "content_settings_status", "unknown"),
-                "screentime_policy_source": getattr(
-                    api, "screentime_policy_source", None
-                ),
-                "screentime_policy_endpoint": "/family/api/st",
-                "web_transport": getattr(api, "_hafs_web_transport", "default"),
-                "web_probe_backoff_active": bool(
-                    api
-                    and float(getattr(api, "_web_probe_backoff_until", 0.0) or 0.0)
-                    > time.monotonic()
-                ),
-                "family_web_backoff_active": bool(
-                    api
-                    and float(getattr(api, "_family_web_backoff_until", 0.0) or 0.0)
-                    > time.monotonic()
-                ),
-            }
-        )
-        return state
-
-    setattr(_patched_connection_state, _CONNECTION_STATE_PATCH_MARKER, True)
-    FamilySafetyDataUpdateCoordinator.connection_state = _patched_connection_state
-    return True
-
-
 def _patch_app_platform() -> bool:
     """Send a Plat-Info header for classic desktop apps (``win32:`` ids).
 
@@ -930,19 +610,6 @@ def apply_patches(hass: HomeAssistant) -> None:
         setattr(_patched_send_request, _API_PATCH_MARKER, True)
         FamilySafetyAPI.send_request = _patched_send_request
         applied.append("single Unauthorized refresh retry")
-
-    if _patch_combined_client_mobile_header():
-        applied.append("legacy mobile Authorization header normalization")
-
-
-    if _patch_web_probe_backoff():
-        applied.append("web transport backoff")
-
-    if _patch_combined_client_data_sources():
-        applied.append("mobile-first + HAR screen-time data sources")
-
-    if _patch_connection_state_diagnostics():
-        applied.append("connection source diagnostics")
 
     if _patch_app_platform():
         applied.append("Plat-Info for win32 desktop apps")
