@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import asyncio
+import copy
 import functools
 import hashlib
 import json
@@ -2581,7 +2582,9 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         unrecoverably (issue #23).
         """
         key = self._policy_key(account_id)
-        current_policy = await self._fetch_screentime_policy(account_id)
+        current_policy = self._with_weekly_values(
+            account_id, await self._fetch_screentime_policy(account_id)
+        )
         # A restore point is only worth something if `_saved_week` can read
         # it back; otherwise the unlock would refuse and the child stay at 0.
         saved_ok = self._saved_week(self._saved_screentime.get(key) or {}) is not None
@@ -2615,6 +2618,43 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "schedule could not be read, so the restore point may be stale",
                 operation.capitalize(), account_id,
             )
+
+    def _with_weekly_values(
+        self, account_id: str, policy: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """``policy`` with today-only changes replaced by their weekly values."""
+        weekly = self.today_only.weekly_values(account_id, "Windows")
+        if not weekly or not isinstance(policy, dict):
+            return policy
+        policy = copy.deepcopy(policy)
+        daily = policy.get("dailyRestrictions") or policy.get("DailyRestrictions")
+        if not isinstance(daily, dict):
+            return policy
+        for day, fields in weekly.items():
+            day_key = DAY_KEYS[day]
+            day_data = daily.get(day_key) or daily.get(day_key.capitalize())
+            if not isinstance(day_data, dict):
+                continue
+            if FIELD_LIMIT in fields:
+                hours, minutes = divmod(int(fields[FIELD_LIMIT]), 60)
+                name = "Allowance" if "Allowance" in day_data and "allowance" not in day_data else "allowance"
+                day_data[name] = f"{hours:02d}:{minutes:02d}:00"
+            if FIELD_ALLOWED_HOURS in fields:
+                # `_policy_intervals_to_slots` reads the timeline first.
+                day_data["timeline"] = [bool(slot) for slot in fields[FIELD_ALLOWED_HOURS]]
+        return policy
+
+    async def _reapply_today_only(self, account_id: str) -> None:
+        """After a restore, write today's one-day values back over the weekly ones."""
+        for day, fields in self.today_only.today_values(account_id, "Windows").items():
+            for field, value in fields.items():
+                try:
+                    await self.async_write_day(account_id, "Windows", day, field, value)
+                except Exception as err:  # noqa: BLE001 - the weekly value is safe
+                    _LOGGER.warning(
+                        "Unlocked account %s but could not write today's %s back: %s",
+                        account_id, field, err,
+                    )
 
     async def _write_week(
         self,
@@ -2677,7 +2717,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         Microsoft exposes no real "lock" endpoint, so a lock is a destructive
         rewrite of the whole weekly schedule; see `_save_restore_point`.
         """
-        async with self._account_lock(account_id):
+        async with self._account_lock(account_id), self.today_only.lock(account_id, "Windows"):
             await self._save_restore_point(account_id, "lock")
             await self._write_week(account_id, [(0, 0, [False] * 48)] * 7, "account lock")
             await self._set_schedule_flag(account_id, True)
@@ -2718,7 +2758,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         limits switch ("re-enable screen time limits for"), and telling a
         user they cannot "unlock" a toggle they never locked is confusing.
         """
-        async with self._account_lock(account_id):
+        async with self._account_lock(account_id), self.today_only.lock(account_id, "Windows"):
             await self._restore_saved(account_id, operation)
         await self.async_request_refresh()
 
@@ -2746,6 +2786,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._saved_screentime.pop(key, None)
         self._released_screentime.add(key)
         await self._async_save_screentime()
+        await self._reapply_today_only(account_id)
         if enabled is None:
             enabled = saved.get("isEnabled") is not False
         await self._set_schedule_flag(account_id, enabled)
@@ -2778,7 +2819,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # keeps every day as it is. The 24 h rewrite below is the fallback when
         # Microsoft refuses the flag, and a restore point it left behind is
         # still restored on enable.
-        async with self._account_lock(account_id):
+        async with self._account_lock(account_id), self.today_only.lock(account_id, "Windows"):
             mobile_ok = False
             if self.web_api is not None:
                 try:

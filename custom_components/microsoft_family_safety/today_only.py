@@ -201,6 +201,37 @@ class TodayOnlyChanges:
             result[record["platform"]] = entry
         return result
 
+    def weekly_values(self, child_id: Any, platform: str) -> dict[int, dict[str, Any]]:
+        """The weekly values pending changes put back, by weekday.
+
+        An account lock saves the schedule as its restore point: a day changed
+        for today only must go in with its weekly value, or the unlock would
+        write the one-day value back as the permanent one.
+        """
+        child = str(child_id)
+        values: dict[int, dict[str, Any]] = {}
+        for record in sorted(self._records.values(), key=lambda r: str(r.get("date"))):
+            if record.get("child_id") != child or record.get("platform") != platform:
+                continue
+            day = values.setdefault(int(record["day_of_week"]), {})
+            for field, held in record["fields"].items():
+                # The oldest record holds the value from before every change.
+                day.setdefault(field, held["saved"])
+        return {day: fields for day, fields in values.items() if fields}
+
+    def today_values(self, child_id: Any, platform: str) -> dict[int, dict[str, Any]]:
+        """Today's pending changes as {weekday: {field: value set for today}}."""
+        child = str(child_id)
+        today = dt_util.now().date().isoformat()
+        record = self._records.get(self._key(child, platform, date.fromisoformat(today)))
+        if not record or not record["fields"]:
+            return {}
+        return {
+            int(record["day_of_week"]): {
+                field: held["set"] for field, held in record["fields"].items()
+            }
+        }
+
     # --- changes ------------------------------------------------------------
     async def async_apply(
         self,
