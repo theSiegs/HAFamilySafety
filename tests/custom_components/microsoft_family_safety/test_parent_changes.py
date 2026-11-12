@@ -185,3 +185,45 @@ async def test_entities_are_told_once_the_hold_is_saved(rig):
         assert seen and seen[-1][1] is False
     finally:
         unsub()
+
+
+async def test_unread_windows_locks_are_unknown_not_a_parent_unlock(rig):
+    """No overrides document read yet: who decides and what is in force are unknown.
+
+    "parent" with override "none" would read as a parent's unlock in the
+    Family Safety app; the stand-in [] says nothing of the kind.
+    """
+    from custom_components.microsoft_family_safety import _pyfamilysafety_compat as compat
+    from custom_components.microsoft_family_safety.binary_sensor import (
+        FamilySafetyAllowedNowSensor,
+    )
+
+    coord, entry, _ = rig
+    account = coord.data["accounts"][CHILD]
+    account["lock_state_known"] = False
+    unknown = {"hold": None, "override": None, "override_until": None, "allow_until": None}
+    for platform in ("Windows", "Mobile"):
+        assert coord.platform_hold_state(CHILD, platform) == unknown
+        lock = switch.FamilySafetyPlatformLockSwitch(coord, entry, CHILD, "Alex", platform)
+        assert lock.is_on is None
+        attrs = lock.extra_state_attributes
+        assert (attrs["blocked"], attrs["hold"], attrs["override"]) == (None, None, None)
+    allowed = FamilySafetyAllowedNowSensor(coord, entry, CHILD, "Windows").extra_state_attributes
+    assert (allowed["hold"], allowed["override"]) == (None, None)
+
+    # A hold of ours whose lock cannot be read stays ours, as for the Xbox.
+    setattr(coord._accounts[CHILD], compat._OVERRIDES_UNREAD_ATTR, True)
+    await coord.async_lock_platform(CHILD, "Windows", _hours(2))
+    # The write's answer is a document: the locks are known from then on.
+    assert account["lock_state_known"] is True
+    assert coord.platform_hold_state(CHILD, "Windows")["hold"] == "ours"
+    account["lock_state_known"] = False
+    state = coord.platform_hold_state(CHILD, "Windows")
+    assert (state["hold"], state["override"]) == ("ours", None)
+
+    # Read and nothing in force, no hold: "none" as before.
+    await coord.async_unlock_platform(CHILD, "Windows")
+    account["lock_state_known"] = True
+    account["blocked_platforms"] = []
+    state = coord.platform_hold_state(CHILD, "Mobile")
+    assert (state["hold"], state["override"]) == ("none", "none")
