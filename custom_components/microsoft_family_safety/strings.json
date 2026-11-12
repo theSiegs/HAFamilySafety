@@ -271,7 +271,7 @@
         },
         "day_of_week": {
           "name": "Day of Week",
-          "description": "Day of week (0=Sunday, 1=Monday, ..., 6=Saturday)."
+          "description": "Day of week (0=Sunday, 1=Monday, ..., 6=Saturday). Required unless today_only is set."
         },
         "hours": {
           "name": "Hours",
@@ -284,6 +284,10 @@
         "platform": {
           "name": "Platform",
           "description": "Windows (default) or Xbox. Xbox writes the limit the console enforces, through the Xbox Family Settings service: Xbox must be among the monitored platforms with the Xbox Family Settings sign-in linked."
+        },
+        "today_only": {
+          "name": "Today only",
+          "description": "Change today only. The previous value is put back at local midnight, unless it was changed again in the meantime. day_of_week can be left out."
         }
       }
     },
@@ -301,7 +305,7 @@
         },
         "day_of_week": {
           "name": "Day of Week",
-          "description": "Day of week (0=Sunday, 1=Monday, ..., 6=Saturday)."
+          "description": "Day of week (0=Sunday, 1=Monday, ..., 6=Saturday). Required unless today_only is set."
         },
         "start_hour": {
           "name": "Start Hour",
@@ -322,6 +326,10 @@
         "platform": {
           "name": "Platform",
           "description": "Windows (default) or Xbox. Xbox sets the allowed hours the console enforces, through the Xbox Family Settings service, and keeps the day's limit: Xbox must be among the monitored platforms with the Xbox Family Settings sign-in linked."
+        },
+        "today_only": {
+          "name": "Today only",
+          "description": "Change today only. The previous value is put back at local midnight, unless it was changed again in the meantime. day_of_week can be left out."
         }
       }
     },
@@ -572,6 +580,20 @@
         "apps": {
           "name": "Apps",
           "description": "App IDs to resume; leave empty for every paused app of the child."
+        }
+      }
+    },
+    "restore_today_only": {
+      "name": "Restore Today-Only Changes",
+      "description": "Put back now the values replaced by today-only screen time changes, instead of at midnight. Values changed again in the meantime are kept.",
+      "fields": {
+        "account_id": {
+          "name": "Account ID",
+          "description": "The user ID of the child account."
+        },
+        "platform": {
+          "name": "Platform",
+          "description": "Only this schedule. Omitted = every platform."
         }
       }
     }

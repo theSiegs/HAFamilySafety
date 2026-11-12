@@ -271,7 +271,7 @@
         },
         "day_of_week": {
           "name": "Jour de la semaine",
-          "description": "Jour de la semaine (0 = dimanche, 1 = lundi, ..., 6 = samedi)."
+          "description": "Jour de la semaine (0 = dimanche, 1 = lundi, ..., 6 = samedi). Obligatoire sauf avec today_only."
         },
         "hours": {
           "name": "Heures",
@@ -284,6 +284,10 @@
         "platform": {
           "name": "Plateforme",
           "description": "Windows (par défaut) ou Xbox. Xbox écrit la limite appliquée par la console, via le service Xbox Family Settings : la Xbox doit faire partie des plateformes surveillées et la connexion Xbox Family Settings doit être liée."
+        },
+        "today_only": {
+          "name": "Aujourd'hui seulement",
+          "description": "Modifie uniquement aujourd'hui. La valeur précédente est rétablie à minuit (heure locale), sauf si elle a été modifiée entre-temps. day_of_week peut alors être omis."
         }
       }
     },
@@ -301,7 +305,7 @@
         },
         "day_of_week": {
           "name": "Jour de la semaine",
-          "description": "Jour de la semaine (0 = dimanche, 1 = lundi, ..., 6 = samedi)."
+          "description": "Jour de la semaine (0 = dimanche, 1 = lundi, ..., 6 = samedi). Obligatoire sauf avec today_only."
         },
         "start_hour": {
           "name": "Heure de début",
@@ -322,6 +326,10 @@
         "platform": {
           "name": "Plateforme",
           "description": "Windows (par défaut) ou Xbox. Xbox définit les heures autorisées appliquées par la console, via le service Xbox Family Settings, et conserve la limite du jour : la Xbox doit faire partie des plateformes surveillées et la connexion Xbox Family Settings doit être liée."
+        },
+        "today_only": {
+          "name": "Aujourd'hui seulement",
+          "description": "Modifie uniquement aujourd'hui. La valeur précédente est rétablie à minuit (heure locale), sauf si elle a été modifiée entre-temps. day_of_week peut alors être omis."
         }
       }
     },
@@ -572,6 +580,20 @@
         "apps": {
           "name": "Applications",
           "description": "Identifiants des applications à reprendre ; laisser vide pour toutes les applications en pause de l'enfant."
+        }
+      }
+    },
+    "restore_today_only": {
+      "name": "Annuler les changements du jour",
+      "description": "Rétablit maintenant, plutôt qu'à minuit, les valeurs remplacées par des changements « aujourd'hui seulement ». Les valeurs modifiées entre-temps sont conservées.",
+      "fields": {
+        "account_id": {
+          "name": "ID du compte",
+          "description": "L'identifiant utilisateur du compte enfant."
+        },
+        "platform": {
+          "name": "Plateforme",
+          "description": "Uniquement ce planning. Vide = toutes les plateformes."
         }
       }
     }

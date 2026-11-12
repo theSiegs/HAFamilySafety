@@ -271,7 +271,7 @@
         },
         "day_of_week": {
           "name": "Wochentag",
-          "description": "Wochentag (0=Sonntag, 1=Montag, ..., 6=Samstag)."
+          "description": "Wochentag (0=Sonntag, 1=Montag, ..., 6=Samstag). Pflicht, außer bei today_only."
         },
         "hours": {
           "name": "Stunden",
@@ -284,6 +284,10 @@
         "platform": {
           "name": "Plattform",
           "description": "Windows (Standard) oder Xbox. Xbox setzt das Limit, das die Konsole durchsetzt, über den Dienst „Xbox Family Settings“: Xbox muss unter den überwachten Plattformen ausgewählt und die Anmeldung für Xbox Family Settings verknüpft sein."
+        },
+        "today_only": {
+          "name": "Nur heute",
+          "description": "Nur für heute ändern. Der vorherige Wert wird um Mitternacht (Ortszeit) wiederhergestellt, sofern er nicht zwischenzeitlich erneut geändert wurde. day_of_week kann dann entfallen."
         }
       }
     },
@@ -301,7 +305,7 @@
         },
         "day_of_week": {
           "name": "Wochentag",
-          "description": "Wochentag (0=Sonntag, 1=Montag, ..., 6=Samstag)."
+          "description": "Wochentag (0=Sonntag, 1=Montag, ..., 6=Samstag). Pflicht, außer bei today_only."
         },
         "start_hour": {
           "name": "Startstunde",
@@ -322,6 +326,10 @@
         "platform": {
           "name": "Plattform",
           "description": "Windows (Standard) oder Xbox. Xbox setzt die erlaubten Zeiten, die die Konsole durchsetzt, über den Dienst „Xbox Family Settings“ und behält das Tageslimit bei: Xbox muss unter den überwachten Plattformen ausgewählt und die Anmeldung für Xbox Family Settings verknüpft sein."
+        },
+        "today_only": {
+          "name": "Nur heute",
+          "description": "Nur für heute ändern. Der vorherige Wert wird um Mitternacht (Ortszeit) wiederhergestellt, sofern er nicht zwischenzeitlich erneut geändert wurde. day_of_week kann dann entfallen."
         }
       }
     },
@@ -572,6 +580,20 @@
         "apps": {
           "name": "Apps",
           "description": "Fortzusetzende App-IDs; leer lassen für alle pausierten Apps des Kindes."
+        }
+      }
+    },
+    "restore_today_only": {
+      "name": "Änderungen für heute zurücksetzen",
+      "description": "Die durch Nur-heute-Änderungen ersetzten Werte jetzt statt um Mitternacht wiederherstellen. Zwischenzeitlich erneut geänderte Werte bleiben erhalten.",
+      "fields": {
+        "account_id": {
+          "name": "Konto-ID",
+          "description": "Die Benutzer-ID des Kinderkontos."
+        },
+        "platform": {
+          "name": "Plattform",
+          "description": "Nur dieser Zeitplan. Leer = alle Plattformen."
         }
       }
     }
