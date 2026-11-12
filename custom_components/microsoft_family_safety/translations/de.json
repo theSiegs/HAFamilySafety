@@ -447,7 +447,7 @@
         },
         "website": {
           "name": "Website",
-          "description": "Die zu sperrende Domain oder eine Liste von Domains. Jede Website wird versucht; schlägt eine fehl, schlägt der Aufruf fehl und nennt die erledigten und die fehlgeschlagenen Websites."
+          "description": "Die zu sperrende Domain oder eine Liste von Domains. Jede Website wird versucht; schlägt eine fehl, schlägt der Aufruf fehl und nennt die erledigten und die fehlgeschlagenen Websites. Mit Antwort angefordert, nennt er die erledigten Websites."
         }
       }
     },
@@ -465,7 +465,7 @@
         },
         "website": {
           "name": "Website",
-          "description": "Die zu entfernende Domain oder eine Liste von Domains. Jede Website wird versucht; schlägt eine fehl, schlägt der Aufruf fehl und nennt die erledigten und die fehlgeschlagenen Websites."
+          "description": "Die zu entfernende Domain oder eine Liste von Domains. Jede Website wird versucht; schlägt eine fehl, schlägt der Aufruf fehl und nennt die erledigten und die fehlgeschlagenen Websites. Mit Antwort angefordert, nennt er die erledigten Websites."
         }
       }
     },
@@ -569,7 +569,7 @@
         },
         "website": {
           "name": "Website",
-          "description": "Die zu erlaubende Domain oder eine Liste von Domains. Jede Website wird versucht; schlägt eine fehl, schlägt der Aufruf fehl und nennt die erledigten und die fehlgeschlagenen Websites."
+          "description": "Die zu erlaubende Domain oder eine Liste von Domains. Jede Website wird versucht; schlägt eine fehl, schlägt der Aufruf fehl und nennt die erledigten und die fehlgeschlagenen Websites. Mit Antwort angefordert, nennt er die erledigten Websites."
         }
       }
     },

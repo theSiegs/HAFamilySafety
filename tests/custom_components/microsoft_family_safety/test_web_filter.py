@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 
 from custom_components.microsoft_family_safety import _register_services, sensor, switch
 from custom_components.microsoft_family_safety.api_client import (
@@ -140,6 +140,55 @@ async def test_website_services_take_several_sites(hass, rig):
         ("allow", CHILD, "d.example"),
         ("remove", CHILD, "c.example"),
     ]
+
+
+async def test_the_same_site_spelled_twice_is_sent_once(hass, rig):
+    coord, _ = rig
+    _register_services(hass)
+    await hass.services.async_call(
+        DOMAIN, "block_website",
+        {"account_id": CHILD, "website": [
+            "a.example", "https://a.example", " A.EXAMPLE ", "HTTPS://A.Example",
+            "http://a.example", "b.example",
+        ]},
+        blocking=True,
+    )
+    # Stored the same (https:// added, any case): only the first spelling goes.
+    # http:// is stored as given, so it is a site of its own.
+    assert coord.web_api.calls == [
+        ("block", CHILD, "a.example"),
+        ("block", CHILD, "http://a.example"),
+        ("block", CHILD, "b.example"),
+    ]
+
+
+@pytest.mark.parametrize("website", [[""], "  ", ["", "   "]])
+async def test_no_site_left_is_refused(hass, rig, website):
+    coord, _ = rig
+    _register_services(hass)
+    with pytest.raises(ServiceValidationError, match="at least one website"):
+        await hass.services.async_call(
+            DOMAIN, "allow_website", {"account_id": CHILD, "website": website},
+            blocking=True,
+        )
+    assert coord.web_api.calls == []
+    coord.async_request_refresh.assert_not_awaited()
+
+
+@pytest.mark.parametrize("service", ["block_website", "allow_website", "remove_website"])
+async def test_website_services_answer_the_sites_done(hass, rig, service):
+    coord, _ = rig
+    _register_services(hass)
+    answer = await hass.services.async_call(
+        DOMAIN, service,
+        {"account_id": CHILD, "website": ["a.example", "b.example", "a.example"]},
+        blocking=True, return_response=True,
+    )
+    assert answer == {"done": ["a.example", "b.example"], "failed": []}
+    # A response is optional: the call works without asking for one.
+    assert await hass.services.async_call(
+        DOMAIN, service, {"account_id": CHILD, "website": "c.example"}, blocking=True,
+    ) is None
 
 
 async def test_a_failed_site_does_not_stop_the_others_and_is_named(hass, rig):

@@ -230,7 +230,8 @@ SERVICE_GET_SITES_SCHEMA = child_schema({})
 #: Services that answer (response_variable): lock_platform / unlock_platform
 #: with ``{"prior", "applied"}``, the extra time actions with what they gave
 #: or cancelled, sync_site_list with what it did, get_sites with what it read,
-#: pause_app / resume_app with what they did per app.
+#: pause_app / resume_app with what they did per app, block_website /
+#: allow_website / remove_website with ``{"done", "failed"}``.
 _RESPONSE_SERVICES = {
     SERVICE_LOCK_PLATFORM: SupportsResponse.OPTIONAL,
     SERVICE_UNLOCK_PLATFORM: SupportsResponse.OPTIONAL,
@@ -240,6 +241,9 @@ _RESPONSE_SERVICES = {
     SERVICE_GET_SITES: SupportsResponse.ONLY,
     SERVICE_PAUSE_APP: SupportsResponse.OPTIONAL,
     SERVICE_RESUME_APP: SupportsResponse.OPTIONAL,
+    SERVICE_BLOCK_WEBSITE: SupportsResponse.OPTIONAL,
+    SERVICE_ALLOW_WEBSITE: SupportsResponse.OPTIONAL,
+    SERVICE_REMOVE_WEBSITE: SupportsResponse.OPTIONAL,
 }
 #: Services for administrators only, whatever the allowed-users option says:
 #: sync_site_list downloads a URL from inside Home Assistant, and get_sites
