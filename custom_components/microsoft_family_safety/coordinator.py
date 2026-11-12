@@ -20,7 +20,7 @@ from pyfamilysafety.device import Device
 from pyfamilysafety.exceptions import HttpException
 
 from homeassistant.components import persistent_notification
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
@@ -3760,6 +3760,22 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._create_auth_notification()
         self._request_reauth("manual")
 
+    def _async_withdraw_unneeded_reauth(self) -> None:
+        """After a good poll, forget a reauth request nobody is answering any more.
+
+        No poll asks for a reauthentication while the mobile token works; only
+        the ``request_reauth`` service raises the flag and the notification
+        then. Once that flow is gone (aborted or ignored) and the mobile token
+        still works, both are cleared; while it is open, they stay.
+        """
+        if not self._reauth_requested:
+            return
+        if any(self.entry.async_get_active_flows(self.hass, {SOURCE_REAUTH})):
+            return
+        self._reauth_requested = False
+        self._reauth_reason = None
+        self._dismiss_auth_notification()
+
     def _transform_account_data(self, account: Account) -> tuple[str, dict[str, Any]]:
         account_id = account.user_id
         today = dt_util.now().date().isoformat()
@@ -3908,6 +3924,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # A reauthentication reloads the entry: the notification it
                 # answered was raised by the previous coordinator.
                 self._dismiss_auth_notification()
+            self._async_withdraw_unneeded_reauth()
             self._accounts = new_accounts
             try:
                 await self._async_prune_platform_holds()
