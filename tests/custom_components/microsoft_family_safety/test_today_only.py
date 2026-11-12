@@ -546,3 +546,78 @@ async def test_normal_service_call_unchanged(hass, services, schedules):
     )
     services._set_screentime_allowance.assert_awaited_once_with(CHILD, 1, 2, 30)
     assert services.today_only.pending(CHILD) == {}
+
+
+def _policy_from(schedules: FakeSchedules) -> dict:
+    """The Windows week as the mobile schedule read returns it."""
+    from custom_components.microsoft_family_safety.const import DAY_KEYS
+
+    daily = {}
+    for day, key in enumerate(DAY_KEYS):
+        values = schedules.days[("Windows", day)]
+        hours, minutes = divmod(values[FIELD_LIMIT], 60)
+        daily[key] = {
+            "allowance": f"{hours:02d}:{minutes:02d}:00",
+            "timeline": list(values[FIELD_ALLOWED_HOURS]),
+        }
+    return {"isEnabled": True, "dailyRestrictions": daily}
+
+
+@pytest.fixture
+def lockable(coordinator, schedules):
+    async def fetch(_account_id):
+        return _policy_from(schedules)
+
+    coordinator._fetch_screentime_policy = fetch
+    return coordinator
+
+
+async def test_lock_keeps_the_weekly_value_of_a_today_only_change(
+    hass, lockable, schedules, freezer
+):
+    coordinator = lockable
+    await coordinator.async_set_screentime_limit(CHILD, None, 3, 0, "Windows", True)
+    await coordinator.async_set_screentime_intervals(
+        CHILD, WEDNESDAY, 7, 0, 23, 0, "Windows", True
+    )
+
+    await coordinator.async_lock_account(CHILD)
+    assert schedules.days[("Windows", WEDNESDAY)][FIELD_LIMIT] == 0
+    saved = coordinator._saved_week(coordinator._saved_screentime[coordinator._policy_key(CHILD)])
+    # The restore point holds the weekly Wednesday, not today's one-day values.
+    assert saved[WEDNESDAY] == (2, 0, DAY_SLOTS)
+
+    # Unlocked the same day: the week comes back and today's change with it.
+    await coordinator.async_unlock_account(CHILD)
+    assert schedules.days[("Windows", WEDNESDAY)][FIELD_LIMIT] == 180
+    assert schedules.days[("Windows", WEDNESDAY)][FIELD_ALLOWED_HOURS] == LONG_SLOTS
+    assert schedules.days[("Windows", THURSDAY)][FIELD_LIMIT] == 120
+
+    # And midnight still puts the weekly value back.
+    await _midnight(hass, freezer)
+    assert schedules.days[("Windows", WEDNESDAY)][FIELD_LIMIT] == 120
+    assert schedules.days[("Windows", WEDNESDAY)][FIELD_ALLOWED_HOURS] == DAY_SLOTS
+    assert coordinator.today_only.pending(CHILD) == {}
+
+
+async def test_unlock_after_midnight_writes_the_weekly_value(
+    hass, lockable, schedules, freezer
+):
+    coordinator = lockable
+    await coordinator.async_set_screentime_limit(CHILD, None, 3, 0, "Windows", True)
+    await coordinator.async_lock_account(CHILD)
+
+    # Midnight while locked: the day reads 0, the record is dropped.
+    await _midnight(hass, freezer)
+    assert coordinator.today_only.pending(CHILD) == {}
+
+    await coordinator.async_unlock_account(CHILD)
+    assert schedules.days[("Windows", WEDNESDAY)][FIELD_LIMIT] == 120
+
+
+async def test_lock_without_today_only_change_saves_the_schedule_as_is(lockable, schedules):
+    coordinator = lockable
+    schedules.days[("Windows", WEDNESDAY)][FIELD_LIMIT] = 90
+    await coordinator.async_lock_account(CHILD)
+    await coordinator.async_unlock_account(CHILD)
+    assert schedules.days[("Windows", WEDNESDAY)][FIELD_LIMIT] == 90
