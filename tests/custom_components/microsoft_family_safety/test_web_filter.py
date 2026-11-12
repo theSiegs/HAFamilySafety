@@ -239,6 +239,9 @@ async def test_get_sites_answers_the_lists_as_stored(hass, rig):
         "blocked": ["https://www.example.com/"],
         "allowed": ["https://school.example.org"],
         "filter_enabled": True,
+        # Fork: the domains a sync_site_list added (none here).
+        "from_list": [],
+        "from_list_by_url": {},
     }
     # The web route's shape is read as well.
     coord.web_api.restrictions = {

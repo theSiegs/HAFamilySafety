@@ -561,7 +561,7 @@
     },
     "get_sites": {
       "name": "Obtenir les sites",
-      "description": "Renvoie les sites web bloqués et autorisés de l'enfant tels que Microsoft les enregistre (URL absolues), et si le filtre web est activé. À appeler avec une variable de réponse.",
+      "description": "Renvoie les sites bloqués et autorisés de l'enfant exactement tels que Microsoft les enregistre (URL absolues), indique si le filtrage web est actif et quels domaines bloqués ont été ajoutés par sync_site_list (from_list, et par liste dans from_list_by_url). Réservé aux administrateurs.",
       "fields": {
         "account_id": {
           "name": "ID du compte",
@@ -612,6 +612,32 @@
         "platform": {
           "name": "Plateforme",
           "description": "Uniquement ce planning. Vide = toutes les plateformes."
+        }
+      }
+    },
+    "sync_site_list": {
+      "name": "Synchroniser une liste de sites",
+      "description": "Maintient les sites bloqués de l'enfant en phase avec une liste de domaines publiée (un par ligne, commentaires avec « # »). Ajoute ce que la liste a gagné et ne retire que ce que cette même liste avait ajouté puis a supprimé depuis ; les sites bloqués à la main et les sites autorisés ne sont pas touchés, et un domaine qui recoupe un site autorisé est ignoré. La liste doit être servie en https (les redirections ne sont pas suivies), est lue jusqu'à 1 Mio, et seuls les domaines simples sont retenus. Un téléchargement vide ou en échec, ou qui retirerait l'essentiel de ce que la liste a ajouté, ne change rien ; « Arrêter » retire tout ce que la liste a ajouté. Répond avec ce qui a été ajouté, retiré, conservé et ignoré. Réservé aux administrateurs.",
+      "fields": {
+        "account_id": {
+          "name": "ID du compte",
+          "description": "L'identifiant utilisateur du compte enfant. Indiquez-le ou une entité de l'enfant."
+        },
+        "entity_id": {
+          "name": "Entité de l'enfant",
+          "description": "N'importe quelle entité Microsoft Family Safety de l'enfant (ou de l'un de ses appareils), à la place de l'identifiant du compte."
+        },
+        "url": {
+          "name": "URL de la liste",
+          "description": "Adresse https:// de la liste, par exemple un fichier brut sur GitHub."
+        },
+        "max_domains": {
+          "name": "Nombre maximal de domaines",
+          "description": "Refuse une liste comptant plus de domaines que ce nombre (2000 par défaut)."
+        },
+        "stop": {
+          "name": "Arrêter",
+          "description": "Retire tous les sites que cette liste a ajoutés pour l'enfant et oublie la liste."
         }
       }
     }

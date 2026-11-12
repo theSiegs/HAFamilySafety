@@ -124,7 +124,7 @@ Service call / entity write
 | **Screen time policies** | Adjust daily allowances and allowed time intervals per day — directly from the UI |
 | **Today-only changes** | Give more (or less) time or other allowed hours for today only; the weekly values come back at midnight |
 | **App management** | Block/unblock apps, set per-app time limits and windows, pause apps and resume them with their limits intact |
-| **Web filtering** | Block/unblock domains (one or several per call), read the blocked and allowed lists, toggle content filtering (action or switch), set PEGI age ratings |
+| **Web filtering** | Block/unblock domains (one or several per call), read the blocked and allowed lists, keep a published blocklist in sync, toggle content filtering (action or switch), set PEGI age ratings |
 | **Purchase controls** | Enable/disable ask-to-buy via service call |
 | **Request handling** | Approve or deny pending screen time requests from HA |
 | **Connection diagnostics** | A dedicated sensor reports whether the mobile API and the Xbox Family Settings sign-in are healthy |
@@ -270,7 +270,7 @@ A typical single-child setup with a full app list lands around 85-90 entities.
 | App Usage | `sensor.{prefix}_{app}_usage` | Minutes the app was used today | `app_id`, `app_name`, `platform`, `blocked`. Opt-in: only with **App usage sensors per child** above 0, for each child's most used apps today, up to that number. An app keeps its sensor once it has one |
 | Balance | `sensor.{prefix}_balance` | Account balance | *(monetary sensor, only if available)* |
 | Pending Requests | `sensor.{prefix}_pending_requests` | Request count | `requests` |
-| Web Filter | `sensor.{prefix}_web_filter` | enabled / disabled / unknown | `blockedSites`, `allowedSites`, `contentRatingAge`, `content_settings`, `max_age_rating`, `acquisition_policy` |
+| Web Filter | `sensor.{prefix}_web_filter` | enabled / disabled / unknown | `blockedSites`, `allowedSites`, `blocked_site_count`, `allowed_site_count`, `contentRatingAge`, `content_settings`, `max_age_rating`, `acquisition_policy` |
 | Websites Visited | `sensor.{prefix}_websites_visited` | Visits in Edge over the last 7 days | `report_available`, `site_count`, `blocked_count`, `sites` (50 most visited: `domain`, `visits`, `last_visit`, `blocked`), `searches` (50 latest search terms, one row per term: `search`, `visits`, `date`, `site`; times in UTC with an offset). Read every 30 min; `report_available: false` when Microsoft has no Edge data for the child. `sites` and `searches` are not stored in the history database |
 | Screen Time Policy | `sensor.{prefix}_screen_time_policy` | enabled / disabled / unknown | `monday_allowance` … `sunday_allowance`, `*_allowed_intervals`, `daily_restrictions`; with the Xbox Family Settings sign-in linked, also `xbox_monday_allowed_intervals` … `xbox_sunday_allowed_intervals` (the Xbox allowed hours, e.g. `[{begin: "07:00", end: "22:00"}]`), `today_only` (pending today-only changes, see [Today only](#today-only)) |
 | Windows Time Remaining | `sensor.{prefix}_windows_time_remaining` | Minutes the child may still use Windows today | `allowed_now`, `reason`, `allowance_minutes`, `used_minutes`, `limits_enabled`, `allowed_ranges`. Same rules as Allowed Now below |
@@ -804,18 +804,25 @@ data:
 ```
 
 ```yaml
-# Read the blocked and allowed websites
+# Keep the blocked websites in step with a published list (administrators only)
+service: microsoft_family_safety.sync_site_list
+data:
+  account_id: "1234567890123456"
+  url: "https://example.com/blocklist.txt"
+response_variable: sync
+```
+
+`sync_site_list` reads a plain-text list over https (one domain per line, `#` comments, up to 1 MiB, redirects not followed). It blocks the listed domains that are not blocked yet and, on later runs, unblocks only the domains this same list added and has since dropped. Sites blocked by hand and allowed sites are never touched, and a domain that overlaps an allowed site is skipped. Which domains a list added is kept per child in Home Assistant's storage. An empty or failed download, a list that would take back more than half of what it added, or an answer from Microsoft without any of the sites the list added changes nothing. `stop: true` removes everything the list added and forgets it. The response gives counts and examples of `added`, `removed`, `kept`, `skipped_allowed`, `failed` and `ignored`. Run it from an automation to keep a list current, for example once a day.
+
+```yaml
+# Read the blocked and allowed websites (administrators only)
 service: microsoft_family_safety.get_sites
 data:
   account_id: "1234567890123456"
 response_variable: sites
 ```
 
-`get_sites` answers with `blocked` and `allowed` exactly as Microsoft stores them (absolute URLs, e.g. `https://example.com`), and `filter_enabled`:
-
-```yaml
-{"account_id": "1234567890123456", "blocked": ["https://example.com"], "allowed": ["https://example.org"], "filter_enabled": true}
-```
+`get_sites` answers with `blocked` and `allowed` as Microsoft stores them (absolute URLs), `filter_enabled`, and `from_list` / `from_list_by_url`: the blocked domains that `sync_site_list` added, so they can be told apart from sites blocked by hand.
 
 ### Content & Purchase Controls
 
@@ -1087,7 +1094,7 @@ Be aware of the following before enabling native authentication:
 | Method | Endpoint | Description | Used by |
 |--------|----------|-------------|---------|
 | GET / PATCH | `/v4/devicelimits/schedules/{childId}` | Windows and Xbox schedules (allowance and time windows per day, on/off) | `sensor.screen_time_policy`, `number.*_limit`, `time.*_start/end`, `switch.lock`, `switch.screen_time_limits`, `switch.xbox_screen_time_limits` |
-| GET / PATCH | `/v1/WebRestrictions/{childId}` | Web filter and the blocked / allowed sites (`exceptions=true`) | `sensor.web_filter`, website services |
+| GET / PATCH | `/v1/WebRestrictions/{childId}` | Web filter and the blocked / allowed sites (`exceptions=true`) | `sensor.web_filter`, `switch.web_filtering`, website services, `get_sites`, `sync_site_list` |
 | GET / PATCH | `/v1/ContentRestrictions/{childId}` | Age rating & ask-to-buy | `sensor.web_filter` attributes, services |
 | GET / PATCH | `/v2/AppLimits/settings/{childId}` | "App, feature, and game limits" switch | `switch.app_limits` |
 | PATCH | `/v3/AppLimits/policies/{childId}/{appId}` | Per-app time limits | app time limit services |
