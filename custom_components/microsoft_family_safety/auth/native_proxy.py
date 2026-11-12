@@ -32,7 +32,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import UnknownFlow
 from homeassistant.helpers.httpx_client import create_async_httpx_client
 
-from ..const import DOMAIN
+from ..const import AUTH_PROXY_LIFETIME_SECONDS, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -60,7 +60,7 @@ _PROXIED_HOSTS = frozenset(
 _MICROSOFT_DOMAIN_ROOTS = ("live.com", "microsoft.com", "microsoftonline.com")
 #: Query parameter carrying a whole upstream query, see _hide_query_from_filter.
 _HIDDEN_QUERY = "__ms_q"
-_PROXY_LIFETIME_SECONDS = 600
+_PROXY_LIFETIME_SECONDS = AUTH_PROXY_LIFETIME_SECONDS
 #: Cookies issued by Akamai Bot Manager in front of Microsoft's sites. They are
 #: bound to the fingerprint of the browser that obtained them and make Microsoft
 #: hang up on any other client that replays them, so they are never exported.
