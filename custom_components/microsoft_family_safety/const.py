@@ -14,12 +14,22 @@ CONF_REDIRECT_URL: Final = "redirect_url"
 CONF_REFRESH_TOKEN: Final = "refresh_token"
 CONF_AUTH_USER_ID: Final = "auth_user_id"
 CONF_UPDATE_INTERVAL: Final = "update_interval"
-CONF_AUTH_URL: Final = "auth_url"
-CONF_API_KEY: Final = "api_key"
-CONF_WEB_COOKIES: Final = "web_cookies"
-CONF_WEB_FAMILY_TOKEN: Final = "web_family_token"
-CONF_WEB_FAMILY_REFERER: Final = "web_family_referer"
 CONF_ALLOW_INSECURE_HTTP_AUTH: Final = "allow_insecure_http_auth"
+#: Xbox Family Settings refresh token obtained during the sign-in, handed to
+#: the entry's Xbox store at its next load and then removed from the entry.
+CONF_XBOX_REFRESH_TOKEN: Final = "xbox_refresh_token"
+#: When the stored refresh token was obtained: a new sign-in replaces the
+#: rotated token cached since, even if Microsoft returned the same string.
+CONF_SIGNED_IN_AT: Final = "signed_in_at"
+#: Family web session and legacy add-on settings stored by earlier versions.
+#: Nothing reads them any more; they are dropped from the entry on load.
+LEGACY_WEB_AUTH_KEYS: Final = (
+    "web_cookies",
+    "web_family_token",
+    "web_family_referer",
+    "auth_url",
+    "api_key",
+)
 
 # Defaults
 DEFAULT_UPDATE_INTERVAL: Final = 300  # 5 minutes in seconds
@@ -29,10 +39,9 @@ DEFAULT_TIMEOUT: Final = 30
 CONF_PLATFORMS: Final = "platforms"
 AVAILABLE_PLATFORMS: Final = ["Windows", "Xbox", "Mobile"]
 DEFAULT_PLATFORMS: Final = ["Windows"]
-# Xbox usage and the Xbox lock still need the Family web session, which some
-# accounts must renew with an interactive sign-in every 24 h (#52). Off = the
-# entry runs on the mobile refresh token only: no web sign-in, no stored
-# browser cookies, no Xbox entities.
+# Xbox entities (Xbox lock, Xbox schedule and limits). The Xbox lock, play
+# time and limits run on the Xbox Family Settings sign-in (xbox_family_api);
+# off = no Xbox entities and no Xbox Family Settings link.
 CONF_XBOX_FEATURES: Final = "xbox_features"
 #: Options-form checkbox that opens the Xbox Family Settings link step.
 CONF_XBOX_LINK: Final = "xbox_link"
@@ -107,7 +116,7 @@ SERVICE_UNLOCK_PLATFORM: Final = "unlock_platform"
 SERVICE_APPROVE_REQUEST: Final = "approve_request"
 SERVICE_DENY_REQUEST: Final = "deny_request"
 
-# New service names (web API)
+# Service names for the settings beyond pyfamilysafety
 SERVICE_SET_SCREENTIME_LIMIT: Final = "set_screentime_limit"
 SERVICE_SET_SCREENTIME_INTERVALS: Final = "set_screentime_intervals"
 SERVICE_SET_APP_TIME_LIMIT: Final = "set_app_time_limit"

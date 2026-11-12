@@ -14,10 +14,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.util import dt as dt_util
 
+from homeassistant.exceptions import HomeAssistantError
+
 from custom_components.microsoft_family_safety.const import (
-    CONF_WEB_COOKIES,
     CONF_XBOX_FEATURES,
     DOMAIN,
 )
@@ -78,7 +80,7 @@ def test_schedule_converts_to_the_entity_shape():
         ([{"overrideType": 7}], "xapprove_7"),
     ],
 )
-def test_overrides_map_to_the_web_policy_shape(overrides, expected):
+def test_overrides_map_to_the_lock_policy_shape(overrides, expected):
     policy = overrides_to_policy({"overrides": overrides})
     assert policy["screenTimeOverride"]["screenTimeOverrideType"] == expected
 
@@ -201,7 +203,7 @@ async def test_create_override_body(hass, hass_storage, aioclient_mock):
 async def coordinator(hass):
     entry = MockConfigEntry(
         domain=DOMAIN,
-        data={"refresh_token": "x", CONF_WEB_COOKIES: [{"name": "MSPAuth"}]},
+        data={"refresh_token": "x"},
         options={CONF_XBOX_FEATURES: True},
     )
     entry.add_to_hass(hass)
@@ -258,18 +260,44 @@ async def test_xbox_lock_through_xapprove(coordinator):
     await coordinator.async_lock_platform(CHILD, "Xbox", dt_util.utcnow() + timedelta(hours=1))
     assert coordinator.xbox_family.async_create_override.await_args.args[1] == OVERRIDE_BLOCK
     assert (CHILD, "xbox") in coordinator._platform_override_until
-    coordinator.web_api.set_platform_time_override.assert_not_called()
 
 
-async def test_xbox_unlock_falls_back_to_web_when_block_remains(coordinator):
+async def test_xbox_unlock_fails_when_the_block_remains(coordinator):
     coordinator.xbox_family.async_create_override.return_value = {
         "overrides": [{"overrideType": 2, "validUntil": "2099-01-01T00:00:00Z"}]
     }
-    coordinator._has_web_credentials = True
-    coordinator.web_api.has_web_cookies = True
-    coordinator.web_api.set_platform_time_override = AsyncMock()
+    coordinator._platform_override_until[(CHILD, "xbox")] = dt_util.utcnow() + timedelta(hours=1)
+    with pytest.raises(HomeAssistantError):
+        await coordinator.async_unlock_platform(CHILD, "Xbox")
+    assert (CHILD, "xbox") in coordinator._platform_override_until
+
+
+async def test_xbox_unlock_through_xapprove(coordinator):
+    coordinator.xbox_family.async_create_override.return_value = {"overrides": []}
+    coordinator._platform_override_until[(CHILD, "xbox")] = dt_util.utcnow() + timedelta(hours=1)
     await coordinator.async_unlock_platform(CHILD, "Xbox")
-    assert coordinator.web_api.set_platform_time_override.await_args.args[2] == "cancel"
+    assert (CHILD, "xbox") not in coordinator._platform_override_until
+    assert CHILD in coordinator._xbox_lock_known
+
+
+async def test_xbox_lock_without_the_xbox_sign_in_fails_and_never_uses_the_mobile_api(
+    coordinator,
+):
+    # The mobile API accepts an Xbox override the console ignores: no fallback.
+    coordinator.xbox_family.linked = False
+    coordinator.xbox_family.usable = False
+    with pytest.raises(HomeAssistantError, match="not linked"):
+        await coordinator.async_lock_platform(CHILD, "Xbox")
+    coordinator.web_api.set_mobile_device_override.assert_not_called()
+    coordinator.xbox_family.async_create_override.assert_not_called()
+
+
+async def test_child_without_an_xbox_reads_as_unlocked(coordinator):
+    coordinator._xbox_unmatched.add("42")
+    account_data: dict = {}
+    coordinator._apply_xbox_lock_state("42", account_data, None, no_xbox=True)
+    assert account_data["xbox_lock_known"] is True
+    assert "Xbox" not in account_data["blocked_platforms"]
 
 
 @pytest.mark.parametrize(
@@ -316,21 +344,6 @@ async def test_allow_until_override_reads_as_unlocked(coordinator):
     coordinator._apply_xbox_lock_state(CHILD, account_data, policy)
     assert "Xbox" not in account_data["blocked_platforms"]
     assert account_data["xbox_lock_known"] is True
-
-
-@pytest.mark.parametrize(
-    ("xapprove", "expected"),
-    [
-        (None, (True, True)),
-        ({"usage": 12, "lock_policy": {}}, (False, False)),
-        ({"usage": None, "lock_policy": {}}, (False, True)),  # only usage falls back
-    ],
-)
-async def test_web_gates(coordinator, xapprove, expected):
-    coordinator.web_api = SimpleNamespace(
-        has_web_cookies=True, family_context_state="ready", _family_web_backoff_until=0.0
-    )
-    assert coordinator._xbox_web_gates(xapprove) == expected
 
 
 async def test_child_match_is_counted_and_not_logged_by_name(coordinator, caplog):

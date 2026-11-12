@@ -55,8 +55,6 @@ from .const import (
 from .coordinator import FamilySafetyDataUpdateCoordinator
 from .permissions import guard_service
 from .targeting import child_schema, resolve_account_id
-from ._httpx_web_adapter import apply_httpx_web_transport_patch
-from ._httpx_web_tuning import apply_httpx_web_tuning_patch
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -116,7 +114,7 @@ SERVICE_DENY_REQUEST_SCHEMA = vol.Schema({
     vol.Required("request_id"): cv.string,
 })
 
-# New service schemas (web API)
+# Service schemas for the settings beyond pyfamilysafety
 
 SERVICE_SET_SCREENTIME_LIMIT_SCHEMA = child_schema({
     vol.Required("day_of_week"): vol.All(vol.Coerce(int), vol.Range(min=0, max=6)),
@@ -226,11 +224,10 @@ def _get_coordinator(
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Microsoft Family Safety from a config entry."""
-    apply_httpx_web_transport_patch(hass)
-    apply_httpx_web_tuning_patch()
     coordinator = FamilySafetyDataUpdateCoordinator(hass, entry)
 
-    # Load persisted screentime policies (for lock/unlock survival across restarts)
+    # Load persisted screentime policies (for lock/unlock survival across
+    # restarts) and the rotated refresh token.
     await coordinator.async_load_saved_screentime()
     # And the app states pause_app saved, for resume_app.
     await coordinator.app_pauser.async_load()
@@ -448,11 +445,14 @@ def _register_services(hass: HomeAssistant) -> None:
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Delete the Xbox Family Settings refresh token and the paused apps kept for this entry."""
+    from homeassistant.helpers import issue_registry as ir
+
     from .app_pause import AppPauser
     from .xbox_family_api import XboxFamilyAPI
 
     await XboxFamilyAPI(hass, entry.entry_id).async_unlink()
     await AppPauser(hass, entry.entry_id).async_remove()
+    ir.async_delete_issue(hass, DOMAIN, f"xbox_link_{entry.entry_id}")
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
