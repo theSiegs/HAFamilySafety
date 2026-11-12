@@ -2532,6 +2532,14 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         return {"cancelled": True, "lock_in_force": lock is not None}
 
+    async def async_probe_xbox_schedule(self, account_id: str) -> dict[str, Any]:
+        """Diagnostic (fork only): the raw xapprove schedule, GET only."""
+        account = self._accounts[self._roster_id(account_id)]
+        xuid = await self._async_xbox_xuid(account)
+        if xuid is None or self.xbox_family is None:
+            raise HomeAssistantError("No Xbox Family Settings link or xuid for this child")
+        return {"schedule": await self.xbox_family.async_get_schedule(xuid)}
+
     async def async_probe_app_policy(self, account_id: str, app_id: str) -> dict[str, Any]:
         """Diagnostic: every candidate read of one app's policy, raw (GETs only)."""
         if not self.web_api:
