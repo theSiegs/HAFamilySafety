@@ -447,6 +447,7 @@ data:
 - While extra time runs, the lock switch of that platform reads off (Microsoft reports `allowUntil` / `AllowUntil`).
 - Extra time given here is remembered as the integration's own: the `hold` attribute reads `bonus_ours` (not `parent`) while it is in force. For Windows, whose extra time is not polled, the integration's own record of it stands in until it ends.
 - Given with `replace_lock: true` over a lock placed by `lock_platform`, the integration keeps that lock's hold: strict mode never locks over the extra time, and once the extra time ends (or `cancel_time_bonus` ends it) the lock goes back on until its own end. `unlock_platform` during that extra time forgets the lock and leaves the extra time running (`applied: "bonus_kept"`).
+- A lock that extra time replaced and that the integration did not place (a parent's lock from the app, or one already lifted by `unlock_platform`) does not come back: after `cancel_time_bonus`, or when the extra time ends, the platform follows its schedule again. Lock it again with `lock_platform` if needed.
 - `cancel_time_bonus` only ever cancels extra time. While the platform is locked it fails without sending anything (the cancel would lift the lock too); with no extra time in force it does nothing.
 - Both can answer with what they did (`response_variable`): `add_time_bonus` with `{added, until, applied_until, replaced_lock, hold_kept}`, `cancel_time_bonus` with `{cancelled: true, lock_in_force}` (plus `lock_restored: true` and `lock_until` when a lock of the integration's was put back) or `{cancelled: false, reason: "no_extra_time"}`.
 
@@ -469,10 +470,10 @@ response_variable: extra_time
 ```
 
 ```yaml
-# End the Xbox extra time early
+# End the Xbox extra time early (the child as one of its entities)
 service: microsoft_family_safety.cancel_time_bonus
 data:
-  account_id: "1234567890123456"
+  entity_id: switch.firstname_xbox_lock
 ```
 
 ```yaml
