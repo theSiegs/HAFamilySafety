@@ -66,12 +66,26 @@ _LOGGER = logging.getLogger(__name__)
 # Service Schemas
 # ──────────────────────────────────────────────────────────────────────
 
+
+def _platform(*choices: str):
+    """A platform in any case (``xbox``, ``XBOX``), given on as the canonical choice."""
+    by_key = {choice.casefold(): choice for choice in choices}
+
+    def validate(value):
+        choice = by_key.get(str(value).strip().casefold())
+        if choice is None:
+            raise vol.Invalid(f"platform must be one of {', '.join(choices)}")
+        return choice
+
+    return validate
+
+
 SERVICE_BLOCK_APP_SCHEMA = child_schema({
     vol.Required("app_id"): cv.string,
 })
 
 SERVICE_LOCK_PLATFORM_SCHEMA = child_schema({
-    vol.Required("platform"): vol.In(["Windows", "Xbox", "Mobile"]),
+    vol.Required("platform"): _platform("Windows", "Xbox", "Mobile"),
     # No default here: giving both is an error, so the 24 h default is
     # applied in _lock_until once it is known that ``until`` is absent.
     vol.Optional("duration_hours"): vol.All(
@@ -81,11 +95,11 @@ SERVICE_LOCK_PLATFORM_SCHEMA = child_schema({
 })
 
 SERVICE_UNLOCK_PLATFORM_SCHEMA = child_schema({
-    vol.Required("platform"): vol.In(["Windows", "Xbox", "Mobile"]),
+    vol.Required("platform"): _platform("Windows", "Xbox", "Mobile"),
 })
 
 SERVICE_ADD_TIME_BONUS_SCHEMA = child_schema({
-    vol.Optional("platform", default="Xbox"): vol.In(["Xbox", "Windows"]),
+    vol.Optional("platform", default="Xbox"): _platform("Xbox", "Windows"),
     vol.Optional("minutes"): vol.All(vol.Coerce(int), vol.Range(min=1, max=1440)),
     vol.Optional("until"): cv.datetime,
     vol.Optional("replace_lock", default=False): cv.boolean,
@@ -107,7 +121,7 @@ SERVICE_PROBE_APP_POLICY_SCHEMA = vol.Schema({
 })
 
 SERVICE_CANCEL_TIME_BONUS_SCHEMA = child_schema({
-    vol.Optional("platform", default="Xbox"): vol.In(["Xbox", "Windows"]),
+    vol.Optional("platform", default="Xbox"): _platform("Xbox", "Windows"),
 })
 
 SERVICE_APPROVE_REQUEST_SCHEMA = vol.Schema({
@@ -125,7 +139,7 @@ SERVICE_DENY_REQUEST_SCHEMA = vol.Schema({
 
 # day_of_week is required unless today_only is set (checked by the coordinator).
 SERVICE_SET_SCREENTIME_LIMIT_SCHEMA = child_schema({
-    vol.Optional("platform", default="Windows"): vol.In(SCREENTIME_PLATFORMS),
+    vol.Optional("platform", default="Windows"): _platform(*SCREENTIME_PLATFORMS),
     vol.Optional("today_only", default=False): cv.boolean,
     vol.Optional("day_of_week"): vol.All(vol.Coerce(int), vol.Range(min=0, max=6)),
     vol.Required("hours"): vol.All(vol.Coerce(int), vol.Range(min=0, max=24)),
@@ -133,7 +147,7 @@ SERVICE_SET_SCREENTIME_LIMIT_SCHEMA = child_schema({
 })
 
 SERVICE_SET_SCREENTIME_INTERVALS_SCHEMA = child_schema({
-    vol.Optional("platform", default="Windows"): vol.In(SCREENTIME_PLATFORMS),
+    vol.Optional("platform", default="Windows"): _platform(*SCREENTIME_PLATFORMS),
     vol.Optional("today_only", default=False): cv.boolean,
     vol.Optional("day_of_week"): vol.All(vol.Coerce(int), vol.Range(min=0, max=6)),
     vol.Required("start_hour"): vol.All(vol.Coerce(int), vol.Range(min=0, max=23)),
@@ -146,7 +160,7 @@ SERVICE_SET_SCREENTIME_INTERVALS_SCHEMA = child_schema({
 SERVICE_SET_APP_TIME_LIMIT_SCHEMA = child_schema({
     vol.Required("app_id"): cv.string,
     vol.Required("app_name"): cv.string,
-    vol.Optional("platform", default="windows"): vol.In(["windows", "xbox", "mobile"]),
+    vol.Optional("platform", default="windows"): _platform("windows", "xbox", "mobile"),
     vol.Required("hours"): vol.All(vol.Coerce(int), vol.Range(min=0, max=24)),
     vol.Optional("minutes", default=0): vol.All(vol.Coerce(int), vol.Range(min=0, max=59)),
     vol.Optional("start_time", default="07:00:00"): cv.string,
@@ -156,7 +170,7 @@ SERVICE_SET_APP_TIME_LIMIT_SCHEMA = child_schema({
 SERVICE_REMOVE_APP_TIME_LIMIT_SCHEMA = child_schema({
     vol.Required("app_id"): cv.string,
     vol.Required("app_name"): cv.string,
-    vol.Optional("platform", default="windows"): vol.In(["windows", "xbox", "mobile"]),
+    vol.Optional("platform", default="windows"): _platform("windows", "xbox", "mobile"),
 })
 
 # One site, or several (a list) applied one after the other.
@@ -189,7 +203,7 @@ SERVICE_UNLOCK_ACCOUNT_SCHEMA = child_schema({})
 SERVICE_REQUEST_REAUTH_SCHEMA = vol.Schema({})
 
 SERVICE_RESTORE_TODAY_ONLY_SCHEMA = child_schema({
-    vol.Optional("platform"): vol.In(SCREENTIME_PLATFORMS),
+    vol.Optional("platform"): _platform(*SCREENTIME_PLATFORMS),
 })
 
 

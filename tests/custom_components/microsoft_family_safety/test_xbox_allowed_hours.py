@@ -336,7 +336,9 @@ async def test_xbox_limit_entity_still_falls_back_when_not_linked(coordinator):
 @pytest.fixture
 def service_coordinator(hass):
     coord = SimpleNamespace(
-        async_set_screentime_limit=AsyncMock(), async_set_screentime_intervals=AsyncMock()
+        async_set_screentime_limit=AsyncMock(), async_set_screentime_intervals=AsyncMock(),
+        async_unlock_platform=AsyncMock(), async_remove_app_time_limit=AsyncMock(),
+        async_cancel_time_bonus=AsyncMock(return_value={"cancelled": False}),
     )
     with patch(
         "custom_components.microsoft_family_safety._get_coordinator", return_value=coord
@@ -371,6 +373,34 @@ async def test_services_pass_xbox(hass, service_coordinator):
     service_coordinator.async_set_screentime_intervals.assert_awaited_once_with(
         CHILD, 5, 16, 0, 21, 30, "Xbox", False
     )
+
+
+@pytest.mark.parametrize("given", ["xbox", "XBOX", " Xbox "])
+async def test_services_take_the_platform_in_any_case(hass, service_coordinator, given):
+    await hass.services.async_call(
+        DOMAIN, "set_screentime_limit",
+        {"account_id": CHILD, "platform": given, "day_of_week": 1, "hours": 2},
+        blocking=True,
+    )
+    await hass.services.async_call(
+        DOMAIN, "unlock_platform", {"account_id": CHILD, "platform": given}, blocking=True,
+    )
+    await hass.services.async_call(
+        DOMAIN, "remove_app_time_limit",
+        {"account_id": CHILD, "platform": given, "app_id": "a", "app_name": "A"},
+        blocking=True,
+    )
+    await hass.services.async_call(
+        DOMAIN, "cancel_time_bonus", {"account_id": CHILD, "platform": given.lower()},
+        blocking=True,
+    )
+    # Each service passes on its own canonical spelling.
+    service_coordinator.async_set_screentime_limit.assert_awaited_once_with(
+        CHILD, 1, 2, 0, "Xbox", False
+    )
+    service_coordinator.async_unlock_platform.assert_awaited_once_with(CHILD, "Xbox")
+    service_coordinator.async_remove_app_time_limit.assert_awaited_once_with(CHILD, "a", "A", "xbox")
+    service_coordinator.async_cancel_time_bonus.assert_awaited_once_with(CHILD, "Xbox")
 
 
 async def test_services_reject_other_platforms(hass, service_coordinator):
