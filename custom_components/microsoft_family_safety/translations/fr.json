@@ -186,8 +186,8 @@
       }
     },
     "add_time_bonus": {
-      "name": "Ajouter du temps Xbox",
-      "description": "Donne du temps supplémentaire à un enfant sur la Xbox, pour quelques minutes ou jusqu'à une heure donnée, via le service Xbox Family Settings. Nécessite la connexion Xbox Family Settings liée. Refusé tant que la Xbox est verrouillée, sauf si « Remplacer le verrouillage » est activé. Échoue si Microsoft ne confirme pas le temps supplémentaire, ou si la Xbox reste verrouillée. Peut répondre avec added, until et replaced_lock.",
+      "name": "Ajouter du temps supplémentaire",
+      "description": "Donne du temps supplémentaire à un enfant sur la Xbox ou sous Windows, pour quelques minutes ou jusqu'à une heure donnée. La Xbox passe par le service Xbox Family Settings (sa connexion doit être liée), Windows par l'API mobile de Family Safety. Refusé tant que la plateforme est verrouillée, sauf si « Remplacer le verrouillage » est activé. Échoue si Microsoft ne confirme pas le temps supplémentaire, ou si la plateforme reste verrouillée. Peut répondre avec added, until et replaced_lock.",
       "fields": {
         "account_id": {
           "name": "ID du compte",
@@ -199,7 +199,7 @@
         },
         "platform": {
           "name": "Plateforme",
-          "description": "Uniquement Xbox pour l'instant (par défaut)."
+          "description": "Xbox (par défaut) ou Windows."
         },
         "minutes": {
           "name": "Minutes",
@@ -211,13 +211,31 @@
         },
         "replace_lock": {
           "name": "Remplacer le verrouillage",
-          "description": "Microsoft ne garde qu'une seule dérogation Xbox, donc le temps supplémentaire remplace un verrouillage. Désactivé (par défaut) : refusé tant que la Xbox est verrouillée, par cette intégration ou par un parent. Activé : le verrouillage est remplacé par le temps supplémentaire."
+          "description": "Microsoft ne garde qu'une seule dérogation par plateforme, donc le temps supplémentaire remplace un verrouillage. Désactivé (par défaut) : refusé tant que la plateforme est verrouillée, par cette intégration ou par un parent. Activé : le verrouillage est remplacé par le temps supplémentaire."
+        }
+      }
+    },
+    "probe_windows_extra_time": {
+      "name": "Tester le temps supplémentaire Windows",
+      "description": "Diagnostic (administrateurs uniquement) : pour un enfant sans dérogation en cours sous Windows, écrit une courte dérogation AllowUntil via l'API mobile, la relit, l'annule et relit. Renvoie chaque requête avec le statut et la réponse brute de Microsoft.",
+      "fields": {
+        "account_id": {
+          "name": "ID du compte",
+          "description": "L'identifiant utilisateur du compte enfant."
+        },
+        "confirm_risk": {
+          "name": "Confirmer le risque",
+          "description": "Doit être activé. L'enfant reçoit quelques minutes de temps supplémentaire sous Windows jusqu'à l'annulation."
+        },
+        "minutes": {
+          "name": "Minutes",
+          "description": "Durée du temps supplémentaire de test (1 à 10, 2 par défaut)."
         }
       }
     },
     "cancel_time_bonus": {
-      "name": "Annuler le temps Xbox supplémentaire",
-      "description": "Annule le temps supplémentaire en cours sur la Xbox d'un enfant. Seul le temps supplémentaire est annulé : échoue tant que la Xbox est verrouillée (un verrouillage n'est jamais levé), et ne fait rien quand aucun temps supplémentaire n'est en cours. Peut répondre avec cancelled et reason ou lock_in_force.",
+      "name": "Annuler le temps supplémentaire",
+      "description": "Annule le temps supplémentaire en cours sur la Xbox ou sous Windows d'un enfant. Seul le temps supplémentaire est annulé : échoue tant que la plateforme est verrouillée (un verrouillage n'est jamais levé), et ne fait rien quand aucun temps supplémentaire n'est en cours. Peut répondre avec cancelled et reason ou lock_in_force.",
       "fields": {
         "account_id": {
           "name": "ID du compte",
@@ -229,7 +247,7 @@
         },
         "platform": {
           "name": "Plateforme",
-          "description": "Uniquement Xbox pour l'instant (par défaut)."
+          "description": "Xbox (par défaut) ou Windows."
         }
       }
     },

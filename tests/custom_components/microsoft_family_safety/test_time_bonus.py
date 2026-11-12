@@ -170,9 +170,9 @@ async def test_without_the_xbox_link_it_fails_clearly(coordinator):
     coordinator.xbox_family.async_create_override.assert_not_awaited()
 
 
-async def test_windows_is_refused(coordinator):
-    with pytest.raises(HomeAssistantError, match="only be given on the Xbox"):
-        await coordinator.async_add_time_bonus(CHILD, "Windows", dt_util.utcnow() + timedelta(minutes=5))
+async def test_an_unknown_platform_is_refused(coordinator):
+    with pytest.raises(HomeAssistantError, match="only be given on Windows or the Xbox"):
+        await coordinator.async_add_time_bonus(CHILD, "Mobile", dt_util.utcnow() + timedelta(minutes=5))
 
 
 async def test_an_unknown_child_is_refused(coordinator):
@@ -321,15 +321,27 @@ async def test_service_takes_an_entity_of_the_child(hass):
         coord.async_cancel_time_bonus.assert_awaited_once_with(CHILD, "Xbox")
 
 
-async def test_service_refuses_windows(hass):
+async def test_service_takes_windows_and_refuses_mobile(hass):
     import voluptuous as vol
 
-    with patch("custom_components.microsoft_family_safety._get_coordinator", return_value=MagicMock()):
+    coord = MagicMock()
+    coord.async_add_time_bonus = AsyncMock(return_value={"added": True})
+    coord.async_cancel_time_bonus = AsyncMock(return_value={"cancelled": True})
+    with patch("custom_components.microsoft_family_safety._get_coordinator", return_value=coord):
         _register_services(hass)
+        await hass.services.async_call(
+            DOMAIN, "add_time_bonus",
+            {"account_id": CHILD, "platform": "Windows", "minutes": 5}, blocking=True,
+        )
+        assert coord.async_add_time_bonus.await_args.args[1] == "Windows"
+        await hass.services.async_call(
+            DOMAIN, "cancel_time_bonus", {"account_id": CHILD, "platform": "Windows"}, blocking=True
+        )
+        coord.async_cancel_time_bonus.assert_awaited_once_with(CHILD, "Windows")
         with pytest.raises(vol.Invalid):
             await hass.services.async_call(
                 DOMAIN, "add_time_bonus",
-                {"account_id": CHILD, "platform": "Windows", "minutes": 5}, blocking=True,
+                {"account_id": CHILD, "platform": "Mobile", "minutes": 5}, blocking=True,
             )
 
 
@@ -342,5 +354,6 @@ def test_platform_is_accepted_in_any_case() -> None:
 
     for schema in (SERVICE_ADD_TIME_BONUS_SCHEMA, SERVICE_CANCEL_TIME_BONUS_SCHEMA):
         assert schema({"account_id": "1", "platform": " xbox "})["platform"] == "Xbox"
+        assert schema({"account_id": "1", "platform": "windows"})["platform"] == "Windows"
         with pytest.raises(Exception):
-            schema({"account_id": "1", "platform": "windows"})
+            schema({"account_id": "1", "platform": "mobile"})

@@ -149,6 +149,7 @@ SERVICE_RESUME_APP: Final = "resume_app"
 SERVICE_ADD_TIME_BONUS: Final = "add_time_bonus"
 SERVICE_CANCEL_TIME_BONUS: Final = "cancel_time_bonus"
 SERVICE_RESTORE_TODAY_ONLY: Final = "restore_today_only"
+SERVICE_PROBE_WINDOWS_EXTRA_TIME: Final = "probe_windows_extra_time"
 
 ALL_SERVICES: Final = [
     SERVICE_BLOCK_APP,
@@ -176,6 +177,7 @@ ALL_SERVICES: Final = [
     SERVICE_ADD_TIME_BONUS,
     SERVICE_CANCEL_TIME_BONUS,
     SERVICE_RESTORE_TODAY_ONLY,
+    SERVICE_PROBE_WINDOWS_EXTRA_TIME,
 ]
 
 # Platforms

@@ -20,6 +20,7 @@ from homeassistant.exceptions import (
     ServiceValidationError,
 )
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.service import async_register_admin_service
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -51,6 +52,7 @@ from .const import (
     SERVICE_ADD_TIME_BONUS,
     SERVICE_CANCEL_TIME_BONUS,
     SERVICE_RESTORE_TODAY_ONLY,
+    SERVICE_PROBE_WINDOWS_EXTRA_TIME,
     CONF_ALLOWED_USERS,
     SCREENTIME_PLATFORMS,
 )
@@ -97,15 +99,20 @@ SERVICE_UNLOCK_PLATFORM_SCHEMA = child_schema({
 })
 
 SERVICE_ADD_TIME_BONUS_SCHEMA = child_schema({
-    # Only the Xbox has a confirmed request for extra time so far.
-    vol.Optional("platform", default="Xbox"): _platform("Xbox"),
+    vol.Optional("platform", default="Xbox"): _platform("Xbox", "Windows"),
     vol.Optional("minutes"): vol.All(vol.Coerce(int), vol.Range(min=1, max=1440)),
     vol.Optional("until"): cv.datetime,
     vol.Optional("replace_lock", default=False): cv.boolean,
 })
 
 SERVICE_CANCEL_TIME_BONUS_SCHEMA = child_schema({
-    vol.Optional("platform", default="Xbox"): _platform("Xbox"),
+    vol.Optional("platform", default="Xbox"): _platform("Xbox", "Windows"),
+})
+
+SERVICE_PROBE_WINDOWS_EXTRA_TIME_SCHEMA = vol.Schema({
+    vol.Required("account_id"): cv.string,
+    vol.Required("confirm_risk"): vol.All(cv.boolean, True),
+    vol.Optional("minutes", default=2): vol.All(vol.Coerce(int), vol.Range(min=1, max=10)),
 })
 
 SERVICE_APPROVE_REQUEST_SCHEMA = vol.Schema({
@@ -438,6 +445,21 @@ def _register_services(hass: HomeAssistant) -> None:
                 return result
             return None
         return handler
+
+    async def probe_windows_extra_time(call: ServiceCall) -> dict:
+        """Diagnostic: write, read back and cancel a short Windows extra time."""
+        coordinator = _get_coordinator(hass, call.data["account_id"])
+        if coordinator is None:
+            raise HomeAssistantError("No Microsoft Family Safety coordinator available")
+        return await coordinator.async_probe_windows_extra_time(
+            call.data["account_id"], call.data["minutes"]
+        )
+
+    async_register_admin_service(
+        hass, DOMAIN, SERVICE_PROBE_WINDOWS_EXTRA_TIME, probe_windows_extra_time,
+        schema=SERVICE_PROBE_WINDOWS_EXTRA_TIME_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
+    )
 
     for name, schema, method, extract in services:
         per_child = schema not in (
