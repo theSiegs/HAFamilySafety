@@ -33,7 +33,7 @@
       },
       "check_mobile_proxy": {
         "title": "Microsoft-Anmeldung",
-        "description": "Melde dich im geöffneten Fenster mit dem Microsoft-Konto an, das die Familie verwaltet. Lass es offen, bis die Microsoft-Anmeldung abgeschlossen ist: Home Assistant fährt dann von selbst fort."
+        "description": "Melde dich im geöffneten Fenster mit dem Microsoft-Konto an, das die Familie verwaltet. Lass es offen, bis die Microsoft-Anmeldung abgeschlossen ist: Home Assistant fährt dann von selbst fort.\n\nEin Passkey funktioniert hier nicht, weil die Anmeldung über die Adresse von Home Assistant läuft und nicht über die von Microsoft: Bietet Microsoft einen an, wähle **Andere Möglichkeiten zum Anmelden** und melde dich mit Passwort oder Code an."
       }
     },
     "error": {

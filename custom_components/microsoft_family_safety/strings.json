@@ -33,7 +33,7 @@
       },
       "check_mobile_proxy": {
         "title": "Microsoft sign-in",
-        "description": "Sign in with the Microsoft account that manages the family in the window that opened. Keep it open until the Microsoft sign-in is complete: Home Assistant then continues on its own."
+        "description": "Sign in with the Microsoft account that manages the family in the window that opened. Keep it open until the Microsoft sign-in is complete: Home Assistant then continues on its own.\n\nA passkey can't be used here, because the sign-in runs through Home Assistant's address rather than Microsoft's: if Microsoft offers one, choose **Sign in another way** and use your password or a code."
       }
     },
     "error": {

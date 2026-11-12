@@ -33,7 +33,7 @@
       },
       "check_mobile_proxy": {
         "title": "Connexion Microsoft",
-        "description": "Connectez-vous, dans la fenêtre qui s'est ouverte, avec le compte Microsoft qui gère la famille. Laissez-la ouverte jusqu'à la fin de la connexion Microsoft : Home Assistant continue ensuite tout seul."
+        "description": "Connectez-vous, dans la fenêtre qui s'est ouverte, avec le compte Microsoft qui gère la famille. Laissez-la ouverte jusqu'à la fin de la connexion Microsoft : Home Assistant continue ensuite tout seul.\n\nUne clé d'accès (passkey) ne peut pas être utilisée ici, car la connexion passe par l'adresse de Home Assistant et non par celle de Microsoft : si Microsoft en propose une, choisissez **Autres façons de se connecter** et utilisez votre mot de passe ou un code."
       }
     },
     "error": {
