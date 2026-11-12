@@ -789,6 +789,8 @@ data:
     - "example.net"
 ```
 
+Each site is its own request to Microsoft. Every site in the list is tried, also after one fails; if any fails, the call fails with a message naming the sites that were done and the sites that failed (with Microsoft's error), so an automation can retry just those.
+
 ```yaml
 # Toggle web content filtering
 service: microsoft_family_safety.toggle_web_filter

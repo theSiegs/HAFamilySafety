@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from homeassistant.exceptions import HomeAssistantError
+
 from custom_components.microsoft_family_safety import _register_services, sensor, switch
 from custom_components.microsoft_family_safety.api_client import (
     FamilySafetyWebAPI,
@@ -24,15 +26,21 @@ CHILD = "1234567890123456"
 class FakeWebAPI:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, object]] = []
+        self.fail: dict[str, Exception] = {}
+
+    def _site(self, kind, child_id, website):
+        self.calls.append((kind, child_id, website))
+        if website in self.fail:
+            raise self.fail[website]
 
     async def block_website(self, child_id, website):
-        self.calls.append(("block", child_id, website))
+        self._site("block", child_id, website)
 
     async def allow_website(self, child_id, website):
-        self.calls.append(("allow", child_id, website))
+        self._site("allow", child_id, website)
 
     async def remove_website(self, child_id, website):
-        self.calls.append(("remove", child_id, website))
+        self._site("remove", child_id, website)
 
     async def toggle_web_filter(self, child_id, enabled):
         self.calls.append(("toggle", child_id, enabled))
@@ -117,8 +125,11 @@ async def test_website_services_take_several_sites(hass, rig):
     _register_services(hass)
     await hass.services.async_call(
         DOMAIN, "block_website",
-        {"account_id": CHILD, "website": ["a.example", "b.example", "a.example"]},
+        {"account_id": CHILD, "website": ["a.example", "b.example", "a.example", " "]},
         blocking=True,
+    )
+    await hass.services.async_call(
+        DOMAIN, "allow_website", {"account_id": CHILD, "website": "d.example"}, blocking=True,
     )
     await hass.services.async_call(
         DOMAIN, "remove_website", {"account_id": CHILD, "website": "c.example"}, blocking=True,
@@ -126,5 +137,34 @@ async def test_website_services_take_several_sites(hass, rig):
     assert coord.web_api.calls == [
         ("block", CHILD, "a.example"),
         ("block", CHILD, "b.example"),
+        ("allow", CHILD, "d.example"),
         ("remove", CHILD, "c.example"),
     ]
+
+
+async def test_a_failed_site_does_not_stop_the_others_and_is_named(hass, rig):
+    coord, _ = rig
+    _register_services(hass)
+    coord.web_api.fail = {"b.example": FamilySafetyWebAPIError("BadUrlFormat")}
+    with pytest.raises(HomeAssistantError) as err:
+        await hass.services.async_call(
+            DOMAIN, "block_website",
+            {"account_id": CHILD, "website": ["a.example", "b.example", "c.example"]},
+            blocking=True,
+        )
+    # Every site was tried.
+    assert [c[2] for c in coord.web_api.calls] == ["a.example", "b.example", "c.example"]
+    message = str(err.value)
+    assert "1 of 3" in message
+    assert "Done: a.example, c.example" in message
+    assert "Failed: b.example (BadUrlFormat)" in message
+    # The sites that went through are shown.
+    coord.async_request_refresh.assert_awaited()
+
+
+async def test_when_every_site_fails_none_is_done(hass, rig):
+    coord, _ = rig
+    coord.web_api.fail = {"a.example": TimeoutError("timed out")}
+    with pytest.raises(HomeAssistantError, match=r"Done: none\. Failed: a\.example"):
+        await coord.async_allow_website(CHILD, ["a.example"])
+    coord.async_request_refresh.assert_not_awaited()

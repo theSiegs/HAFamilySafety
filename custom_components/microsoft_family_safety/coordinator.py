@@ -2939,13 +2939,33 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_change_websites(
         self, method: str, child_id: str, websites: str | list[str]
     ) -> None:
-        """Send one website change per site (each is its own PATCH)."""
+        """Send one website change per site (each is its own PATCH).
+
+        Every site is tried, also after one fails, and a failure fails the
+        call naming the sites done and the sites failed, so a caller knows
+        exactly which ones to retry.
+        """
         if not self.web_api:
             raise RuntimeError("Web API not initialized")
+        write = getattr(self.web_api, method)
         sites = [websites] if isinstance(websites, str) else list(websites)
+        done: list[str] = []
+        failed: dict[str, str] = {}
         for site in dict.fromkeys(s.strip() for s in sites if s and s.strip()):
-            await getattr(self.web_api, method)(child_id, site)
-        await self.async_request_refresh()
+            try:
+                await write(child_id, site)
+            except Exception as err:  # noqa: BLE001 - reported with the others
+                failed[site] = str(err)[:200]
+            else:
+                done.append(site)
+        if done:
+            await self.async_request_refresh()
+        if failed:
+            raise HomeAssistantError(
+                f"{method}: {len(failed)} of {len(done) + len(failed)} site(s) failed. "
+                f"Done: {', '.join(done) or 'none'}. Failed: "
+                + "; ".join(f"{site} ({error})" for site, error in failed.items())
+            )
 
     async def async_block_website(self, child_id: str, website: str | list[str]) -> None:
         await self._async_change_websites("block_website", child_id, website)
