@@ -348,6 +348,27 @@ One start/end pair per day of the week, editable from the UI with optimistic upd
 
 > **The `time.*_end` entities are now populated.** They existed before but stayed `unknown` on many accounts because the end of the allowed window was not parsed from Microsoft's response. Interval parsing now reads the `timeline` array and the *last* allowed interval, so both ends of the window are correct. Microsoft's `24:00:00` end-of-day value is clamped to `23:59`.
 
+### Events
+
+| Event | When | Data |
+|-------|------|------|
+| `microsoft_family_safety_request` | A new pending request (more time, an app) appears. Checked on every update; the first update after a start only sets the baseline, and a request must be missing for three updates in a row before it counts as new again | `entry_id`, `account_id`, `first_name`, `request_id`, `type`, `platform`, `app_id`, `app_name`, `requested_time` (as Microsoft gives it) |
+
+```yaml
+automation:
+  - alias: "Tell me about new requests"
+    trigger:
+      - platform: event
+        event_type: microsoft_family_safety_request
+    action:
+      - action: notify.mobile_app_your_phone
+        data:
+          message: >
+            {{ trigger.event.data.first_name }} asks for
+            {{ trigger.event.data.app_name or 'more screen time' }}
+            ({{ trigger.event.data.platform }}).
+```
+
 ---
 
 ## Services
