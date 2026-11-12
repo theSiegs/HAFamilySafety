@@ -24,6 +24,7 @@ from yarl import URL
 
 from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_USER
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.util import dt as dt_util
 
 from custom_components.microsoft_family_safety import coordinator as coordinator_module
 from custom_components.microsoft_family_safety.config_flow import (
@@ -109,10 +110,49 @@ class _Response:
         return None
 
 
-def _answer(method: str, url: URL, body: object) -> _Response | None:
+#: The Xbox overrides in force on xapprove; a create replaces them.
+_XBOX_OVERRIDES: list[dict] = []
+#: app id -> block state of the app activity report; a policy PATCH sets it.
+_APP_BLOCK_STATES: dict[str, str] = {}
+#: The Windows overrides on the mobile /v4 device-limits route; a POST sets them.
+_MOBILE_OVERRIDES: list[dict] = []
+#: Every POST to the mobile /v4 device-limits overrides: (target, overrideType).
+_MOBILE_OVERRIDE_POSTS: list[tuple[str, str]] = []
+
+
+def _mobile_overrides_document() -> dict:
+    return {"lockablePlatforms": [
+        {"appliesTo": "Windows", "overrides": list(_MOBILE_OVERRIDES), "devices": []},
+        {"appliesTo": "Xbox", "overrides": [], "devices": []},
+    ]}
+
+
+def _answer(
+    method: str, url: URL, body: object, headers: dict | None = None
+) -> _Response | None:
     """Microsoft as the mobile client and the Xbox Family Settings client see it."""
     host, path = url.host or "", url.path
     if host == "mobileaggregator.family.microsoft.com":
+        if path == f"/api/v4/devicelimits/{CHILD}/overrides":
+            if (headers or {}).get("Plat-Info") != "ALL":
+                return _Response(400)
+            if method == "POST" and isinstance(body, dict):
+                _MOBILE_OVERRIDE_POSTS.append((body["target"], body["overrideType"]))
+                _MOBILE_OVERRIDES[:] = (
+                    [{"overrideType": "BlockUntil", "validUntil": body["validUntil"]}]
+                    if body["overrideType"] == "BlockUntil" else []
+                )
+            return _Response(200, _mobile_overrides_document())
+        if method == "GET" and path.startswith("/api/v4/activityReport/appUsage/"):
+            return _Response(200, {"appActivity": [
+                {"appId": app_id, "displayName": "App", "blockState": state,
+                 "policy": None, "isLegacyBlocked": False}
+                for app_id, state in _APP_BLOCK_STATES.items()
+            ]})
+        if method == "PATCH" and path.startswith("/api/v3/AppLimits/policies/"):
+            if isinstance(body, dict) and body.get("appId") in _APP_BLOCK_STATES:
+                _APP_BLOCK_STATES[body["appId"]] = body["blockState"]
+            return _Response(204)
         if method == "GET" and path.startswith("/api/v4/devicelimits/schedules/"):
             return _Response(200, MOBILE_SCHEDULES)
         if method == "GET" and path.startswith("/api/v1/WebRestrictions/"):
@@ -140,12 +180,14 @@ def _answer(method: str, url: URL, body: object) -> _Response | None:
         ]})
     if host == "xapprove.xboxlive.com":
         if path.endswith("/overrides/create"):
-            blocked = isinstance(body, dict) and body.get("overrideType") == 2
-            return _Response(200, {"overrides": [
-                {"overrideType": 2, "validUntil": "2099-01-01T00:00:00Z"}
-            ] if blocked else []})
+            kind = body.get("overrideType") if isinstance(body, dict) else None
+            _XBOX_OVERRIDES[:] = (
+                [{"overrideType": kind, "validUntil": body["validUntil"]}]
+                if kind in (1, 2) else []
+            )
+            return _Response(200, {"overrides": list(_XBOX_OVERRIDES)})
         if path.endswith("/overrides"):
-            return _Response(200, {"overrides": []})
+            return _Response(200, {"overrides": list(_XBOX_OVERRIDES)})
         if path.endswith("/screenTimeUsage"):
             return _Response(200, {"dailyScreenTimeEvents": []})
         if path.endswith("/settings/screentime"):
@@ -163,11 +205,18 @@ def transport():
     """
     seen: list[tuple[str, URL]] = []
     refused: list[tuple[str, URL]] = []
+    _XBOX_OVERRIDES.clear()
+    _APP_BLOCK_STATES.clear()
+    _APP_BLOCK_STATES["win32:app"] = "NotBlocked"
+    _MOBILE_OVERRIDES.clear()
+    _MOBILE_OVERRIDE_POSTS.clear()
 
     async def aiohttp_request(self, method, url, *args, **kwargs):
         target = URL(str(url))
         seen.append((method.upper(), target))
-        response = _answer(method.upper(), target, kwargs.get("json"))
+        response = _answer(
+            method.upper(), target, kwargs.get("json"), kwargs.get("headers")
+        )
         if response is None:
             refused.append((method.upper(), target))
             raise aiohttp.ClientConnectionError("not a token API")
@@ -185,11 +234,16 @@ def transport():
 
 
 def _account() -> SimpleNamespace:
+    app = SimpleNamespace(
+        app_id="win32:app", name="App", blocked=False, icon=None, usage=0,
+        block_app=AsyncMock(), unblock_app=AsyncMock(),
+    )
     return SimpleNamespace(
         user_id=CHILD, first_name="Alex", surname="Rivera", profile_picture=None,
         today_screentime_usage=0, average_screentime_usage=0, account_balance=0,
         account_currency="USD", blocked_platforms=[], roster_errors={}, devices=[],
-        applications=[], override_device=AsyncMock(),
+        applications=[app], override_device=AsyncMock(),
+        get_application=lambda app_id: app if app_id == app.app_id else None,
     )
 
 
@@ -297,18 +351,35 @@ async def test_linked_poll_and_every_action_stay_on_the_token_apis(
     await coordinator.async_lock_account(CHILD)
     await coordinator.async_unlock_account(CHILD)
     await coordinator.async_set_policy_enabled(CHILD, False)
+    # Windows goes only through the mobile /v4 overrides, judged by the answer.
     await coordinator.async_lock_platform(CHILD, "Windows")
+    assert coordinator.get_account(CHILD).blocked_platforms == ["Windows"]
     await coordinator.async_unlock_platform(CHILD, "Windows")
+    assert coordinator.get_account(CHILD).blocked_platforms == []
+    assert _MOBILE_OVERRIDE_POSTS == [("Windows", "BlockUntil"), ("Windows", "Cancel")]
+    coordinator.get_account(CHILD).override_device.assert_not_awaited()
     await coordinator.async_lock_platform(CHILD, "Xbox")
     await coordinator.async_unlock_platform(CHILD, "Xbox")
+    until = dt_util.utcnow() + timedelta(minutes=30)
+    assert (await coordinator.async_add_time_bonus(CHILD, "Xbox", until))["added"] is True
+    assert (await coordinator.async_cancel_time_bonus(CHILD, "Xbox"))["cancelled"] is True
     await coordinator.async_set_xbox_screentime_limit(CHILD, 2, 0, 45)
+    await coordinator.async_set_xbox_allowed_hours(CHILD, 2, 8, 0, 20, 0)
     await coordinator.async_set_xbox_schedule_enabled(CHILD, True)
     await coordinator.async_set_app_limits_enabled(CHILD, True)
     await coordinator.async_set_app_time_limit(CHILD, "win32:app", "App", "windows", "01:00:00")
     await coordinator.async_remove_app_time_limit(CHILD, "win32:app", "App", "windows")
-    await coordinator.async_block_website(CHILD, "example.org")
+    assert (await coordinator.async_pause_app(CHILD, ["win32:app"]))["paused"] == ["win32:app"]
+    assert _APP_BLOCK_STATES["win32:app"] == "BlockedAlways"
+    assert (await coordinator.async_resume_app(CHILD))["resumed"] == ["win32:app"]
+    assert _APP_BLOCK_STATES["win32:app"] == "NotBlocked"
+    await coordinator.async_block_app(CHILD, "win32:app")
+    await coordinator.async_unblock_app(CHILD, "win32:app")
+    await coordinator.async_block_website(CHILD, ["example.org", "example.net"])
     await coordinator.async_allow_website(CHILD, "example.com")
     await coordinator.async_remove_website(CHILD, "example.org")
+    sites = await coordinator.async_get_sites(CHILD)
+    assert "https://example.org" in str(sites)
     await coordinator.async_toggle_web_filter(CHILD, True)
     await coordinator.async_set_age_rating(CHILD, 12)
     await coordinator.async_set_acquisition_policy(CHILD, True)
