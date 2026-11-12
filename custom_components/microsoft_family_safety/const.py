@@ -152,6 +152,7 @@ SERVICE_RESTORE_TODAY_ONLY: Final = "restore_today_only"
 SERVICE_PROBE_WINDOWS_EXTRA_TIME: Final = "probe_windows_extra_time"
 SERVICE_PROBE_APP_POLICY: Final = "probe_app_policy"
 SERVICE_PROBE_XBOX_SCHEDULE: Final = "probe_xbox_schedule"
+SERVICE_PROBE_XBOX_UNLINK: Final = "probe_xbox_unlink"
 
 ALL_SERVICES: Final = [
     SERVICE_BLOCK_APP,
@@ -183,6 +184,7 @@ ALL_SERVICES: Final = [
     SERVICE_PROBE_WINDOWS_EXTRA_TIME,
     SERVICE_PROBE_APP_POLICY,
     SERVICE_PROBE_XBOX_SCHEDULE,
+    SERVICE_PROBE_XBOX_UNLINK,
 ]
 
 # Platforms

@@ -188,6 +188,10 @@ probe_windows_extra_time:
           max: 10
           unit_of_measurement: minutes
 
+probe_xbox_unlink:
+  name: Probe Xbox Unlink
+  description: "Diagnostic (administrators only, fork only): forgets the Xbox Family Settings link, to test linking it again."
+
 probe_xbox_schedule:
   name: Probe Xbox Schedule
   description: "Diagnostic (administrators only): returns the raw Xbox Family Settings schedule of one child (GET only)."
