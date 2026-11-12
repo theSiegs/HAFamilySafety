@@ -390,7 +390,7 @@ automation:
 
 ## Services
 
-The integration exposes **23 services**, split between the pyfamilysafety library, the integration's own mobile API calls and the Xbox Family Settings service, plus one to start the sign-in flow on demand.
+The integration exposes **25 services**, split between the pyfamilysafety library, the integration's own mobile API calls and the Xbox Family Settings service, plus one to start the sign-in flow on demand.
 
 Every service that acts on one child takes the child either as `account_id` (the Microsoft user ID, shown in the `user_id` attribute of the child's entities) or as `entity_id`: any Microsoft Family Safety entity of that child or of one of its devices. `device_id` works the same way: the child's Microsoft Family Safety device or one of its physical devices. The account is looked up from the entity or device, so automations need no hard-coded ID. Lists are accepted as long as everything in them belongs to the same child. When `account_id` is given, it wins.
 
@@ -1082,7 +1082,7 @@ Be aware of the following before enabling native authentication:
 - **Renewal depends on the refresh tokens.** The integration renews and stores Microsoft's token rotations by itself. It cannot recover from a revoked login (password change, security review); Home Assistant will prompt you then.
 - **A browser is required to sign in.** Microsoft's OAuth sign-in is interactive (password, MFA). There is no headless sign-in.
 - **Entity IDs changed** — see [Breaking changes](#breaking-changes).
-- **Per-platform lock is unreliable** — Microsoft removed the `override_device` endpoint. Account Lock is the recommended replacement, but it locks all platforms at once.
+- **Per-platform lock can answer an error** — Microsoft's Windows/Mobile override endpoint sometimes answers HTTP 500. The integration reads the overrides back after each lock or unlock and only reports an error when the change really did not apply.
 
 ---
 
@@ -1090,21 +1090,21 @@ Be aware of the following before enabling native authentication:
 
 ### Mobile API — `mobileaggregator.family.microsoft.com`
 
-**Authentication:** OAuth token of the Family Safety app (client `000000000004893A`), refreshed from the stored refresh token. The roster, devices, usage, applications, device overrides and requests go through `pyfamilysafety`; the integration adds:
+**Authentication:** OAuth token of the Family Safety app (client `000000000004893A`), refreshed from the stored refresh token. The roster, devices, usage, applications and requests go through `pyfamilysafety`; the integration adds:
 
 | Method | Endpoint | Description | Used by |
 |--------|----------|-------------|---------|
 | GET / PATCH | `/v4/devicelimits/schedules/{childId}` | Windows and Xbox schedules (allowance and time windows per day, on/off) | `sensor.screen_time_policy`, `number.*_limit`, `time.*_start/end`, `switch.lock`, `switch.screen_time_limits`, `switch.xbox_screen_time_limits` |
-| GET / PATCH | `/v1/WebRestrictions/{childId}` | Web filter and the blocked / allowed sites (`exceptions=true`) | `sensor.web_filter`, `switch.web_filtering`, website services, `get_sites`, `sync_site_list` |
+| GET / PATCH | `/v1/WebRestrictions/{childId}` | Web filter and the blocked / allowed sites (`exceptions=true`); block/allow/remove a website (one operation per site), web filter on/off | `sensor.web_filter`, `switch.web_filtering`, website services, `get_sites`, `sync_site_list` |
 | GET / PATCH | `/v1/ContentRestrictions/{childId}` | Age rating & ask-to-buy | `sensor.web_filter` attributes, services |
 | GET / PATCH | `/v2/AppLimits/settings/{childId}` | "App, feature, and game limits" switch | `switch.app_limits` |
 | PATCH | `/v3/AppLimits/policies/{childId}/{appId}` | Per-app time limits | app time limit services |
 | GET | `/v1/activityreport/webactivity/{childId}` | Websites visited in Edge (`allowStatus=true`, 403 when there is no data) | `sensor.websites_visited` |
 | GET | `/v1/activityreport/searchactivity/{childId}` | Bing searches | `sensor.websites_visited` attributes |
-| GET | `/v4/devicelimits/{childId}/overrides` (`Plat-Info: ALL`) | Active device overrides; the platform name to send is its `appliesTo` (Windows can be listed as `Desktop`) | `switch.lock`, `lock_platform` / `unlock_platform` read-back |
+| GET | `/v4/devicelimits/{childId}/overrides` (`Plat-Info: ALL`) | Active device overrides, read fresh on every poll and around every lock/unlock; the platform name to send is its `appliesTo` (Windows can be listed as `Desktop`) | `switch.lock`, `lock_platform` / `unlock_platform` |
 | POST | `/v4/devicelimits/{childId}/overrides` (`Plat-Info: ALL`) | Lock (`BlockUntil`) or unlock (`Cancel`) Windows/Mobile; body `{target, overrideType, validUntil, culture}` | `lock_platform`, `unlock_platform` |
 
-> The POST answers with the whole overrides document as it stands after the write, and `lock_platform` / `unlock_platform` are judged by that answer: a GET made right after a write can still list the previous state for a while. Microsoft sometimes answers HTTP 500 to a lock or unlock it applied anyway, and has failed a cancel without applying it; after an error, a timeout or an answer without the document, the overrides are read up to three times over a few seconds, and the action succeeds only when a read shows the platform locked (lock) or not locked (unlock); when no read succeeds it fails. A poll answer without the platform list keeps the last known locks. For two minutes after a write, its answer is shown for that platform instead of what the poll reads.
+> The POST answers with the whole overrides document as it stands after the write, and `lock_platform` / `unlock_platform` / Windows `add_time_bonus` / `cancel_time_bonus` are judged by that answer: a GET made right after a write can still list the previous state for a while. Microsoft sometimes answers HTTP 500 to a write it applied anyway, and has failed a cancel without applying it; after an error, a timeout or an answer without the document, the overrides are read up to three times over a few seconds, and the action succeeds only when a read shows the expected state; when no read succeeds it fails. A poll answer without the platform list keeps the last known locks. For two minutes after a write, its answer stands over what a GET says for that platform (the poll, the lock holds, strict mode), so a lagging read is never taken for a parent's change.
 
 ### Xbox Family Settings — `xapprove.xboxlive.com`
 
