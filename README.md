@@ -180,7 +180,7 @@ Service call / entity write
 | App usage sensors per child | 0 – 30 | 0 (off) | How many of each child's most used apps today get an [App Usage](#sensors--per-child-account) sensor; also turns on the [`microsoft_family_safety_app_usage`](#events) event |
 | Strict mode | on / off | off | Places a `lock_platform` lock again when it is cancelled elsewhere; see [Strict mode](#strict-mode) |
 | Allow insecure local HTTP authentication (testing only) | on / off | off | See below |
-| Link the Xbox Family Settings sign-in | on / off | off | Only with Xbox ticked; for when the Connection sensor shows `xbox_family: not_linked`. Opens a Microsoft sign-in through the same temporary proxy as the setup, which picks up the result itself: sign in, close the window, done. Without an HTTPS URL (or the local HTTP option below), or if the sign-in does not finish within 5 minutes, you paste the address of the blank page Microsoft ends on instead |
+| Link the Xbox Family Settings sign-in | on / off | off | Only with Xbox ticked; for when the Connection sensor shows `xbox_family: not_linked`. Opens a Microsoft sign-in through the same temporary proxy as the setup, which picks up the result itself: sign in, close the window, done. A passkey does not work through the proxy (it is tied to Microsoft's address): choose *Sign in another way*. Without an HTTPS URL (or the local HTTP option below), or if the sign-in does not finish within 5 minutes, you paste the address of the blank page Microsoft ends on instead |
 
 #### Who can control the integration
 
