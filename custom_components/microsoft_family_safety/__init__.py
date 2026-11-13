@@ -53,6 +53,7 @@ from .const import (
     SERVICE_RESTORE_TODAY_ONLY,
     SERVICE_SYNC_SITE_LIST,
     SERVICE_PROBE_APP_POLICY,
+    SERVICE_PROBE_XBOX_SCHEDULE,
     CONF_ALLOWED_USERS,
     SCREENTIME_PLATFORMS,
 )
@@ -108,6 +109,10 @@ SERVICE_ADD_TIME_BONUS_SCHEMA = child_schema({
 
 SERVICE_CANCEL_TIME_BONUS_SCHEMA = child_schema({
     vol.Optional("platform", default="Xbox"): _platform("Xbox", "Windows"),
+})
+
+SERVICE_PROBE_XBOX_SCHEDULE_SCHEMA = vol.Schema({
+    vol.Required("account_id"): cv.string,
 })
 
 SERVICE_PROBE_APP_POLICY_SCHEMA = vol.Schema({
@@ -483,6 +488,20 @@ def _register_services(hass: HomeAssistant) -> None:
     hass.services.async_register(
         DOMAIN, SERVICE_PROBE_APP_POLICY, guard_service(hass, probe_app_policy),
         schema=SERVICE_PROBE_APP_POLICY_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
+    )
+
+    async def probe_xbox_schedule(call: ServiceCall) -> dict:
+        """Diagnostic: the raw xapprove schedule of one child (GET only)."""
+        await async_require_admin(hass, call)
+        coordinator = _get_coordinator(hass, call.data["account_id"])
+        if coordinator is None:
+            raise HomeAssistantError("No Microsoft Family Safety coordinator available")
+        return await coordinator.async_probe_xbox_schedule(call.data["account_id"])
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_PROBE_XBOX_SCHEDULE, guard_service(hass, probe_xbox_schedule),
+        schema=SERVICE_PROBE_XBOX_SCHEDULE_SCHEMA,
         supports_response=SupportsResponse.ONLY,
     )
 

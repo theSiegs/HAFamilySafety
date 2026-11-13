@@ -447,6 +447,10 @@ class XboxFamilyAPI:
             self._xsts = None
             self._msa.pop(XAPPROVE_SCOPE, None)
         if status >= 400:
+            _LOGGER.debug(
+                "xapprove %s %s answered %s: %s",
+                method, url.split(".com", 1)[-1], status, text[:500],
+            )
             self.state = "error"
             self.last_error = f"{method} {url.split('.com', 1)[-1]} answered {status}"
             raise XboxFamilyError(self.last_error)
