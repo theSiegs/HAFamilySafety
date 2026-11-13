@@ -356,9 +356,9 @@ async def test_services_default_to_windows(hass, service_coordinator):
         {"account_id": CHILD, "day_of_week": 1, "start_hour": 8, "end_hour": 20},
         blocking=True,
     )
-    service_coordinator.async_set_screentime_limit.assert_awaited_once_with(CHILD, 1, 2, 0, "Windows")
+    service_coordinator.async_set_screentime_limit.assert_awaited_once_with(CHILD, 1, 2, 0, "Windows", False)
     service_coordinator.async_set_screentime_intervals.assert_awaited_once_with(
-        CHILD, 1, 8, 0, 20, 0, "Windows"
+        CHILD, 1, 8, 0, 20, 0, "Windows", False
     )
 
 
@@ -370,7 +370,7 @@ async def test_services_pass_xbox(hass, service_coordinator):
         blocking=True,
     )
     service_coordinator.async_set_screentime_intervals.assert_awaited_once_with(
-        CHILD, 5, 16, 0, 21, 30, "Xbox"
+        CHILD, 5, 16, 0, 21, 30, "Xbox", False
     )
 
 
@@ -390,7 +390,9 @@ async def test_services_take_the_platform_in_any_case(hass, service_coordinator,
         blocking=True,
     )
     # Each service passes on its own canonical spelling.
-    service_coordinator.async_set_screentime_limit.assert_awaited_once_with(CHILD, 1, 2, 0, "Xbox")
+    service_coordinator.async_set_screentime_limit.assert_awaited_once_with(
+        CHILD, 1, 2, 0, "Xbox", False
+    )
     service_coordinator.async_unlock_platform.assert_awaited_once_with(CHILD, "Xbox")
     service_coordinator.async_remove_app_time_limit.assert_awaited_once_with(CHILD, "a", "A", "xbox")
 
