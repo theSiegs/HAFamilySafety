@@ -454,11 +454,8 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         entry = self._update_entry
         if entry is None and self._is_existing_entry_auth_flow():
             entry = self._get_existing_entry()
-        if entry is not None:
-            coordinator = self.hass.data.get(DOMAIN, {}).get(entry.entry_id)
-            xbox_family = getattr(coordinator, "xbox_family", None)
-            if xbox_family is not None and xbox_family.usable:
-                return None
+        if entry is not None and await self._async_xbox_link_usable(entry):
+            return None
         from .auth.native_proxy import async_fetch_oauth_redirect
         from .xbox_family_api import XboxFamilyAPI, build_authorize_url
 
@@ -479,6 +476,24 @@ class FamilySafetyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return None
         _LOGGER.info("Xbox Family Settings linked from the sign-in")
         return str(body["refresh_token"])
+
+    async def _async_xbox_link_usable(self, entry: config_entries.ConfigEntry) -> bool:
+        """Whether ``entry`` already has an Xbox link the sign-in must not replace.
+
+        The link may be another parent's, made from the options. A loaded
+        entry knows whether Microsoft refused it. An entry whose setup failed
+        (its mobile token refused at startup, before this reauth) has no
+        coordinator, so its stored link is read here: a stored token counts as
+        usable, since a refusal is only known once the token has been tried.
+        """
+        from .xbox_family_api import XboxFamilyAPI
+
+        coordinator = self.hass.data.get(DOMAIN, {}).get(entry.entry_id)
+        xbox_family = getattr(coordinator, "xbox_family", None)
+        if xbox_family is None:
+            xbox_family = XboxFamilyAPI(self.hass, entry.entry_id)
+            await xbox_family.async_load()
+        return xbox_family.usable
 
     async def async_step_finish_mobile_proxy(
         self, user_input: dict[str, Any] | None = None
