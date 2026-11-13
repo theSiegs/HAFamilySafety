@@ -39,6 +39,8 @@ DEFAULT_TIMEOUT: Final = 30
 CONF_PLATFORMS: Final = "platforms"
 AVAILABLE_PLATFORMS: Final = ["Windows", "Xbox", "Mobile"]
 DEFAULT_PLATFORMS: Final = ["Windows"]
+#: Platforms whose daily schedule the screen-time actions can write.
+SCREENTIME_PLATFORMS: Final = ["Windows", "Xbox"]
 # Xbox entities (Xbox lock, Xbox schedule and limits). The Xbox lock, play
 # time and limits run on the Xbox Family Settings sign-in (xbox_family_api);
 # off = no Xbox entities and no Xbox Family Settings link.
@@ -146,6 +148,7 @@ SERVICE_PAUSE_APP: Final = "pause_app"
 SERVICE_RESUME_APP: Final = "resume_app"
 SERVICE_ADD_TIME_BONUS: Final = "add_time_bonus"
 SERVICE_CANCEL_TIME_BONUS: Final = "cancel_time_bonus"
+SERVICE_RESTORE_TODAY_ONLY: Final = "restore_today_only"
 
 ALL_SERVICES: Final = [
     SERVICE_BLOCK_APP,
@@ -172,6 +175,7 @@ ALL_SERVICES: Final = [
     SERVICE_RESUME_APP,
     SERVICE_ADD_TIME_BONUS,
     SERVICE_CANCEL_TIME_BONUS,
+    SERVICE_RESTORE_TODAY_ONLY,
 ]
 
 # Platforms
