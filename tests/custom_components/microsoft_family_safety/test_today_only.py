@@ -8,7 +8,7 @@ so each test can check what Microsoft would hold after every step.
 from __future__ import annotations
 
 from datetime import datetime
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from pytest_homeassistant_custom_component.common import (
@@ -328,10 +328,27 @@ async def test_other_day_is_refused(hass, coordinator, schedules):
     assert schedules.writes == [("Windows", WEDNESDAY, FIELD_LIMIT, 180)]
 
 
-async def test_xbox_limit_through_xbox_family_settings(hass, coordinator, schedules, freezer):
+def _with_xbox(coordinator, schedules) -> FakeXboxFamily:
     xbox = FakeXboxFamily(schedules)
     coordinator.xbox_family = xbox
     coordinator._xapprove_xuid_for = AsyncMock(return_value=XUID)
+    coordinator._xapprove_xuid_required = AsyncMock(return_value=XUID)
+    return xbox
+
+
+def _xbox_unavailable(coordinator) -> None:
+    """Xbox Family Settings gone (link refused, lookup failed, ...)."""
+    coordinator._xapprove_xuid_for = AsyncMock(return_value=None)
+    coordinator._xapprove_xuid_required = AsyncMock(
+        side_effect=HomeAssistantError(
+            "Microsoft refused the Xbox Family Settings sign-in: link it again "
+            "from the integration options"
+        )
+    )
+
+
+async def test_xbox_limit_through_xbox_family_settings(hass, coordinator, schedules, freezer):
+    xbox = _with_xbox(coordinator, schedules)
 
     await coordinator.async_set_screentime_limit(CHILD, None, 1, 30, "Xbox", True)
     assert xbox.set_day_calls == [(XUID, WEDNESDAY, 90)]
@@ -345,19 +362,22 @@ async def test_xbox_limit_through_xbox_family_settings(hass, coordinator, schedu
     assert coordinator.today_only.pending(CHILD) == {}
 
 
-async def test_xbox_limit_through_the_mobile_api(hass, coordinator, schedules, freezer):
+async def test_xbox_number_for_another_day_keeps_the_restore(
+    hass, coordinator, schedules, freezer
+):
+    xbox = _with_xbox(coordinator, schedules)
     await coordinator.async_set_screentime_limit(CHILD, None, 0, 45, "Xbox", True)
-    assert schedules.writes == [("Xbox", WEDNESDAY, FIELD_LIMIT, 45)]
-
     # A normal Xbox write (the Xbox number entity) for another day keeps it.
     await coordinator.async_set_xbox_screentime_limit(CHILD, THURSDAY, 2, 0)
     assert "Xbox" in coordinator.today_only.pending(CHILD)
 
     await _midnight(hass, freezer)
-    assert schedules.days[("Xbox", WEDNESDAY)][FIELD_LIMIT] == 120
+    assert xbox.set_day_calls[-1] == (XUID, WEDNESDAY, 120)
+    assert schedules.writes == []  # never the mobile Xbox schedule
 
 
 async def test_xbox_number_cancels_the_xbox_restore(hass, coordinator, schedules, freezer):
+    _with_xbox(coordinator, schedules)
     await coordinator.async_set_screentime_limit(CHILD, None, 0, 45, "Xbox", True)
     await coordinator.async_set_xbox_screentime_limit(CHILD, WEDNESDAY, 2, 30)
     assert coordinator.today_only.pending(CHILD) == {}
@@ -365,12 +385,68 @@ async def test_xbox_number_cancels_the_xbox_restore(hass, coordinator, schedules
     assert schedules.days[("Xbox", WEDNESDAY)][FIELD_LIMIT] == 150
 
 
-def _with_xbox(coordinator, schedules) -> FakeXboxFamily:
+@pytest.mark.parametrize("setup", ["xbox_off", "not_linked", "refused", "lookup_failed"])
+async def test_xbox_today_only_limit_needs_the_xbox_sign_in(
+    hass, coordinator, schedules, setup
+):
+    """Without Xbox Family Settings nothing is written and nothing is kept.
+
+    The console ignores the mobile Xbox schedule: a write there would report
+    success and leave the Xbox as it was.
+    """
     xbox = FakeXboxFamily(schedules)
     coordinator.xbox_family = xbox
+    xbox_features = setup != "xbox_off"
+    if setup == "not_linked":
+        xbox.linked = xbox.usable = xbox.ready = False
+    elif setup == "refused":
+        xbox.usable = False
+    elif setup == "lookup_failed":
+        _xbox_unavailable(coordinator)
+    with patch.object(
+        FamilySafetyDataUpdateCoordinator, "xbox_features",
+        new=property(lambda self: xbox_features),
+    ), pytest.raises(HomeAssistantError, match="Xbox"):
+        await coordinator.async_set_screentime_limit(CHILD, None, 3, 0, "Xbox", True)
+    assert schedules.writes == []
+    assert xbox.set_day_calls == []
+    assert coordinator.today_only.pending(CHILD) == {}
+
+
+async def test_xbox_restore_waits_for_the_xbox_sign_in(hass, coordinator, schedules, freezer):
+    """An Xbox restore that cannot reach Xbox Family Settings is retried.
+
+    It is neither written to the mobile Xbox schedule nor dropped because the
+    mobile Xbox schedule holds another value (it is not the console's).
+    """
+    xbox = _with_xbox(coordinator, schedules)
+    await coordinator.async_set_screentime_limit(CHILD, None, 3, 0, "Xbox", True)
+    assert schedules.days[("Xbox", WEDNESDAY)][FIELD_LIMIT] == 180
+
+    _xbox_unavailable(coordinator)
+    mobile_read = schedules.get_mobile_day
+
+    async def _mobile_day(child_id, day_of_week, platform="Windows"):
+        day = await mobile_read(child_id, day_of_week, platform)
+        if platform == "Xbox":
+            day[FIELD_LIMIT] = 60  # the mobile Xbox schedule, never the console's
+        return day
+
+    schedules.get_mobile_day = _mobile_day
+    await _midnight(hass, freezer)
+    assert schedules.writes == []
+    assert schedules.days[("Xbox", WEDNESDAY)][FIELD_LIMIT] == 180
+    pending = coordinator.today_only.pending(CHILD)
+    assert pending["Xbox"]["restore_limit_minutes"] == 120
+
+    # Back the next poll: put back through Xbox Family Settings.
     coordinator._xapprove_xuid_for = AsyncMock(return_value=XUID)
     coordinator._xapprove_xuid_required = AsyncMock(return_value=XUID)
-    return xbox
+    coordinator.today_only.async_schedule_restore_due({CHILD})
+    await hass.async_block_till_done()
+    assert xbox.set_day_calls[-1] == (XUID, WEDNESDAY, 120)
+    assert schedules.writes == []
+    assert coordinator.today_only.pending(CHILD) == {}
 
 
 async def test_xbox_allowed_hours_today_only_restored_at_midnight(
@@ -425,6 +501,7 @@ async def test_xbox_allowed_hours_need_the_xbox_sign_in(hass, coordinator, sched
 
 
 async def test_restore_now(hass, coordinator, schedules):
+    _with_xbox(coordinator, schedules)
     await coordinator.async_set_screentime_limit(CHILD, None, 3, 0, "Windows", True)
     await coordinator.async_set_screentime_limit(CHILD, None, 1, 0, "Xbox", True)
 
@@ -496,6 +573,7 @@ async def services(hass, coordinator):
 
 
 async def test_services(hass, services, schedules):
+    _with_xbox(services, schedules)
     await hass.services.async_call(
         DOMAIN, "set_screentime_limit",
         {"account_id": CHILD, "hours": 3, "today_only": True}, blocking=True,
@@ -519,7 +597,8 @@ async def test_services(hass, services, schedules):
         await hass.services.async_call(
             DOMAIN, "set_screentime_limit", {"account_id": CHILD, "hours": 3}, blocking=True
         )
-    # Xbox allowed hours need the Xbox Family Settings sign-in (none here).
+    # Xbox allowed hours need the Xbox Family Settings sign-in.
+    _xbox_unavailable(services)
     with pytest.raises(HomeAssistantError, match="Xbox"):
         await hass.services.async_call(
             DOMAIN, "set_screentime_intervals",

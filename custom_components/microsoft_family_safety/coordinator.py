@@ -2033,6 +2033,9 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # --- one day of a platform schedule, for today-only changes --------------
     # Mobile API and Xbox Family Settings only. Reads always ask Microsoft
     # (never the poll cache): the value read decides what midnight writes.
+    # The Xbox goes through Xbox Family Settings only, reads included: the
+    # mobile Xbox schedule is not what the console enforces, so comparing a
+    # restore against it would take the value there for a parent's change.
     def today_only_fields(self, platform: str) -> tuple[str, ...]:
         """Fields of a day that ``async_read_day`` / ``async_write_day`` handle."""
         if platform == "Windows":
@@ -2052,25 +2055,26 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self.web_api is None:
             raise HomeAssistantError("Microsoft Family Safety is not connected")
         if platform == "Xbox":
-            xuid = await self._xapprove_xuid_for(child_id)
-            if xuid is not None:
-                try:
-                    policy = schedule_to_policy(await self.xbox_family.async_get_schedule(xuid))
-                except XboxFamilyError as err:
-                    raise HomeAssistantError(f"Could not read the Xbox schedule: {err}") from err
-                day = (policy.get("dailyRestrictions") or {}).get(DAY_KEYS[day_of_week])
-                if not isinstance(day, dict):
-                    raise HomeAssistantError(
-                        f"The Xbox schedule has no {DAY_KEYS[day_of_week]}"
-                    )
-                hours, minutes = (int(p) for p in str(day["allowance"]).split(":")[:2])
-                # Allowed hours as [begin, end] minutes after midnight.
-                windows = [
-                    [_clock_to_minutes(i.get("begin")), _clock_to_minutes(i.get("end"))]
-                    for i in day.get("allowedIntervals") or []
-                    if isinstance(i, dict)
-                ]
-                return {FIELD_LIMIT: hours * 60 + minutes, FIELD_ALLOWED_HOURS: windows}
+            # Refused (not linked, refused, child not found) rather than read
+            # from the mobile Xbox schedule: a restore then waits and retries.
+            xuid = await self._xapprove_xuid_required(child_id)
+            try:
+                policy = schedule_to_policy(await self.xbox_family.async_get_schedule(xuid))
+            except XboxFamilyError as err:
+                raise HomeAssistantError(f"Could not read the Xbox schedule: {err}") from err
+            day = (policy.get("dailyRestrictions") or {}).get(DAY_KEYS[day_of_week])
+            if not isinstance(day, dict):
+                raise HomeAssistantError(
+                    f"The Xbox schedule has no {DAY_KEYS[day_of_week]}"
+                )
+            hours, minutes = (int(p) for p in str(day["allowance"]).split(":")[:2])
+            # Allowed hours as [begin, end] minutes after midnight.
+            windows = [
+                [_clock_to_minutes(i.get("begin")), _clock_to_minutes(i.get("end"))]
+                for i in day.get("allowedIntervals") or []
+                if isinstance(i, dict)
+            ]
+            return {FIELD_LIMIT: hours * 60 + minutes, FIELD_ALLOWED_HOURS: windows}
         return await self.web_api.get_mobile_day(child_id, day_of_week, platform)
 
     async def async_write_day(

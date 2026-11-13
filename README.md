@@ -707,6 +707,11 @@ How it behaves:
   `set_screentime_intervals`), with the same requirements as above: the Xbox
   Family Settings sign-in linked. The kept value is the day's whole list of
   Xbox time windows.
+- Xbox changes (limit and allowed hours) are read and written through the Xbox
+  Family Settings sign-in only, never the mobile Xbox schedule, which the
+  console ignores. Without it the today-only call fails and nothing is
+  written; a pending Xbox restore waits for it and is retried at each poll
+  (within the 7 days above).
 
 To put the usual values back before midnight:
 
