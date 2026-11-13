@@ -1,7 +1,5 @@
 {
   "name": "Microsoft Family Safety",
   "render_readme": true,
-  "zip_release": true,
-  "filename": "microsoft_family_safety.zip",
   "homeassistant": "2024.7.0"
 }
