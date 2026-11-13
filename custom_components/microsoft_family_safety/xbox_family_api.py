@@ -21,8 +21,8 @@ No device token, title token or request signing is needed on this path
 
 Override types seen on ``/settings/screentime/overrides``: 1 = extra time
 until ``validUntil`` (the app's "add time"), 2 = blocked until ``validUntil``
-(what the web blockUntil lock stores), 100 = sent by the app's "revoke time
-extension" and leaves no override behind.
+(the Xbox lock), 100 = sent by the app's "revoke time extension" and leaves
+no override behind.
 """
 
 from __future__ import annotations
@@ -158,7 +158,7 @@ def schedule_to_policy(schedule: dict[str, Any]) -> dict[str, Any]:
 
 
 def overrides_to_policy(overrides: dict[str, Any]) -> dict[str, Any]:
-    """Express the active xapprove override in the web Xbox policy shape.
+    """Express the active xapprove override as the policy the lock state reads.
 
     ``coordinator._apply_xbox_lock_state`` reads ``screenTimeOverride`` with a
     ``screenTimeOverrideType`` of blockUntil / allowUntil, or no override plus
@@ -252,8 +252,11 @@ class XboxFamilyAPI:
         await self._store.async_remove()
 
     # --- linking -----------------------------------------------------------
-    async def async_link_from_redirect(self, redirect_url: str, verifier: str, via: str) -> None:
-        """Exchange the ``oauth20_desktop.srf?code=...`` redirect for a refresh token."""
+    async def async_exchange_redirect(self, redirect_url: str, verifier: str) -> dict[str, Any]:
+        """Exchange an ``oauth20_desktop.srf?code=...`` redirect; nothing is stored.
+
+        Returns Microsoft's token answer (``refresh_token``, ``access_token``...).
+        """
         query = URL(redirect_url.strip()).query
         if "error" in query:
             raise XboxFamilyAuthError(
@@ -273,6 +276,18 @@ class XboxFamilyAPI:
                 "scope": USER_AUTH_SCOPE,
             }
         )
+        if not body.get("refresh_token"):
+            raise XboxFamilyError("Microsoft returned no refresh token for the Xbox sign-in")
+        return body
+
+    async def async_link_from_redirect(self, redirect_url: str, verifier: str, via: str) -> None:
+        """Exchange the ``oauth20_desktop.srf?code=...`` redirect for a refresh token."""
+        body = await self.async_exchange_redirect(redirect_url, verifier)
+        await self.async_link_refresh_token(body["refresh_token"], via)
+        self._remember_msa(USER_AUTH_SCOPE, body)
+
+    async def async_link_refresh_token(self, refresh_token: str, via: str) -> None:
+        """Store a refresh token obtained elsewhere (the sign-in flow) and use it."""
         # A relink may be another parent account: forget everything derived
         # from the previous token.
         self._msa.clear()
@@ -280,8 +295,7 @@ class XboxFamilyAPI:
         self._user_token = None
         self._parent_xuid = None
         self._family = None
-        self._refresh_token = body["refresh_token"]
-        self._remember_msa(USER_AUTH_SCOPE, body)
+        self._refresh_token = refresh_token
         self.linked_via = via
         self.state = "linked"
         self.last_error = None

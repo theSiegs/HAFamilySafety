@@ -906,9 +906,9 @@ class FamilySafetyScreenTimePolicySensor(FamilySafetyAccountSensor):
 class FamilySafetyConnectionSensor(CoordinatorEntity, SensorEntity):
     """Integration-level connection/health sensor (issue #23).
 
-    Surfaces whether the mobile API and the web (cookie) session are working,
-    so users can see at a glance if the integration is connected, degraded
-    (mobile only, web cookies expired), or disconnected — addressing the
+    Surfaces whether the mobile API and the Xbox Family Settings sign-in are
+    working, so users can see at a glance if the integration is connected,
+    degraded (Xbox sign-in refused), or disconnected — addressing the
     "test connection / connection state" request in issue #23.
     """
 

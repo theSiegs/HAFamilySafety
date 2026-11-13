@@ -21,7 +21,6 @@ from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.microsoft_family_safety import _register_services
 from custom_components.microsoft_family_safety.const import (
-    CONF_WEB_COOKIES,
     CONF_XBOX_FEATURES,
     DOMAIN,
 )
@@ -185,7 +184,7 @@ async def test_missing_day_is_an_error(api):
 async def coordinator(hass):
     entry = MockConfigEntry(
         domain=DOMAIN,
-        data={"refresh_token": "x", CONF_WEB_COOKIES: [{"name": "MSPAuth"}]},
+        data={"refresh_token": "x"},
         options={CONF_XBOX_FEATURES: True},
     )
     entry.add_to_hass(hass)

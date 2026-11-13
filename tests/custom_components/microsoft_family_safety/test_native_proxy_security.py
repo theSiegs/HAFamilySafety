@@ -38,7 +38,9 @@ SSO_REDIRECT = "https://login.live.com/oauth20_authorize.srf?client_id=1&epctrc=
 def proxy() -> MicrosoftFamilyAuthProxy:
     with patch.object(native_proxy, "create_async_httpx_client", return_value=MagicMock()):
         return MicrosoftFamilyAuthProxy(
-            MagicMock(), callback_url=f"{ORIGIN}/auth/microsoft_family_safety/callback?flow_id={FLOW}"
+            MagicMock(),
+            callback_url=f"{ORIGIN}/auth/microsoft_family_safety/callback?flow_id={FLOW}",
+            start_url="https://login.live.com/oauth20_authorize.srf?client_id=1",
         )
 
 
@@ -232,9 +234,10 @@ async def test_redirect_outside_microsoft_is_refused(proxy: MicrosoftFamilyAuthP
         await _redirect(proxy, "https://evil.example/")
 
 
-async def test_marketing_page_moves_on_to_the_next_family_route(
-    proxy: MicrosoftFamilyAuthProxy,
-) -> None:
-    response = await _redirect(proxy, "https://www.microsoft.com/fr-fr/microsoft-365/family-safety")
-    assert "/__ms_host__/account.microsoft.com/family/windows/home/direct" in response.headers["Location"]
-    assert proxy._family_bootstrap_attempts == 1
+async def test_marketing_page_leaves_the_proxy(proxy: MicrosoftFamilyAuthProxy) -> None:
+    # No Family dashboard is bootstrapped any more: Microsoft's product page is
+    # an ordinary Microsoft site for the browser to open.
+    url = "https://www.microsoft.com/fr-fr/microsoft-365/family-safety"
+    response = await _redirect(proxy, url)
+    assert response.headers["Location"] == url
+    assert not proxy.complete

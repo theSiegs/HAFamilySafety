@@ -164,6 +164,7 @@ async def test_add_fails_when_the_overrides_cannot_be_read(coordinator):
 
 async def test_without_the_xbox_link_it_fails_clearly(coordinator):
     coordinator.xbox_family.linked = False
+    coordinator.xbox_family.usable = False
     with pytest.raises(HomeAssistantError, match="Xbox Family Settings sign-in linked"):
         await coordinator.async_add_time_bonus(CHILD, "Xbox", dt_util.utcnow() + timedelta(minutes=5))
     coordinator.xbox_family.async_create_override.assert_not_awaited()
