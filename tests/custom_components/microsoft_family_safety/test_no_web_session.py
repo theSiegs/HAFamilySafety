@@ -22,8 +22,10 @@ import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from yarl import URL
 
+from homeassistant.components import persistent_notification
 from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_USER
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.setup import async_setup_component
 
 from custom_components.microsoft_family_safety import coordinator as coordinator_module
 from custom_components.microsoft_family_safety.config_flow import (
@@ -387,6 +389,35 @@ async def test_first_update_clears_a_stale_auth_notification(hass, transport):
         await coordinator._async_update_data()
         await coordinator._async_update_data()
     dismiss.assert_called_once_with(hass, coordinator_module.AUTH_NOTIFICATION_ID)
+
+
+async def test_manual_reauth_request_is_withdrawn_once_its_flow_is_gone(hass, transport):
+    """request_reauth on a working token: cleared by a good poll after the flow ends."""
+    await async_setup_component(hass, "persistent_notification", {})
+    entry = MockConfigEntry(domain=DOMAIN, data={"refresh_token": "rt"}, options={})
+    entry.add_to_hass(hass)
+    coordinator = FamilySafetyDataUpdateCoordinator(hass, entry)
+    with patch.object(
+        coordinator_module.FamilySafety, "create",
+        AsyncMock(return_value=_fake_family_safety("rt")),
+    ):
+        await coordinator._async_update_data()
+        await coordinator.async_request_reauth()
+        await hass.async_block_till_done()
+        flows = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+        assert len(flows) == 1
+        notification = coordinator_module.AUTH_NOTIFICATION_ID
+        assert notification in persistent_notification._async_get_or_create_notifications(hass)
+
+        # While the sign-in is open, a good poll keeps the request.
+        await coordinator._async_update_data()
+        assert coordinator.connection_state()["reauth_requested"] is True
+        assert notification in persistent_notification._async_get_or_create_notifications(hass)
+
+        hass.config_entries.flow.async_abort(flows[0]["flow_id"])
+        await coordinator._async_update_data()
+    assert coordinator.connection_state()["reauth_requested"] is False
+    assert notification not in persistent_notification._async_get_or_create_notifications(hass)
 
 
 # --- upgrade ---------------------------------------------------------------------
