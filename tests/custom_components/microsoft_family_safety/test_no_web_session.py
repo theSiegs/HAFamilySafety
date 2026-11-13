@@ -597,6 +597,29 @@ async def test_reauth_of_a_legacy_entry_keeps_tokens_only(hass, legacy_entry, si
     assert not set(LEGACY_WEB_AUTH_KEYS) & set(legacy_entry.data)
 
 
+async def test_reauth_after_failed_setup_keeps_the_stored_xbox_link(
+    hass, hass_storage, legacy_entry, sign_in
+):
+    """No coordinator (setup failed on a refused token): the stored link is read."""
+    key = f"{DOMAIN}.xbox.{legacy_entry.entry_id}"
+    _store(hass_storage, key, {"refresh_token": "options-link", "linked_via": "options"})
+    assert legacy_entry.entry_id not in hass.data.get(DOMAIN, {})
+    flow = hass.config_entries.flow
+    result = await flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_REAUTH, "entry_id": legacy_entry.entry_id},
+        data=dict(legacy_entry.data),
+    )
+    result = await flow.async_configure(result["flow_id"], {})
+    result = await _complete(hass, result["flow_id"])
+
+    assert result["type"] == "abort" and result["reason"] == "reauth_successful"
+    assert legacy_entry.data["refresh_token"] == "rt"
+    sign_in.fetch.assert_not_called()
+    assert "xbox_refresh_token" not in legacy_entry.data
+    assert hass_storage[key]["data"]["refresh_token"] == "options-link"
+
+
 @pytest.mark.parametrize(
     ("user_id", "reason", "token"),
     [("parent", "reauth_successful", "manual"), ("someone-else", "wrong_account", "signed-in")],
