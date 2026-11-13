@@ -18,16 +18,13 @@ from homeassistant.core import HomeAssistant
 
 from .const import (
     CONF_ALLOWED_USERS,
-    CONF_API_KEY,
-    CONF_AUTH_URL,
     CONF_AUTH_USER_ID,
     CONF_REDIRECT_URL,
     CONF_REFRESH_TOKEN,
     CONF_TOKEN,
-    CONF_WEB_COOKIES,
-    CONF_WEB_FAMILY_REFERER,
-    CONF_WEB_FAMILY_TOKEN,
+    CONF_XBOX_REFRESH_TOKEN,
     DOMAIN,
+    LEGACY_WEB_AUTH_KEYS,
 )
 
 TO_REDACT = {
@@ -35,11 +32,8 @@ TO_REDACT = {
     CONF_TOKEN,
     CONF_REFRESH_TOKEN,
     CONF_REDIRECT_URL,
-    CONF_WEB_COOKIES,
-    CONF_WEB_FAMILY_TOKEN,
-    CONF_WEB_FAMILY_REFERER,
-    CONF_API_KEY,
-    CONF_AUTH_URL,
+    CONF_XBOX_REFRESH_TOKEN,
+    *LEGACY_WEB_AUTH_KEYS,
     "access_token",
     "cookies",
     # people

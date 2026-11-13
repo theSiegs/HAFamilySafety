@@ -21,7 +21,6 @@ from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.microsoft_family_safety import _register_services
 from custom_components.microsoft_family_safety.const import (
-    CONF_WEB_COOKIES,
     CONF_XBOX_FEATURES,
     DOMAIN,
 )
@@ -185,7 +184,7 @@ async def test_missing_day_is_an_error(api):
 async def coordinator(hass):
     entry = MockConfigEntry(
         domain=DOMAIN,
-        data={"refresh_token": "x", CONF_WEB_COOKIES: [{"name": "MSPAuth"}]},
+        data={"refresh_token": "x"},
         options={CONF_XBOX_FEATURES: True},
     )
     entry.add_to_hass(hass)
@@ -328,6 +327,7 @@ async def test_xbox_limit_entity_still_falls_back_when_not_linked(coordinator):
     # The number entity keeps its behaviour: without xapprove it writes the
     # mobile Xbox schedule as before. Only the services refuse.
     coordinator.xbox_family.linked = False
+    coordinator.xbox_family.usable = False
     await coordinator.async_set_xbox_screentime_limit(CHILD, 1, 1, 0)
     coordinator.web_api.set_mobile_xbox_screentime_allowance.assert_awaited_once_with(CHILD, 1, 1, 0)
 

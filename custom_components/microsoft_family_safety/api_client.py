@@ -1,75 +1,37 @@
 """Microsoft Family Safety API client.
 
-The mobile API uses the refresh token supplied by pyfamilysafety.  Screen-time
-schedule operations use Microsoft's private account web API.  Web cookies may
-come either from the legacy Playwright add-on or from the native browser-assisted
-Home Assistant authentication flow.
+Requests that pyfamilysafety does not cover, sent to the same mobile
+aggregator the Family Safety app uses, on the single refresh-token chain of
+the pyfamilysafety authenticator. Nothing here talks to account.microsoft.com:
+the Family web session (browser cookies, Family dashboard) is not used at
+runtime, so its daily interactive sign-in (#52) no longer concerns the
+integration. Xbox settings go through ``xbox_family_api`` instead.
 """
 from __future__ import annotations
 
 import asyncio
-import base64
 from datetime import datetime, timedelta, timezone
-from html import unescape
-from http.cookies import SimpleCookie
-import json
 import logging
-import re
 import time
 from typing import Any
 from urllib.parse import quote
 
 import aiohttp
-from yarl import URL
 
 from homeassistant.util import dt as dt_util
 
-from ._pyfamilysafety_compat import authenticator_access_token_expired
+from ._pyfamilysafety_compat import (
+    authenticator_access_token_expired,
+    authenticator_authorization_header,
+)
 from .const import DAY_KEYS
 from .mobile_overrides import MOBILE_OVERRIDES_PATH, MOBILE_OVERRIDES_PLAT_INFO
 
 _LOGGER = logging.getLogger(__name__)
 
-#: Xbox activity report (/family/api/xbox/recent-activity/report-v3): fetched at
-#: most once per window per child, and not at all for a while after a timeout or
-#: network error. Microsoft tar-pits this endpoint when it is polled often.
-_XBOX_REPORT_MIN_INTERVAL_SECONDS = 5 * 60
-_XBOX_REPORT_BACKOFF_SECONDS = 30 * 60
-#: A poll interval equal to the window lands a fraction of a second early each
-#: time; without this slack every other poll would be skipped.
-_XBOX_REPORT_SLACK_SECONDS = 30
-#: A child without an Xbox gets 403 (or 404) from the report, and always will.
-#: Backoff after consecutive such answers: 1 h, then 6 h, then 24 h from the
-#: third on; any successful report resets it. Escalating rather than a flat 24 h
-#: so a one-off 403 for a child who does have an Xbox costs an hour, not a day.
-_XBOX_REPORT_NO_DATA_BACKOFF_SECONDS = (60 * 60, 6 * 60 * 60, 24 * 60 * 60)
-
 _BASE_URL = "https://mobileaggregator.family.microsoft.com/api"
 _APP_VERSION = "v 1.26.0.1001"
 _USER_AGENT = f"Family Safety-prod/({_APP_VERSION}) Android/33 google/Pixel 4 XL"
-_BROWSER_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0"
-)
-
-
-#: Cookies issued by Akamai Bot Manager in front of account.microsoft.com.
-#: They are bound to the fingerprint of the browser that obtained them. When
-#: the integration replays them from its own HTTP client, Akamai treats the
-#: session as hijacked and answers with silence (the request hangs until the
-#: read timeout, then the connection is reset) instead of a clean status. That
-#: masks a plain expired session behind 120 s timeouts and 30 min backoffs.
-#: Microsoft's own APIs never need them, so they are dropped everywhere the
-#: integration stores or loads cookies.
-#: How long a Family bootstrap that ended on a login page is taken for granted
-#: before it is retried. Shorter than the smallest poll interval, so every
-#: poll still re-checks once while the other callers in the same poll do not.
-_FAMILY_AUTH_REQUIRED_MEMO_SECONDS = 25.0
-
-_BOT_MANAGER_COOKIE_NAMES: frozenset[str] = frozenset(
-    {"bm_sv", "bm_sz", "bm_mi", "bm_s", "bm_so", "bm_ss", "bm_lso", "ak_bmsc", "_abck", "akavpau_ppsd"}
-)
 
 
 def _parse_iso_utc(value: str) -> datetime | None:
@@ -93,80 +55,6 @@ def _utc_iso(value: Any) -> Any:
     """Give the activity report's naive UTC times an explicit offset (#65)."""
     parsed = _parse_iso_utc(value) if value else None
     return parsed.isoformat() if parsed else value
-
-
-def strip_bot_manager_cookies(cookies: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    """Return ``cookies`` without Akamai Bot Manager entries (see the note above)."""
-    if not cookies:
-        return []
-    kept = [c for c in cookies if str(c.get("name") or "") not in _BOT_MANAGER_COOKIE_NAMES]
-    dropped = len(cookies) - len(kept)
-    if dropped:
-        _LOGGER.debug("Dropped %d Akamai bot-manager cookie(s) from the Family web session", dropped)
-    return kept
-
-
-def _extract_request_verification_token(page: str) -> str | None:
-    """Extract the CSRF token used by account.microsoft.com/family.
-
-    The Playwright add-on obtains this exact value from the hidden DOM input.
-    Keep several fallbacks for older Microsoft page variants.
-    """
-    patterns = (
-        r'<input[^>]+name=["\']__RequestVerificationToken["\'][^>]+value=["\']([^"\']+)',
-        r'<input[^>]+value=["\']([^"\']+)["\'][^>]+name=["\']__RequestVerificationToken["\']',
-        r'"__RequestVerificationToken"\s*:\s*"([^"]+)"',
-    )
-    for pattern in patterns:
-        match = re.search(pattern, page, re.IGNORECASE)
-        if match:
-            return unescape(match.group(1))
-    return None
-
-
-_MSA_CONTINUE_FORM_RE = re.compile(
-    r'<form[^>]*\bname=["\']fmHF["\'][^>]*\baction=["\']([^"\']+)["\'][^>]*>(.*?)</form>',
-    re.IGNORECASE | re.DOTALL,
-)
-_HIDDEN_INPUT_RE = re.compile(
-    r'<input[^>]*\bname=["\']([^"\']+)["\'][^>]*\bvalue=["\']([^"\']*)["\']',
-    re.IGNORECASE,
-)
-
-
-def _extract_msa_continue_form(page: str) -> tuple[str, dict[str, str]] | None:
-    """Return the auto-submit form login.live.com serves while the MSA session is alive.
-
-    account.microsoft.com keeps its own session (``AMCSecAuth``) for about a day.
-    When it lapses, the site bounces to ``login.live.com/login.srf``; with valid
-    Microsoft-account cookies that page is not a sign-in form but a tiny
-    "Continue" document whose ``fmHF`` form a browser posts back to
-    ``/auth/complete-signin`` on its own.  Submitting it re-establishes the
-    account.microsoft.com session without any user interaction, which is what
-    kept the Playwright add-on alive for weeks.  Returns ``None`` for a real
-    sign-in page (email/password fields present) or any form posting elsewhere.
-    """
-    lowered = page.lower()
-    if 'name="loginfmt"' in lowered or 'name="ppft"' in lowered or 'name="passwd"' in lowered:
-        return None
-    match = _MSA_CONTINUE_FORM_RE.search(page)
-    if not match:
-        return None
-    action = unescape(match.group(1))
-    try:
-        target = URL(action)
-    except ValueError:
-        return None
-    if (target.host or "").lower() != "account.microsoft.com" or not target.path.startswith(
-        "/auth/complete-signin"
-    ):
-        return None
-    fields = {
-        unescape(name): unescape(value) for name, value in _HIDDEN_INPUT_RE.findall(match.group(2))
-    }
-    if not fields:
-        return None
-    return action, fields
 
 
 #: Sites and searches kept in the sensor attributes (the raw report is ~30 KB).
@@ -253,9 +141,7 @@ def summarize_web_activity(web: Any, search: Any) -> dict[str, Any]:
 
 
 class FamilySafetyWebAPI:
-    """Combined Microsoft Family mobile and private web API client."""
-
-    WEB_API_BASE = "https://account.microsoft.com"
+    """Mobile aggregator requests beyond pyfamilysafety (schedules, lists, limits)."""
 
     def __init__(
         self, authenticator, session: aiohttp.ClientSession | None = None
@@ -266,165 +152,10 @@ class FamilySafetyWebAPI:
         #: private session is created and closed by close().
         self._shared_session = session
         self._session: aiohttp.ClientSession | None = None
-        self._web_cookies: list[dict[str, Any]] | None = None
-        self._web_csrf: str | None = None
-        self._web_session: aiohttp.ClientSession | None = None
-        self._relationship_tokens: dict[str, tuple[str, int]] = {}
-        self.last_web_error_code: str | None = None
-        #: Interactive step Microsoft inserted into the silent sign-in, e.g.
-        #: "terms_of_use" when updated Terms of Use must be accepted. Such a
-        #: step is a user decision and is never submitted automatically.
-        self.account_interrupt: str | None = None
-        #: Set when an isolated call found the Family session
-        #: rejected, so the coordinator bootstraps again in the same poll.
-        self.family_context_dropped = False
-        #: Set with family_context_dropped and kept until a new token is
-        #: captured, so the rejected token is not persisted and reloaded.
-        self.family_token_rejected = False
-        #: Set once the mobile /v4 schedule API answered; schedules then no
-        #: longer depend on the Family web context.
-        self.mobile_schedule_ok = False
-        #: Browser-like Accept-Language; the coordinator sets it from HA's language.
-        self.accept_language = "en-US,en;q=0.9"
+        #: Outcome of the last Windows schedule read, for the Connection sensor.
+        self.screentime_policy_status: str = "unknown"
         #: child id -> (time.monotonic(), payload) of the last schedules GET.
         self._mobile_schedule_cache: dict[str, tuple[float, dict]] = {}
-        # Keep authentication health separate from endpoint-specific failures.
-        # A private endpoint may return 401/403 while the account.microsoft.com
-        # Family browser session itself is still authenticated.
-        self.web_session_state: str = "unknown"
-        self.web_session_last_checked: int | None = None
-        self.web_session_last_http_status: int | None = None
-        self.screentime_policy_status: str = "unknown"
-        self.screentime_policy_source: str | None = None
-        # Endpoint health is intentionally separate from browser-login health.
-        # A Family dashboard can still be authenticated while one private API
-        # endpoint is timing out or rejecting a request.
-        self.web_api_state: str = "unknown"
-        self.web_api_last_checked: int | None = None
-        self.web_api_last_http_status: int | None = None
-        self.web_api_last_endpoint: str | None = None
-        # A valid Microsoft account session is not enough for the private
-        # Family API.  The Family SPA issues its own request-verification token
-        # in /family/home; keep that context separate from /account health.
-        self.family_context_state: str = "unknown"
-        #: child id -> time.monotonic() before which the Xbox activity report is
-        #: not fetched again (minimum interval, or backoff after a failure).
-        self._xbox_report_next_fetch: dict[str, float] = {}
-        #: child id -> consecutive 403/404 answers from the Xbox report.
-        self._xbox_report_no_data: dict[str, int] = {}
-        #: child id -> time.monotonic() before which the Xbox policy is not read
-        #: again (after a timeout/network error, or a "no Xbox" verdict).
-        self._xbox_policy_next_fetch: dict[str, float] = {}
-        #: Outcome of the last _web_request(isolated=True) call.
-        self.last_isolated_error_code: str | None = None
-        self.family_context_last_checked: int | None = None
-        self.family_context_last_http_status: int | None = None
-        self.family_context_last_path: str | None = None
-        self.family_token_source: str | None = None
-        self._family_referer: str = f"{self.WEB_API_BASE}/family/home"
-        # Once a bootstrap has landed on a login page, retrying it for every
-        # caller in the same poll only repeats the redirect. Remember the
-        # verdict briefly and warn about it once per episode, not per attempt.
-        self._family_auth_required_until: float = 0.0
-        self._family_auth_required_warned = False
-
-    def set_web_cookies(
-        self, cookies: list[dict[str, Any]], *,
-        family_token: str | None = None,
-        family_referer: str | None = None,
-    ) -> None:
-        """Set browser cookies and optional browser-captured Family API context."""
-        cookies = strip_bot_manager_cookies(cookies)
-        same_cookies = cookies == self._web_cookies
-        self._web_cookies = cookies
-        self._web_csrf = family_token or (self._web_csrf if same_cookies else None)
-        self._relationship_tokens.clear()
-        self.last_web_error_code = None
-        self.web_session_state = "unknown" if cookies else "missing"
-        self.web_session_last_checked = None
-        self.web_session_last_http_status = None
-        self.screentime_policy_status = "unknown"
-        self.screentime_policy_source = None
-        self.web_api_state = "unknown"
-        self.web_api_last_checked = None
-        self.web_api_last_http_status = None
-        self.web_api_last_endpoint = None
-        if family_token:
-            self._family_referer = family_referer or f"{self.WEB_API_BASE}/family/home"
-            self.family_context_state = "ready"
-            self.family_context_last_checked = int(time.time())
-            self.family_context_last_http_status = 200
-            self.family_context_last_path = URL(self._family_referer).path
-            self.family_token_source = "auth_proxy"
-        else:
-            self.family_context_state = "unknown" if cookies else "missing"
-            self.family_context_last_checked = None
-            self.family_context_last_http_status = None
-            self.family_context_last_path = None
-            self.family_token_source = None
-            self._family_referer = f"{self.WEB_API_BASE}/family/home"
-        if self._web_session and not self._web_session.closed:
-            session = self._web_session
-            self._web_session = None
-            try:
-                asyncio.get_running_loop().create_task(session.close())
-            except RuntimeError:
-                pass
-        _LOGGER.info(
-            "Web API cookies configured (%d cookies; family_context=%s token_source=%s)",
-            len(cookies or []), self.family_context_state, self.family_token_source,
-        )
-
-    @property
-    def has_web_cookies(self) -> bool:
-        """Return True if web cookies are available."""
-        return bool(self._web_cookies)
-
-    def export_web_cookies(self) -> list[dict[str, Any]]:
-        """Export the currently effective browser cookie jar.
-
-        Microsoft can rotate authentication cookies through Set-Cookie responses.
-        The exported representation is safe to persist in Home Assistant storage
-        and can be restored after a restart.
-        """
-        if self._web_session is None or self._web_session.closed:
-            return strip_bot_manager_cookies(self._web_cookies)
-        # Microsoft sets the same cookie for "host" and ".host"; aiohttp keeps
-        # both and the store grew by a pair per poll. One per (name, host,
-        # path), the ".host" form preferred since it also covers subdomains.
-        exported: dict[tuple[str, str, str], dict[str, Any]] = {}
-        for morsel in self._web_session.cookie_jar:
-            domain = str(morsel["domain"] or "")
-            if not domain or morsel.key in _BOT_MANAGER_COOKIE_NAMES:
-                continue
-            path = str(morsel["path"] or "/")
-            key = (morsel.key, domain.lstrip("."), path)
-            if key in exported and not domain.startswith("."):
-                continue
-            item: dict[str, Any] = {
-                "name": morsel.key,
-                "value": morsel.value,
-                "domain": domain,
-                "path": path,
-                "secure": bool(morsel["secure"]),
-                "httpOnly": bool(morsel["httponly"]),
-            }
-            if morsel["expires"]:
-                item["expires"] = str(morsel["expires"])
-            exported[key] = item
-        return sorted(exported.values(), key=lambda item: (item["domain"], item["path"], item["name"]))
-
-    def export_family_context(self) -> tuple[str | None, str | None]:
-        """Return captured Family antiforgery context for persistence."""
-        return self._web_csrf, self._family_referer
-
-    def sync_web_cookies_from_session(self) -> bool:
-        """Capture any Microsoft Set-Cookie rotations from the live session."""
-        exported = self.export_web_cookies()
-        if not exported or exported == (self._web_cookies or []):
-            return False
-        self._web_cookies = exported
-        return True
 
     #: Per-request timeout of the mobile API (the shared session has none).
     _MOBILE_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
@@ -454,7 +185,7 @@ class FamilySafetyWebAPI:
 
     def _build_headers(self) -> dict[str, str]:
         return {
-            "Authorization": self._authenticator.access_token,
+            "Authorization": authenticator_authorization_header(self._authenticator),
             "User-Agent": _USER_AGENT,
             "X-Requested-With": "com.microsoft.familysafety",
             "Content-Type": "application/json",
@@ -494,8 +225,10 @@ class FamilySafetyWebAPI:
                 await self._authenticator.perform_refresh()
                 headers.update(self._build_headers())
                 return await do_request()
-        except aiohttp.ClientError as err:
-            raise FamilySafetyWebAPIError(f"Mobile API request failed: {err}") from err
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise FamilySafetyWebAPIError(
+                f"Mobile API request failed: {err!r}", transient=True
+            ) from err
 
     async def _handle_response(self, resp: aiohttp.ClientResponse) -> dict | list | None:
         if resp.status in (200, 201, 204):
@@ -512,1197 +245,82 @@ class FamilySafetyWebAPI:
             status=resp.status,
         )
 
-    # ------------------------------------------------------------------
-    # Private web API
-    # ------------------------------------------------------------------
-
-    def _build_cookie_jar(self) -> aiohttp.CookieJar:
-        """Build a cookie jar without losing domain/path/secure semantics."""
-        jar = aiohttp.CookieJar(unsafe=True)
-        for cookie in self._web_cookies or []:
-            name = str(cookie.get("name") or "")
-            value = str(cookie.get("value") or "")
-            domain = str(cookie.get("domain") or "")
-            path = str(cookie.get("path") or "/")
-            if not name or not domain:
-                continue
-
-            simple = SimpleCookie()
-            simple[name] = value
-            morsel = simple[name]
-            morsel["domain"] = domain
-            morsel["path"] = path
-            if cookie.get("secure"):
-                morsel["secure"] = True
-            if cookie.get("httpOnly") or cookie.get("httponly"):
-                morsel["httponly"] = True
-
-            # Supply a host inside the cookie's domain. CookieJar then retains
-            # the Domain attribute rather than turning it into a host-only cookie.
-            host = domain.lstrip(".")
-            jar.update_cookies(simple, response_url=URL(f"https://{host}{path}"))
-        return jar
-
-    def _get_web_session(self) -> aiohttp.ClientSession:
-        if self._web_session is None or self._web_session.closed:
-            self._web_session = aiohttp.ClientSession(
-                cookie_jar=self._build_cookie_jar(),
-                timeout=aiohttp.ClientTimeout(
-                    total=20, connect=8, sock_connect=8, sock_read=15
-                ),
-            )
-        return self._web_session
-
-    def _cookie_value(self, name: str) -> str | None:
-        for cookie in self._web_cookies or []:
-            if str(cookie.get("name", "")).lower() == name.lower():
-                return str(cookie.get("value") or "") or None
-        return None
-
-    def _mark_web_session(self, state: str, http_status: int | None = None) -> None:
-        """Record browser-session health without exposing credentials."""
-        self.web_session_state = state
-        self.web_session_last_checked = int(time.time())
-        self.web_session_last_http_status = http_status
-
-    def _mark_web_api(
-        self, state: str, endpoint: str, http_status: int | None = None
-    ) -> None:
-        """Record private Family web API health separately from login health."""
-        self.web_api_state = state
-        self.web_api_last_checked = int(time.time())
-        self.web_api_last_http_status = http_status
-        self.web_api_last_endpoint = endpoint
-
-    @staticmethod
-    def _is_authentication_url(value: str | URL | None) -> bool:
-        """Return True only for destinations that actually represent login.
-
-        account.microsoft.com/family may legitimately redirect to a public
-        Microsoft Family Safety landing page.  That is a routing/product-page
-        change, not proof that the captured Microsoft account session expired.
-        """
-        if not value:
-            return False
-        try:
-            url = value if isinstance(value, URL) else URL(str(value))
-        except ValueError:
-            return False
-        host = (url.host or "").lower()
-        path = (url.path or "").lower()
-        if host in {
-            "login.live.com",
-            "login.microsoft.com",
-            "login.microsoftonline.com",
-            "device.login.microsoftonline.com",
-            "login-us.microsoftonline.com",
-            "logincert.microsoftonline.com",
-        }:
-            return True
-        return host == "account.microsoft.com" and path.startswith("/auth/")
-
-    async def async_check_web_session(self) -> bool:
-        """Actively verify the stored Microsoft account browser session.
-
-        Cookie presence alone is not proof of authentication.  Verify the same
-        authenticated account destination that the native browser flow itself
-        accepts (/account).  Family private-API reachability is tracked
-        independently in web_api_state and must not be conflated with login
-        health.
-        """
-        if not self._web_cookies:
-            self._mark_web_session("missing")
-            return False
-
-        # Preserve a Family antiforgery token captured by the real browser.
-        # The supplied 2026-08-12 HAR shows that the hidden token from the
-        # Family landing page is reused verbatim by successful /family/api
-        # requests. Previous builds cleared it here before the first API call
-        # and then tried to rebuild the Family SPA context with aiohttp.
-        had_family_token = bool(self._web_csrf)
-        family_source = self.family_token_source
-        family_referer_path = (
-            URL(self._family_referer).path if self._family_referer else None
-        )
-        await self._warm_web_session()
-        authenticated = self.web_session_state == "authenticated"
-
-        if authenticated and had_family_token:
-            _LOGGER.debug(
-                "Microsoft account session verified while preserving browser-captured "
-                "Family context: token_source=%s token_present=%s token_length=%d "
-                "referer_path=%s",
-                family_source,
-                bool(self._web_csrf),
-                len(self._web_csrf or ""),
-                family_referer_path,
-            )
-        elif self.web_session_state in ("missing", "expired"):
-            # Confirmed login loss invalidates browser-derived Family context.
-            self._web_csrf = None
-            self.family_context_state = self.web_session_state
-            self.family_token_source = None
-
-        return authenticated
-
-    async def _warm_web_session(self, *, allow_renewal: bool = True) -> str | None:
-        """Verify the Microsoft account login without sourcing a Family API token.
-
-        The /account page can contain an antiforgery value, but the supplied
-        browser capture shows that private /family/api requests use the hidden
-        __RequestVerificationToken emitted by the Family SPA itself.  Treat the
-        account page only as an authentication-health probe.
-        """
-        if not self._web_cookies:
-            self._mark_web_session("missing")
-            return None
-        headers = {
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": self.accept_language,
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "User-Agent": _BROWSER_USER_AGENT,
-        }
-        try:
-            session = self._get_web_session()
-            async with session.get(
-                f"{self.WEB_API_BASE}/account",
-                headers=headers,
-                allow_redirects=True,
-            ) as resp:
-                status = resp.status
-                final_url = URL(str(resp.url))
-                page = await resp.text()
-                rotated = self.sync_web_cookies_from_session()
-
-            if status in (401, 403) or self._is_authentication_url(final_url):
-                # account.microsoft.com drops its own session after about a
-                # day even though the Microsoft-account cookies stay valid;
-                # a browser re-establishes it by posting the "Continue" form
-                # login.live.com answers with.  Do the same before declaring
-                # the login lost, once per probe.
-                if allow_renewal and await self._async_renew_account_session(
-                    session, page, final_url
-                ):
-                    return await self._warm_web_session(allow_renewal=False)
-                self.last_web_error_code = "LOGIN_REDIRECT"
-                self._mark_web_session("expired", status)
-                _LOGGER.warning(
-                    "Microsoft account session probe requires authentication: "
-                    "final_host=%s final_path=%s status=%s cookies=%d rotated=%s",
-                    final_url.host,
-                    final_url.path,
-                    status,
-                    len(self._web_cookies or []),
-                    rotated,
-                )
-                return None
-
-            if (
-                status != 200
-                or final_url.host != "account.microsoft.com"
-                or not final_url.path.startswith("/account")
-            ):
-                self.last_web_error_code = "UNEXPECTED_SESSION_DESTINATION"
-                self._mark_web_session("error", status)
-                _LOGGER.warning(
-                    "Microsoft account session probe ended at an unexpected "
-                    "destination: final_host=%s final_path=%s status=%s "
-                    "cookies=%d rotated=%s",
-                    final_url.host,
-                    final_url.path,
-                    status,
-                    len(self._web_cookies or []),
-                    rotated,
-                )
-                return None
-
-            # Diagnostic only.  Do NOT use a token from /account for Family
-            # API calls; it is a different antiforgery context.
-            account_token_present = bool(_extract_request_verification_token(page))
-            self.last_web_error_code = None
-            self._mark_web_session("authenticated", status)
-            _LOGGER.debug(
-                "Microsoft account session verified: final_host=%s "
-                "final_path=%s status=%s cookies=%d rotated=%s "
-                "account_antiforgery_present=%s",
-                final_url.host,
-                final_url.path,
-                status,
-                len(self._web_cookies or []),
-                rotated,
-                account_token_present,
-            )
-            return None
-        except asyncio.TimeoutError:
-            self.last_web_error_code = "TIMEOUT"
-            self._mark_web_session("error")
-            _LOGGER.warning("Microsoft account session check timed out")
-            return None
-        except (aiohttp.ClientError, ValueError) as err:
-            self.last_web_error_code = "NETWORK_ERROR"
-            self._mark_web_session("error")
-            _LOGGER.debug("Microsoft account session check failed: %r", err)
-            return None
-
-    def _drop_family_context(self) -> None:
-        """Forget a Family context that an isolated request found rejected.
-
-        Isolated requests (the Xbox endpoints) leave the session state alone so
-        that a child without an Xbox cannot break it. A 401 or a login redirect
-        is different: the Family session itself is gone. Since #64 nothing else
-        uses that session on every poll, so without this the context stayed
-        "ready" and the Xbox features stopped with the entry still "connected".
-        The coordinator re-warms the context on the next poll.
-        """
-        if self.family_context_state == "ready":
-            self.family_context_state = "auth_required"
-            self.family_token_source = None
-        self._web_csrf = None
-        # The coordinator bootstraps again in the same poll.
-        self.family_context_dropped = True
-        self.family_token_rejected = True
-
-    def _note_account_interrupt(self, page: str) -> None:
-        """Record an interactive step Microsoft put in front of the silent sign-in.
-
-        login.live.com uses the same auto-submit "Continue" page for these, but
-        posts it elsewhere: ``account.live.com/tou/accrue`` asks the user to
-        accept updated Microsoft Terms of Use (observed 2026-09-24, every
-        silent renewal failed from then on). Accepting terms is the user's
-        decision, so the page is only reported here, never submitted; the
-        regular reauthentication shows it in the browser.
-        """
-        lowered = (page or "").lower()
-        interrupt: str | None = None
-        if "account.live.com/tou/" in lowered:
-            interrupt = "terms_of_use"
-        elif re.search(r"pageid[\"']?\s*:\s*[\"']i5600\b", lowered) or re.search(
-            r"fproofconfirmationrequired[\"']?\s*:\s*(?:true|1|!0)\b", lowered
-        ):
-            # "Help us protect your account" (MSA page i5600): Microsoft wants
-            # the user to confirm a security proof. Seen on login.live.com's
-            # oauth20_authorize.srf during the Family bootstrap, exactly 24 h
-            # after the last interactive sign-in (#52). The page offers a skip
-            # link, but skipping a security check is the account owner's call
-            # and is never done here.
-            interrupt = "proof_confirm"
-        if interrupt and interrupt != self.account_interrupt:
-            if interrupt == "terms_of_use":
-                _LOGGER.warning(
-                    "Microsoft asks the account to accept updated Terms of Use before "
-                    "the session can be renewed; this needs one interactive sign-in "
-                    "from Home Assistant (reauthentication)"
-                )
-            else:
-                _LOGGER.warning(
-                    "Microsoft asks the account to confirm its security info "
-                    "(\"Help us protect your account\") before the Family session "
-                    "can be renewed; this needs one interactive sign-in, at "
-                    "account.microsoft.com or from Home Assistant (reauthentication)"
-                )
-        # Only ever upgrade the verdict here. A later page without a marker
-        # (the plain "Continue" form, a login page) used to reset a detected
-        # interrupt to None in the middle of the same outage (#52); it is
-        # cleared only once a renewal or the Family context succeeds again.
-        if interrupt:
-            self.account_interrupt = interrupt
-
-    async def _async_renew_account_session(
-        self, session: Any, page: str | None, final_url: URL | None
-    ) -> bool:
-        """Re-establish the account.microsoft.com session from live MSA cookies.
-
-        ``page``/``final_url`` describe a response that ended on a login host.
-        When it already is the login.live.com "Continue" form it is submitted
-        directly; otherwise ``/account`` is loaded first, which is where
-        Microsoft serves that form.  Returns True once account.microsoft.com
-        answered 200 to the completed sign-in.  A real sign-in page (email or
-        password fields) is never submitted; the caller then reports the
-        session as expired as before.  Network errors propagate to the caller.
-        """
-        headers = {
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": self.accept_language,
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "User-Agent": _BROWSER_USER_AGENT,
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Upgrade-Insecure-Requests": "1",
-        }
-        form: tuple[str, dict[str, str]] | None = None
-        if page and final_url is not None and (final_url.host or "").lower() == "login.live.com":
-            form = _extract_msa_continue_form(page)
-            self._note_account_interrupt(page)
-        if form is None:
-            async with session.get(
-                f"{self.WEB_API_BASE}/account", headers=headers, allow_redirects=True
-            ) as resp:
-                probe_status = resp.status
-                probe_url = URL(str(resp.url))
-                probe_page = await resp.text()
-                self.sync_web_cookies_from_session()
-            if (probe_url.host or "").lower() == "login.live.com":
-                form = _extract_msa_continue_form(probe_page)
-                self._note_account_interrupt(probe_page)
-            if form is None:
-                _LOGGER.debug(
-                    "Microsoft account session cannot be renewed silently: "
-                    "final_host=%s final_path=%s status=%s length=%d",
-                    probe_url.host,
-                    probe_url.path,
-                    probe_status,
-                    len(probe_page),
-                )
-                return False
-
-        action, fields = form
-        post_headers = {
-            **headers,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Origin": "https://login.live.com",
-            "Referer": "https://login.live.com/",
-            "Sec-Fetch-Site": "cross-site",
-        }
-        async with session.request(
-            "POST", action, data=fields, headers=post_headers, allow_redirects=True
-        ) as resp:
-            status = resp.status
-            end_url = URL(str(resp.url))
-            await resp.text()
-            rotated = self.sync_web_cookies_from_session()
-
-        renewed = status == 200 and (end_url.host or "").lower() == "account.microsoft.com"
-        if renewed:
-            self.account_interrupt = None
-            _LOGGER.info(
-                "Microsoft account session renewed silently: final_path=%s "
-                "rotated=%s cookies=%d",
-                end_url.path,
-                rotated,
-                len(self._web_cookies or []),
-            )
-        else:
-            _LOGGER.warning(
-                "Microsoft account session silent renewal failed: final_host=%s "
-                "final_path=%s status=%s",
-                end_url.host,
-                end_url.path,
-                status,
-            )
-        return renewed
-
-    async def _warm_family_context(self) -> str | None:
-        """Load the Family SPA and obtain its request-verification token.
-
-        The browser capture uses the hidden token from /family/home (or the
-        Windows direct landing page) on successful /family/api requests.  This
-        token is distinct from antiforgery data exposed by /account.
-        """
-        if not self._web_cookies:
-            self.family_context_state = "missing"
-            return None
-
-        if time.monotonic() < self._family_auth_required_until:
-            self.family_context_state = "auth_required"
-            self.family_token_source = None
-            self.last_web_error_code = "FAMILY_CONTEXT_AUTH_REQUIRED"
-            _LOGGER.debug(
-                "Microsoft Family bootstrap skipped: it ended on a login page "
-                "moments ago and needs browser authentication"
-            )
-            return None
-
-        # Clear stale Family antiforgery state before rebuilding it.
-        self._web_csrf = None
-        headers = {
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": self.accept_language,
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "User-Agent": _BROWSER_USER_AGENT,
-        }
-        candidates = (
-            (
-                f"{self.WEB_API_BASE}/family/windows/home/direct"
-                "?fref=coldstartv2&refd=account.microsoft.com"
-            ),
-            f"{self.WEB_API_BASE}/family/home",
-        )
-        session = self._get_web_session()
-        last_destination: URL | None = None
-        last_status: int | None = None
-        pending = list(candidates)
-        attempt = 0
-        renewal_attempted = False
-        try:
-            while pending:
-                candidate = pending.pop(0)
-                attempt += 1
-                async with session.get(candidate, headers=headers, allow_redirects=True) as resp:
-                    final_url = URL(str(resp.url))
-                    last_destination = final_url
-                    last_status = resp.status
-                    page = await resp.text()
-                    rotated = self.sync_web_cookies_from_session()
-                    self.family_context_last_checked = int(time.time())
-                    self.family_context_last_http_status = resp.status
-                    self.family_context_last_path = final_url.path
-
-                    if resp.status in (401, 403) or self._is_authentication_url(final_url):
-                        # The Family SPA bounces through the same expired
-                        # account.microsoft.com session; renew it once and
-                        # retry the same landing page before giving up.
-                        if not renewal_attempted:
-                            renewal_attempted = True
-                            if await self._async_renew_account_session(session, page, final_url):
-                                pending.insert(0, candidate)
-                                continue
-                        self.family_context_state = "auth_required"
-                        self.family_token_source = None
-                        self.last_web_error_code = "FAMILY_CONTEXT_AUTH_REQUIRED"
-                        # The page itself may name the reason (i5600, terms);
-                        # otherwise Microsoft simply wants an interactive
-                        # sign-in for the Family app, typically
-                        # login.microsoftonline.com/.../authorize?prompt=login
-                        # 24 h after the last one on some accounts (#52, #50).
-                        self._note_account_interrupt(page)
-                        if self.account_interrupt is None:
-                            self.account_interrupt = "signin_required"
-                        # A Family-SPA bootstrap redirect is not proof that the
-                        # independently verified /account session has expired.
-                        # Keep web_session_state untouched and surface this as a
-                        # Family-context problem; the coordinator escalates it to
-                        # reauthentication only once it persists across polls.
-                        self._family_auth_required_until = (
-                            time.monotonic() + _FAMILY_AUTH_REQUIRED_MEMO_SECONDS
-                        )
-                        _LOGGER.log(
-                            logging.DEBUG if self._family_auth_required_warned else logging.WARNING,
-                            "Microsoft Family context requires browser authentication: "
-                            "attempt=%d final_host=%s final_path=%s status=%s rotated=%s; "
-                            "account-session auth state left unchanged",
-                            attempt, final_url.host, final_url.path, resp.status, rotated,
-                        )
-                        self._family_auth_required_warned = True
-                        # Diagnostic markers only (no values): tell an interactive
-                        # sign-in page apart from a prompt=none auto-submit form
-                        # that a browser would post on its own.
-                        lowered = page.lower()
-                        title_start = lowered.find("<title>")
-                        title = (
-                            page[title_start + 7 : lowered.find("</title>", title_start)][:60]
-                            if title_start >= 0
-                            else None
-                        )
-                        _LOGGER.debug(
-                            "Microsoft Family bootstrap login page markers: query_keys=%s "
-                            "prompt=%s title=%r length=%d form=%s code_field=%s "
-                            "error_field=%s interaction_required=%s login_required=%s "
-                            "kmsi=%s",
-                            sorted(final_url.query.keys()),
-                            final_url.query.get("prompt"),
-                            title,
-                            len(page),
-                            "<form" in lowered,
-                            'name="code"' in lowered,
-                            'name="error"' in lowered,
-                            "interaction_required" in lowered,
-                            "login_required" in lowered,
-                            "kmsi" in lowered,
-                        )
-                        return None
-
-                    if (
-                        resp.status == 200
-                        and final_url.host == "account.microsoft.com"
-                        and final_url.path.startswith("/family")
-                    ):
-                        csrf = _extract_request_verification_token(page)
-                        if csrf:
-                            self._web_csrf = csrf
-                            self._family_referer = str(final_url)
-                            self.family_context_state = "ready"
-                            self.family_token_source = "family_page"
-                            self.last_web_error_code = None
-                            self.account_interrupt = None
-                            self._family_auth_required_until = 0.0
-                            self._family_auth_required_warned = False
-                            _LOGGER.debug(
-                                "Microsoft Family API context ready: attempt=%d "
-                                "final_path=%s status=%s cookies=%d rotated=%s "
-                                "token_source=family_page token_length=%d",
-                                attempt,
-                                final_url.path,
-                                resp.status,
-                                len(self._web_cookies or []),
-                                rotated,
-                                len(csrf),
-                            )
-                            return csrf
-
-                        _LOGGER.debug(
-                            "Microsoft Family page loaded but no request-verification token "
-                            "was found: attempt=%d final_path=%s status=%s",
-                            attempt,
-                            final_url.path,
-                            resp.status,
-                        )
-                        continue
-
-                    _LOGGER.debug(
-                        "Microsoft Family context candidate ended elsewhere: "
-                        "attempt=%d final_host=%s final_path=%s status=%s rotated=%s",
-                        attempt,
-                        final_url.host,
-                        final_url.path,
-                        resp.status,
-                        rotated,
-                    )
-
-            self.family_context_state = "unavailable"
-            self.family_token_source = None
-            self.last_web_error_code = "FAMILY_CONTEXT_UNAVAILABLE"
-            _LOGGER.warning(
-                "Could not establish Microsoft Family API context: "
-                "last_host=%s last_path=%s status=%s cookies=%d; "
-                "account-session auth state left unchanged",
-                last_destination.host if last_destination else None,
-                last_destination.path if last_destination else None,
-                last_status,
-                len(self._web_cookies or []),
-            )
-            return None
-        except asyncio.TimeoutError:
-            self.family_context_state = "timeout"
-            self.family_token_source = None
-            self.last_web_error_code = "FAMILY_CONTEXT_TIMEOUT"
-            _LOGGER.warning("Microsoft Family API context warm-up timed out")
-            return None
-        except (aiohttp.ClientError, ValueError) as err:
-            self.family_context_state = "error"
-            self.family_token_source = None
-            self.last_web_error_code = "FAMILY_CONTEXT_NETWORK_ERROR"
-            _LOGGER.warning("Microsoft Family API context warm-up failed: %r", err)
-            return None
-
-    @staticmethod
-    def _decode_relationship_token(value: str) -> dict[str, Any] | None:
-        """Decode only enough JWT metadata to associate a Family token.
-
-        The token is still validated cryptographically by Microsoft.  Local
-        decoding is used solely to select the token whose target PUID matches
-        the child.  Token values are never logged.
-        """
-        if not isinstance(value, str) or value.count(".") != 2:
-            return None
-        try:
-            payload = value.split(".", 2)[1]
-            payload += "=" * ((4 - len(payload) % 4) % 4)
-            decoded = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
-        except (ValueError, TypeError, UnicodeError, json.JSONDecodeError):
-            return None
-        if not isinstance(decoded, dict) or decoded.get("iss") != "urn:microsoft:family":
-            return None
-        return decoded
-
-    def _cache_relationship_tokens(self, payload: object) -> None:
-        """Harvest per-child Family relationship JWTs from web JSON.
-
-        The supplied browser HAR shows that modern device/app endpoints send
-        X-JwtFamilyRelationshipToken.  The token is already present in data
-        loaded before those requests; this recursive scanner deliberately does
-        not depend on Microsoft's private JSON property name.
-        """
-        def walk(value: object):
-            if isinstance(value, dict):
-                for item in value.values():
-                    yield from walk(item)
-            elif isinstance(value, list):
-                for item in value:
-                    yield from walk(item)
-            elif isinstance(value, str):
-                yield value
-
-        for value in walk(payload):
-            claims = self._decode_relationship_token(value)
-            if claims is None:
-                continue
-            child_id = claims.get("t-puid")
-            if child_id is None:
-                continue
-            try:
-                expires = int(claims.get("exp") or 0)
-            except (TypeError, ValueError):
-                expires = 0
-            self._relationship_tokens[str(child_id)] = (value, expires)
-
-    async def _get_relationship_token(self, child_id: str) -> str | None:
-        cached = self._relationship_tokens.get(str(child_id))
-        if cached and (not cached[1] or cached[1] > int(time.time()) + 60):
-            return cached[0]
-
-        # These are the non-privileged calls observed immediately before the
-        # browser starts sending X-JwtFamilyRelationshipToken.  Scan both so
-        # the implementation remains tolerant of Microsoft moving the token.
-        for url, params in (
-            (f"{self.WEB_API_BASE}/family/api/roster", None),
-            (
-                f"{self.WEB_API_BASE}/family/api/landing-page-feeds",
-                {"memberIdList": str(child_id)},
-            ),
-        ):
-            payload = await self._web_request("GET", url, params=params)
-            if payload is not None:
-                self._cache_relationship_tokens(payload)
-            cached = self._relationship_tokens.get(str(child_id))
-            if cached and (not cached[1] or cached[1] > int(time.time()) + 60):
-                return cached[0]
-        return None
-
-    async def _web_request(
-        self,
-        method: str,
-        url: str,
-        params: dict | None = None,
-        json_data: dict | None = None,
-        relationship_child_id: str | None = None,
-        referer_override: str | None = None,
-        isolated: bool = False,
-    ) -> dict | list | None:
-        """Call the private Family web API using the captured browser session.
-
-        isolated=True is for optional endpoints whose failure says nothing about
-        the session (e.g. an Xbox report answering 403 for a child without an
-        Xbox). Such a call never touches family_context_state, the antiforgery
-        token, web_session/web_api health or last_web_error_code, and does not
-        warm the Family context itself; its outcome goes to
-        last_isolated_error_code instead ("HTTP_<status>", "LOGIN_REDIRECT",
-        "TIMEOUT", ...). Cookie rotations are still captured.
-        """
-        # Every outcome below sets its own code; clear the previous one so a
-        # caller inspecting the code after this call never reads a stale value
-        # from an earlier request.
-        def _set_error(code: str | None) -> None:
-            if isolated:
-                self.last_isolated_error_code = code
-            else:
-                self.last_web_error_code = code
-
-        def _no_mark(*_args: Any, **_kwargs: Any) -> None:
-            return None
-
-        mark_session = _no_mark if isolated else self._mark_web_session
-        mark_api = _no_mark if isolated else self._mark_web_api
-        warn = _LOGGER.debug if isolated else _LOGGER.warning
-
-        _set_error(None)
-        if not self._web_cookies:
-            _set_error("NO_WEB_SESSION")
-            return None
-        if not self._web_csrf and isolated:
-            _set_error("NO_FAMILY_CONTEXT")
-            return None
-        if not self._web_csrf:
-            token = await self._warm_family_context()
-            if token is None:
-                endpoint = URL(url).path
-                self._mark_web_api("family_context_unavailable", endpoint)
-                return None
-
-        token = self._web_csrf
-        # Match the successful browser requests more closely.  In particular,
-        # GET calls do not send Origin/Content-Type, while writes do.
-        referer = referer_override or self._family_referer or f"{self.WEB_API_BASE}/family/home"
-        if referer_override is None and params and params.get("childId"):
-            child = str(params["childId"])
-            endpoint_path = URL(url).path
-            if "web-browsing" in endpoint_path or "app" in endpoint_path:
-                referer = f"{self.WEB_API_BASE}/family/settings/windows/{child}/apps"
-            elif "screen-time" in endpoint_path or endpoint_path.endswith("/st"):
-                referer = f"{self.WEB_API_BASE}/family/settings/windows/{child}/devices"
-        headers = {
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": self.accept_language,
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "X-Requested-With": "XMLHttpRequest",
-            "X-AMC-JsonMode": "CamelCase",
-            "Referer": referer,
-            "User-Agent": _BROWSER_USER_AGENT,
-        }
-        if method.upper() not in {"GET", "HEAD"}:
-            headers["Content-Type"] = "application/json"
-            headers["Origin"] = "https://account.microsoft.com"
-        if token:
-            headers["__RequestVerificationToken"] = token
-        if relationship_child_id is not None:
-            relationship_token = await self._get_relationship_token(relationship_child_id)
-            if not relationship_token:
-                _LOGGER.debug(
-                    "No Family relationship token available for child-specific web request"
-                )
-                return None
-            headers["X-JwtFamilyRelationshipToken"] = relationship_token
-
-        session = self._get_web_session()
-        endpoint = URL(url).path
-        started = time.monotonic()
-        try:
-            cookie_count = len(session.cookie_jar.filter_cookies(URL(url)))
-        except Exception:
-            cookie_count = -1
-        _LOGGER.debug(
-            "Family web API request prepared: method=%s endpoint=%s "
-            "family_context=%s token_source=%s token_present=%s "
-            "token_length=%d referer_path=%s cookie_count=%d",
-            method.upper(),
-            endpoint,
-            self.family_context_state,
-            self.family_token_source,
-            bool(token),
-            len(token or ""),
-            URL(referer).path,
-            cookie_count,
-        )
-        try:
-            async with session.request(
-                method,
-                url,
-                headers=headers,
-                params=params,
-                json=json_data,
-                allow_redirects=False,
-            ) as resp:
-                if resp.status in (200, 201, 204):
-                    _set_error(None)
-                    mark_session("authenticated", resp.status)
-                    if isolated:
-                        # A 2xx from a Family endpoint proves the
-                        # session, isolated or not. Since #64 the Xbox calls are
-                        # the only Family requests, and the /account probe is
-                        # deferred while the context is ready, so without this
-                        # the session stayed "unknown" and the entry "degraded".
-                        self._mark_web_session("authenticated", resp.status)
-                    mark_api("ok", endpoint, resp.status)
-                    text = await resp.text()
-                    self.sync_web_cookies_from_session()
-                    if not text:
-                        return {"success": True, "status": resp.status}
-                    try:
-                        payload = await resp.json(content_type=None)
-                    except (aiohttp.ContentTypeError, ValueError):
-                        if text.lstrip().startswith("<"):
-                            # A sign-in or interstitial page answered 200: every
-                            # /family/api endpoint answers JSON, so nothing was done.
-                            _set_error("NON_JSON_2XX")
-                            warn(
-                                "Family web API %s answered an HTML page with status %s; "
-                                "treating it as a failure",
-                                endpoint, resp.status,
-                            )
-                            return None
-                        return {"success": True, "status": resp.status}
-                    self._cache_relationship_tokens(payload)
-                    return payload
-                if resp.status in (301, 302, 303, 307, 308):
-                    self.sync_web_cookies_from_session()
-                    location = resp.headers.get("Location")
-                    try:
-                        destination = URL(location) if location else None
-                        if destination is not None and not destination.is_absolute():
-                            destination = URL(url).join(destination)
-                    except ValueError:
-                        destination = None
-                    if self._is_authentication_url(destination):
-                        _set_error("LOGIN_REDIRECT")
-                        if isolated:
-                            self._drop_family_context()
-                        mark_session("expired", resp.status)
-                        mark_api("auth_redirect", endpoint, resp.status)
-                        warn(
-                            "Family web API redirected to authentication: "
-                            "endpoint=%s destination_host=%s destination_path=%s",
-                            endpoint,
-                            destination.host if destination else None,
-                            destination.path if destination else None,
-                        )
-                    else:
-                        _set_error("HTTP_REDIRECT")
-                        mark_api("redirect", endpoint, resp.status)
-                        warn(
-                            "Family web API returned a non-authentication redirect: "
-                            "endpoint=%s destination_host=%s destination_path=%s; "
-                            "leaving web-session auth state unchanged",
-                            endpoint,
-                            destination.host if destination else None,
-                            destination.path if destination else None,
-                        )
-                    return None
-                body = await resp.text()
-                if isolated:
-                    _set_error(f"HTTP_{resp.status}")
-                    if resp.status == 401:
-                        # A 403/404 on an optional endpoint can
-                        # mean "no Xbox", but a 401 is the Family session itself.
-                        self._drop_family_context()
-                    _LOGGER.debug(
-                        "Optional Family web API endpoint answered %s: %s %s",
-                        resp.status, endpoint, body[:200],
-                    )
-                    return None
-                if resp.status in (401, 403):
-                    self.last_web_error_code = "AUTH_ERROR"
-                    self._mark_web_api("auth_error", endpoint, resp.status)
-                    # A rejected Family request means the captured Family
-                    # context can no longer be trusted, whatever the reason
-                    # (rotated antiforgery token or a session that expired).
-                    # Leaving it "ready" would make the tuning patch keep
-                    # skipping the /account probe, so an expired session would
-                    # never be detected and reauthentication never offered.
-                    # Marking it here lets the next poll re-probe /account,
-                    # which is the only check that can tell the two apart.
-                    if self.family_context_state == "ready":
-                        self.family_context_state = "auth_required"
-                        self.family_token_source = None
-                    # Drop the rejected antiforgery token as well. The
-                    # coordinator persists it and hands it back to
-                    # set_web_cookies on every poll, which would flip the
-                    # context back to "ready" and skip the probe again. With
-                    # the token gone, the next poll probes /account and, if
-                    # the account session is still alive, scrapes a fresh
-                    # token from /family/home on its own.
-                    self._web_csrf = None
-                    try:
-                        applicable_cookie_meta = sorted(
-                            (m.key, str(m["domain"] or ""), str(m["path"] or "/"))
-                            for m in session.cookie_jar
-                            if m.key in session.cookie_jar.filter_cookies(URL(url))
-                        )
-                    except Exception:
-                        applicable_cookie_meta = []
-                    _LOGGER.debug(
-                        "Family web API applicable cookie metadata on auth rejection: %s",
-                        applicable_cookie_meta,
-                    )
-                    _LOGGER.warning(
-                        "Family web API authentication rejected: status=%s endpoint=%s "
-                        "token_source=%s token_present=%s token_length=%d "
-                        "referer_path=%s cookie_count=%d body=%s",
-                        resp.status,
-                        endpoint,
-                        self.family_token_source,
-                        bool(token),
-                        len(token or ""),
-                        URL(referer).path,
-                        cookie_count,
-                        body[:200],
-                    )
-                else:
-                    self.last_web_error_code = f"HTTP_{resp.status}"
-                    self._mark_web_api("http_error", endpoint, resp.status)
-                    _LOGGER.warning("Web API error %s on %s: %s", resp.status, endpoint, body[:200])
-                return None
-        except asyncio.TimeoutError:
-            elapsed = time.monotonic() - started
-            _set_error("TIMEOUT")
-            mark_api("timeout", endpoint)
-            # A private endpoint timeout is not proof that the Microsoft browser
-            # login expired. Preserve web_session_state from the independent
-            # /family probe and expose endpoint health separately.
-            warn(
-                "Family web API request timed out after %.1fs: %s %s",
-                elapsed,
-                method,
-                endpoint,
-            )
-            return None
-        except aiohttp.ClientError as err:
-            _set_error("NETWORK_ERROR")
-            mark_api("network_error", endpoint)
-            warn("Web API request failed on %s: %s", endpoint, err)
-            return None
-
-    @staticmethod
-    def _normalize_screentime_policy(
-        payload: object, child_id: str, *, require_child_match: bool = False
-    ) -> dict | None:
-        """Normalize current Family web screen-time payloads.
-
-        Microsoft exposes the schedule in several response shapes.  Prefer a
-        policy associated with the requested child, but also accept a single
-        unambiguous policy anywhere in the response.  This is intentionally
-        tolerant because landing-page-feeds has changed its member wrapper
-        fields over time while the actual timeRestrictions/dailyRestrictions
-        object has remained stable.
-
-        Set ``require_child_match`` when the result will be used to overwrite
-        the schedule (lock/unlock).  In a multi-child family a response holding
-        exactly one policy could belong to a *different* child; accepting it
-        there would store the wrong schedule as this child's restore point.
-        """
-        if not isinstance(payload, (dict, list)):
-            return None
-
-        def as_policy(value: object) -> dict | None:
-            if not isinstance(value, dict):
-                return None
-            daily = value.get("dailyRestrictions") or value.get("DailyRestrictions")
-            if not isinstance(daily, dict) or not daily:
-                return None
-            normalized = dict(value)
-            normalized["dailyRestrictions"] = daily
-            if "isEnabled" not in normalized:
-                if "enabled" in normalized:
-                    normalized["isEnabled"] = normalized.get("enabled")
-                elif "Enabled" in normalized:
-                    normalized["isEnabled"] = normalized.get("Enabled")
-            return normalized
-
-        child = str(child_id)
-
-        # Prefer the exact landing-page-feeds shape confirmed by the supplied
-        # browser HAR before falling back to generic recursive discovery.
-        # This was the path that originally populated the weekday entities.
-        if isinstance(payload, dict):
-            for list_key in ("exceptionRequestsV0", "exceptionRequests"):
-                members = payload.get(list_key)
-                if not isinstance(members, list):
-                    continue
-                for member in members:
-                    if not isinstance(member, dict):
-                        continue
-                    member_id = (
-                        member.get("id")
-                        or member.get("childId")
-                        or member.get("memberId")
-                        or member.get("userId")
-                    )
-                    if str(member_id or "") != child:
-                        continue
-                    for key in ("timeRestrictions", "TimeRestrictions"):
-                        if policy := as_policy(member.get(key)):
-                            return policy
-
-        id_keys = (
-            "id", "Id", "childId", "ChildId", "memberId", "MemberId",
-            "userId", "UserId", "puid", "Puid", "user_id", "member_id",
-        )
-        matched: list[dict] = []
-        candidates: list[dict] = []
-        seen: set[int] = set()
-
-        def add_candidate(policy: dict, owner: dict | None = None) -> None:
-            marker = id(policy)
-            if marker in seen:
-                return
-            seen.add(marker)
-            candidates.append(policy)
-            if owner:
-                for key in id_keys:
-                    raw = owner.get(key)
-                    if raw is not None and str(raw) == child:
-                        matched.append(policy)
-                        break
-
-        def walk(value: object, owner: dict | None = None) -> None:
-            if isinstance(value, dict):
-                if policy := as_policy(value):
-                    add_candidate(policy, owner or value)
-                # timeRestrictions is usually owned by the surrounding member
-                # object, so preserve that owner while descending into it.
-                for key, item in value.items():
-                    next_owner = value if key in ("timeRestrictions", "TimeRestrictions") else owner
-                    walk(item, next_owner)
-            elif isinstance(value, list):
-                for item in value:
-                    walk(item, owner)
-
-        walk(payload)
-        if matched:
-            return matched[0]
-
-        if require_child_match:
-            # Callers that are about to overwrite the schedule (lock/unlock)
-            # ask for this. Guessing there would mean saving another child's
-            # policy as this child's restore point, so refuse instead.
-            _LOGGER.debug(
-                "No screen-time policy explicitly matched child %s and "
-                "child matching was required; ignoring %d unmatched candidate(s)",
-                child,
-                len(candidates),
-            )
-            return None
-
-        if len(candidates) == 1:
-            return candidates[0]
-
-        # Retain the old direct/wrapper behavior as a final deterministic
-        # fallback for response shapes where recursive ownership is ambiguous.
-        if isinstance(payload, dict):
-            if policy := as_policy(payload):
-                return policy
-            for key in ("timeRestrictions", "TimeRestrictions", "data", "Data"):
-                candidate = payload.get(key)
-                if policy := as_policy(candidate):
-                    return policy
-                if isinstance(candidate, dict):
-                    for nested_key in ("timeRestrictions", "TimeRestrictions"):
-                        if policy := as_policy(candidate.get(nested_key)):
-                            return policy
-        return None
-
-    async def get_screentime_policy(
-        self, child_id: str, platform: str = "Windows",
-        *, require_child_match: bool = False,
-    ) -> dict | None:
-        """Get and normalize a child's screen-time policy via the Family web API.
-
-        The supplied browser HAR and the earlier working integration build both
-        confirm landing-page-feeds as a source of dailyRestrictions. Prefer it
-        first so a slow/unstable /st endpoint cannot prevent weekday entities
-        from being populated. /st remains a compatibility fallback.
-        """
-        self.screentime_policy_status = "checking"
-        self.screentime_policy_source = None
-        if not self._web_cookies:
-            self.screentime_policy_status = "missing_session"
-            return None
-
-        feed = await self._web_request(
-            "GET",
-            f"{self.WEB_API_BASE}/family/api/landing-page-feeds",
-            params={"memberIdList": str(child_id)},
-        )
-        policy = self._normalize_screentime_policy(
-            feed, child_id, require_child_match=require_child_match
-        )
-        if policy is not None:
-            self.screentime_policy_status = "ok"
-            self.screentime_policy_source = "landing_page_feeds"
-            _LOGGER.debug("Loaded screen-time weekday policy via Family landing-page-feeds")
-            return policy
-
-        feed_error = self.last_web_error_code
-        if feed_error == "LOGIN_REDIRECT":
-            self.screentime_policy_status = "session_expired"
-            return None
-        if feed_error == "TIMEOUT":
-            self.screentime_policy_status = "web_api_timeout"
-            return None
-        if feed_error == "NETWORK_ERROR":
-            self.screentime_policy_status = "web_api_network_error"
-            return None
-
-        # Compatibility fallback for accounts where landing-page-feeds does not
-        # expose the schedule. Do not retry it after a transport timeout, since
-        # that only multiplies coordinator latency without adding information.
-        st_url = f"{self.WEB_API_BASE}/family/api/st"
-        result = await self._web_request("GET", st_url, params={"childId": child_id})
-        policy = self._normalize_screentime_policy(
-            result, child_id, require_child_match=require_child_match
-        )
-        if policy is not None:
-            self.screentime_policy_status = "ok"
-            self.screentime_policy_source = "st"
-            _LOGGER.debug("Loaded screen-time weekday policy via Family /st endpoint")
-            return policy
-
-        if self.last_web_error_code == "LOGIN_REDIRECT":
-            self.screentime_policy_status = "session_expired"
-        elif self.last_web_error_code == "TIMEOUT":
-            self.screentime_policy_status = "web_api_timeout"
-        elif self.last_web_error_code == "NETWORK_ERROR":
-            self.screentime_policy_status = "web_api_network_error"
-        elif self.web_session_state == "authenticated":
-            self.screentime_policy_status = "no_policy_data"
-        elif self.web_session_state == "expired":
-            self.screentime_policy_status = "session_expired"
-        else:
-            self.screentime_policy_status = f"session_{self.web_session_state}"
-
-        if isinstance(feed, dict):
-            _LOGGER.debug(
-                "Family landing-page-feeds contained no usable weekday policy; top-level keys=%s",
-                sorted(str(k) for k in feed.keys())[:30],
-            )
-        else:
-            _LOGGER.debug(
-                "Family landing-page-feeds contained no usable weekday policy (type=%s, error=%s)",
-                type(feed).__name__,
-                feed_error,
-            )
-        return None
-
-    async def set_screentime_allowance(
-        self, child_id: str, day_of_week: int, hours: int, minutes: int
-    ) -> bool:
-        result = await self._web_request(
-            "POST",
-            f"{self.WEB_API_BASE}/family/api//st/day-allow",
-            json_data={
-                "childId": str(child_id),
-                "dayOfWeek": int(day_of_week),
-                "timeSpanDays": 0,
-                "timeSpanHours": int(hours),
-                "timeSpanMinutes": int(minutes),
-            },
-        )
-        if result is None:
-            raise FamilySafetyWebAPIError("Native screen-time allowance update failed")
-        return True
-
-    async def set_screentime_intervals(
-        self, child_id: str, day_of_week: int, allowed_intervals: list[bool]
-    ) -> bool:
-        if len(allowed_intervals) != 48:
-            raise ValueError("allowed_intervals must contain exactly 48 values")
-        result = await self._web_request(
-            "POST",
-            f"{self.WEB_API_BASE}/family/api//st/day-allow-int",
-            json_data={
-                "childId": str(child_id),
-                "dayOfWeek": int(day_of_week),
-                "allowedIntervals": allowed_intervals,
-            },
-        )
-        if result is None:
-            raise FamilySafetyWebAPIError("Native screen-time interval update failed")
-        return True
-
-    # ------------------------------------------------------------------
-    # Mobile API reads / writes retained from upstream
-    # ------------------------------------------------------------------
-
     async def get_web_browsing_settings(self, child_id: str) -> dict | None:
-        """Get web-browsing restrictions.
+        """Web filter settings with the blocked and allowed sites.
 
-        The current account.microsoft.com Family UI loads this data through the
-        authenticated Family web session, not through the mobile aggregator.
-        Prefer the browser endpoint whenever web credentials are available. This
-        also avoids Authentication.BadCompactTicket responses observed from the
-        mobile WebRestrictions endpoint after an otherwise successful OAuth
-        refresh.
-
-        Keep the mobile endpoint only as a compatibility fallback for legacy
-        installations that do not have a captured web session.
+        Without ``exceptions=true`` the sites come back as an empty list (the
+        Family Safety app always asks for them, #64). ``blockedSites`` and
+        ``allowedSites`` are derived from them for the Web Filter sensor.
         """
-        if self._web_cookies:
-            _LOGGER.debug(
-                "Fetching web browsing settings via account.microsoft.com Family web API"
-            )
-            result = await self._web_request(
-                "GET",
-                f"{self.WEB_API_BASE}/family/api/settings/web-browsing",
-                params={"childId": str(child_id)},
-            )
-            return result if isinstance(result, dict) else None
-
         result = await self._request(
-            "GET", f"/v1/WebRestrictions/{child_id}"
+            "GET", f"/v1/WebRestrictions/{child_id}", params={"exceptions": "true"}
         )
+        if not isinstance(result, dict):
+            return None
+        exceptions = result.get("exceptions")
+        if isinstance(exceptions, list):
+            sites = [e for e in exceptions if isinstance(e, dict) and e.get("website")]
+            result.setdefault("blockedSites", [e["website"] for e in sites if not e.get("allowed")])
+            result.setdefault("allowedSites", [e["website"] for e in sites if e.get("allowed")])
+        return result
+
+    async def get_screentime_policy(self, child_id: str) -> dict | None:
+        """The child's Windows schedule from the mobile API, or None.
+
+        Never raises: the outcome is kept in ``screentime_policy_status`` for
+        the Connection sensor ("ok", "no_policy_data", "network_error" or
+        "error").
+        """
+        try:
+            policy = await self.get_mobile_screentime_policy(child_id)
+        except FamilySafetyWebAPIError as err:
+            self.screentime_policy_status = "network_error" if err.transient else "error"
+            _LOGGER.debug("Mobile screen-time schedule read failed: %s", err)
+            return None
+        except Exception as err:  # noqa: BLE001 - a malformed answer must not stop the poll
+            self.screentime_policy_status = "error"
+            _LOGGER.debug("Mobile screen-time schedule read failed: %r", err)
+            return None
+        self.screentime_policy_status = "ok" if policy is not None else "no_policy_data"
+        return policy
+
+    @staticmethod
+    def parse_block_until(payload: object) -> datetime | None:
+        """Pull an active blockUntil expiry out of an overrides payload.
+
+        Shape is from the captured POST *response*:
+            {"data":{"screenTimeOverrides":[
+                {"screenTimeOverrideType":"blockUntil","validUntil":"…Z"}]}}
+
+        Deliberately tolerant: returns None on anything unrecognised, which
+        callers read as "unknown", never as "not blocked".
+        """
+        if not isinstance(payload, dict):
+            return None
+        data = payload.get("data")
+        container = data if isinstance(data, dict) else payload
+        overrides = container.get("screenTimeOverrides")
+        if not isinstance(overrides, list):
+            return None
+        for entry in overrides:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("screenTimeOverrideType", "")).lower() != "blockuntil":
+                continue
+            raw = entry.get("validUntil")
+            if not isinstance(raw, str):
+                continue
+            parsed = _parse_iso_utc(raw)
+            if parsed is not None:
+                return parsed
+        return None
+
+    async def get_content_settings(self, child_id: str) -> dict | None:
+        result = await self._request("GET", f"/v1/ContentRestrictions/{child_id}")
+        return result if isinstance(result, dict) else None
+
+    async def get_devices(self, child_id: str) -> dict | None:
+        result = await self._request("GET", f"/v1/devices/{child_id}")
         return result if isinstance(result, dict) else None
 
     async def get_web_restrictions(self, child_id: str) -> dict:
@@ -1718,19 +336,6 @@ class FamilySafetyWebAPI:
         if not isinstance(result, dict):
             raise FamilySafetyWebAPIError("WebRestrictions read returned no data")
         return result
-
-    async def get_device_overrides(self, child_id: str) -> dict | None:
-        """Get device/platform overrides, preferring the current web route."""
-        if self._web_cookies:
-            result = await self._web_request(
-                "GET",
-                f"{self.WEB_API_BASE}/family/api/device-limits/screentime-time-override",
-                params={"childId": str(child_id)},
-                relationship_child_id=str(child_id),
-            )
-            if isinstance(result, dict):
-                return result
-        return await self.get_mobile_device_overrides(child_id)
 
     async def get_mobile_device_overrides(self, child_id: str) -> dict:
         """The child's device-limits overrides from the mobile API, read fresh.
@@ -1772,325 +377,11 @@ class FamilySafetyWebAPI:
             extra_headers={"Plat-Info": MOBILE_OVERRIDES_PLAT_INFO},
         )
 
-    # Each platform has its OWN override endpoint.  They are not one endpoint
-    # parameterised by platformType -- Xbox lives under an /xbox/ path segment,
-    # and posting an Xbox override to the Windows path is accepted, stored, and
-    # never reaches the console.  Browser-captured 2026-09-20; both bodies were
-    # byte-for-byte verified against their Content-Length.
-    _PLATFORM_OVERRIDE_PATHS = {
-        "windows": "/family/api/device-limits/screentime-time-override",
-        "xbox": "/family/api/xbox/device-limits/screentime-time-override",
-    }
-
-    # The Windows routes authenticate child-scoped calls with
-    # X-JwtFamilyRelationshipToken.  The captured Xbox requests carry no such
-    # header, and _web_request ABORTS (returns None) when it is asked for a
-    # relationship token it cannot obtain -- so requesting one for Xbox would
-    # turn a working call into a silent no-op.
-    _PLATFORM_OVERRIDE_NEEDS_RELATIONSHIP_TOKEN = {"windows"}
-
-    @classmethod
-    def supports_platform_override(cls, platform: str) -> bool:
-        """True if this platform has a known, working web override endpoint."""
-        return platform.lower() in cls._PLATFORM_OVERRIDE_PATHS
-
-    async def set_platform_time_override(
-        self, child_id: str, platform: str, time_override: str, date_time: str
-    ) -> bool:
-        """Set/cancel a screen-time override for one platform.
-
-        Browser-captured request body (Xbox, blockUntil), 117 bytes:
-            {"childId":"…","platformType":"xbox",
-             "timeOverride":"blockUntil","dateTime":"2026-09-20T22:59:59.461Z"}
-
-        Identical in shape to the Windows body -- only platformType and the URL
-        path differ.
-        """
-        if time_override not in {"blockUntil", "cancel"}:
-            raise ValueError("time_override must be 'blockUntil' or 'cancel'")
-        key = platform.lower()
-        path = self._PLATFORM_OVERRIDE_PATHS.get(key)
-        if path is None:
-            raise ValueError(
-                f"No screen-time override endpoint is known for platform {platform!r}. "
-                f"Known: {sorted(self._PLATFORM_OVERRIDE_PATHS)}"
-            )
-        result = await self._web_request(
-            "POST",
-            f"{self.WEB_API_BASE}{path}",
-            json_data={
-                "childId": str(child_id),
-                "platformType": key,
-                "timeOverride": time_override,
-                "dateTime": date_time,
-            },
-            relationship_child_id=(
-                str(child_id)
-                if key in self._PLATFORM_OVERRIDE_NEEDS_RELATIONSHIP_TOKEN
-                else None
-            ),
-            # Windows keeps the Referer it has always sent; the Xbox one is the
-            # Xbox settings page the browser capture shows.
-            referer_override=(
-                None
-                if key == "windows"
-                else self._platform_settings_referer(key, child_id)
-            ),
-            # The Xbox routes answer 403 for a child without an Xbox; that must
-            # not be read as a Family authentication failure. Windows keeps its
-            # existing behaviour.
-            isolated=key != "windows",
-        )
-        if result is None:
-            detail = (
-                f" ({self.last_isolated_error_code})"
-                if key != "windows" and self.last_isolated_error_code
-                else ""
-            )
-            raise FamilySafetyWebAPIError(
-                f"{platform} screen-time override web request failed{detail}"
-            )
-        return True
-
-    async def set_windows_time_override(
-        self, child_id: str, time_override: str, date_time: str
-    ) -> bool:
-        """Backwards-compatible wrapper -- prefer set_platform_time_override."""
-        return await self.set_platform_time_override(
-            child_id, "windows", time_override, date_time
-        )
-
-    def _platform_settings_referer(self, platform: str, child_id: str) -> str:
-        """Referer the Family web UI sends for this platform's settings page."""
-        return (
-            f"{self.WEB_API_BASE}/family/settings/{platform.lower()}"
-            f"/{child_id}/devices"
-        )
-
-    @staticmethod
-    def parse_block_until(payload: object) -> datetime | None:
-        """Pull an active blockUntil expiry out of an overrides payload.
-
-        Shape is from the captured POST *response*:
-            {"data":{"screenTimeOverrides":[
-                {"screenTimeOverrideType":"blockUntil","validUntil":"…Z"}]}}
-
-        Deliberately tolerant: returns None on anything unrecognised, which
-        callers read as "unknown", never as "not blocked".
-        """
-        if not isinstance(payload, dict):
-            return None
-        data = payload.get("data")
-        container = data if isinstance(data, dict) else payload
-        overrides = container.get("screenTimeOverrides")
-        if not isinstance(overrides, list):
-            return None
-        for entry in overrides:
-            if not isinstance(entry, dict):
-                continue
-            if str(entry.get("screenTimeOverrideType", "")).lower() != "blockuntil":
-                continue
-            raw = entry.get("validUntil")
-            if not isinstance(raw, str):
-                continue
-            parsed = _parse_iso_utc(raw)
-            if parsed is not None:
-                return parsed
-        return None
-
-    async def get_xbox_screentime_policy(self, child_id: str) -> dict | None:
-        """Read the Xbox policy, which carries the current Xbox override.
-
-        GET /family/api/xbox/screen-time-xbox?childId=...  (browser-captured)
-            {"data":{"isEnabled":true,"isBlocked":false,
-                     "dailyRestrictions":[...],
-                     "screenTimeOverride":{"screenTimeOverrideType":"cancel",
-                         "validUntil":"...+00:00","lastModified":"..."}}}
-
-        Used for the lock state: it is what the console enforces, and it
-        survives a Home Assistant restart and reflects a block or release made
-        in the Family Safety app. Returns the full payload (with the "data"
-        wrapper); the coordinator keeps it on the account data as
-        "xbox_policy" for anything else that needs the Xbox schedule.
-
-        Returns None when the read is skipped or fails. It is skipped while the
-        child has a "no Xbox" verdict (see _note_no_xbox_data). This endpoint
-        answers 200 even for a child without an Xbox, so a success here never
-        clears that verdict; a 403/404 still feeds it. A timeout or network
-        error backs this read off for _XBOX_REPORT_BACKOFF_SECONDS.
-        """
-        if not self._web_cookies:
-            return None
-        key = str(child_id)
-        now = time.monotonic()
-        if now < self._xbox_policy_next_fetch.get(key, 0.0):
-            return None
-        result = await self._web_request(
-            "GET",
-            f"{self.WEB_API_BASE}/family/api/xbox/screen-time-xbox",
-            params={"childId": key},
-            referer_override=self._platform_settings_referer("xbox", child_id),
-            # Read every poll for every child: a 403 for a child without an
-            # Xbox must not count as a Family authentication failure.
-            isolated=True,
-        )
-        if not isinstance(result, dict):
-            code = self.last_isolated_error_code
-            if code in ("HTTP_403", "HTTP_404"):
-                self._note_no_xbox_data(key, code, "Xbox policy")
-            elif code in ("TIMEOUT", "NETWORK_ERROR"):
-                self._xbox_policy_next_fetch[key] = now + _XBOX_REPORT_BACKOFF_SECONDS
-            return None
-        # A 200 here does NOT clear the "no Xbox" verdict: this endpoint
-        # answers 200 even for a child without an Xbox (observed in review of
-        # #56). Only a successful Xbox activity report clears it.
-        return result
-
-    def has_no_xbox_data(self, child_id: str) -> bool:
-        """True while this child is backed off because Microsoft has no Xbox
-        data for it (403/404 from the Xbox report or the Xbox policy)."""
-        return bool(self._xbox_report_no_data.get(str(child_id)))
-
-    def _note_no_xbox_data(self, key: str, code: str, source: str) -> None:
-        """Back both Xbox reads off for a child Microsoft has no Xbox data for.
-
-        Fed by a 403/404 from the Xbox report (and from the Xbox policy, should
-        it ever answer one): the child has no Xbox, so neither read is worth
-        asking again soon. 1 h, then 6 h, then 24 h. Only a successful Xbox
-        activity report resets it -- the policy answers 200 for a child
-        without an Xbox too, so its success says nothing.
-        """
-        misses = self._xbox_report_no_data.get(key, 0)
-        self._xbox_report_no_data[key] = misses + 1
-        delays = _XBOX_REPORT_NO_DATA_BACKOFF_SECONDS
-        seconds = delays[min(misses, len(delays) - 1)]
-        until = time.monotonic() + seconds
-        self._xbox_report_next_fetch[key] = until
-        self._xbox_policy_next_fetch[key] = until
-        _LOGGER.info(
-            "%s answered %s for child %s (no Xbox data for this child); not "
-            "asking for Xbox data again for %d h",
-            source, code[5:], key, seconds // 3600,
-        )
-
-    async def get_content_settings(self, child_id: str) -> dict | None:
-        result = await self._request("GET", f"/v1/ContentRestrictions/{child_id}")
-        return result if isinstance(result, dict) else None
-
-    async def get_devices(self, child_id: str) -> dict | None:
-        result = await self._request("GET", f"/v1/devices/{child_id}")
-        return result if isinstance(result, dict) else None
-
-    async def get_xbox_screentime_usage(
-        self, child_id: str, time_zone: str, target_date: str
-    ) -> int | None:
-        """Return today's Xbox screen-time usage in minutes from the web report.
-
-        Reads /family/api/xbox/recent-activity/report-v3 (isPreviousWeek=false =
-        current week) and picks the day matching target_date (local YYYY-MM-DD).
-
-        Returns None when the report is not fetched this time -- inside the
-        per-child minimum interval or a backoff -- or the fetch fails; the
-        coordinator keeps the last same-day value in that case.
-
-        Microsoft tar-pits this endpoint when it is polled often (the request is
-        accepted but the body never arrives, hanging ~120 s). The wait is capped
-        at 20 s, and a timeout or network error backs this child off for
-        _XBOX_REPORT_BACKOFF_SECONDS, so a throttled endpoint is not hit again
-        on every poll.
-
-        The call is isolated (see _web_request): a child without an Xbox gets
-        403, which must not be read as a Family authentication failure. 403/404
-        back that child off per _XBOX_REPORT_NO_DATA_BACKOFF_SECONDS.
-        """
-        if not self._web_cookies:
-            return None
-        key = str(child_id)
-        now = time.monotonic()
-        if now < self._xbox_report_next_fetch.get(key, 0.0) - _XBOX_REPORT_SLACK_SECONDS:
-            return None
-        self._xbox_report_next_fetch[key] = now + _XBOX_REPORT_MIN_INTERVAL_SECONDS
-        try:
-            result = await asyncio.wait_for(
-                self._web_request(
-                    "GET",
-                    f"{self.WEB_API_BASE}/family/api/xbox/recent-activity/report-v3",
-                    params={
-                        "childId": key,
-                        "isPreviousWeek": "false",
-                        "timeZone": time_zone or "UTC",
-                    },
-                    isolated=True,
-                ),
-                timeout=20,
-            )
-        except asyncio.TimeoutError:
-            self._back_off_xbox_report(key, "hit the 20 s cap", _XBOX_REPORT_BACKOFF_SECONDS)
-            return None
-        except Exception as err:  # noqa: BLE001 - keep the poll healthy
-            _LOGGER.debug("Xbox activity report fetch failed: %r", err)
-            return None
-        if result is None:
-            code = self.last_isolated_error_code
-            if code in ("HTTP_403", "HTTP_404"):
-                self._note_no_xbox_data(key, code, "Xbox activity report")
-            elif code in ("TIMEOUT", "NETWORK_ERROR"):
-                self._back_off_xbox_report(
-                    key, code.lower().replace("_", " "), _XBOX_REPORT_BACKOFF_SECONDS
-                )
-            return None
-        self._xbox_report_no_data.pop(key, None)
-        return self._extract_daily_usage_minutes(result, target_date)
-
-    def _back_off_xbox_report(self, key: str, reason: str, seconds: int) -> None:
-        """Skip the Xbox activity report for this child for a while."""
-        self._xbox_report_next_fetch[key] = time.monotonic() + seconds
-        _LOGGER.info(
-            "Xbox activity report %s for child %s; not fetching it again for %s "
-            "(last value kept)",
-            reason, key,
-            f"{seconds // 3600} h" if seconds >= 3600 else f"{seconds // 60} min",
-        )
-
-    @staticmethod
-    def _extract_daily_usage_minutes(payload: object, target_date: str) -> int | None:
-        """Pull the target day's total from a recent-activity report payload."""
-        if not isinstance(payload, dict):
-            return None
-        data = payload.get("data")
-        if not isinstance(data, dict):
-            return None
-        events = data.get("dailyScreenTimeEvents")
-        if not isinstance(events, list):
-            return None
-        for event in events:
-            if not isinstance(event, dict):
-                continue
-            if str(event.get("date") or "")[:10] == target_date:
-                return FamilySafetyWebAPI._duration_to_minutes(event.get("timeUsed"))
-        return None
-
-    @staticmethod
-    def _duration_to_minutes(value: object) -> int | None:
-        """Convert Microsoft 'HH:MM:SS' duration to whole minutes."""
-        if not isinstance(value, str):
-            return None
-        parts = value.split(":")
-        try:
-            hours = int(parts[0])
-            minutes = int(parts[1]) if len(parts) > 1 else 0
-            seconds = int(parts[2]) if len(parts) > 2 else 0
-        except (ValueError, IndexError):
-            return None
-        return hours * 60 + minutes + (1 if seconds >= 30 else 0)
-
     # ------------------------------------------------------------------
     # Mobile schedule API (/v4/devicelimits/schedules), as used by the
-    # Family Safety iOS app 2.1.0. It runs on the long-lived mobile refresh
-    # token, so it keeps working when the Family web context demands its
-    # daily interactive sign-in (prompt=login, #52). GET needs ``culture``
-    # and ``time`` (local ISO time with offset); both calls need Plat-Info.
-    # Allowances are milliseconds, intervals are {begin, end} "HH:MM:SS".
+    # Family Safety iOS app 2.1.0. GET needs ``culture`` and ``time`` (local
+    # ISO time with offset); both calls need Plat-Info. Allowances are
+    # milliseconds, intervals are {begin, end} "HH:MM:SS".
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -2199,21 +490,11 @@ class FamilySafetyWebAPI:
         return summarize_web_activity(web, search)
 
     async def get_mobile_screentime_policy(self, child_id: str, platform: str = "Windows") -> dict | None:
-        """Return the child's schedule in the shape the entities read (allowance "HH:MM:SS").
-
-        ``mobile_schedule_ok`` silences the daily web reauth, so it turns true
-        only once a policy was actually produced and false on any failure.
-        """
-        try:
-            schedule = self._mobile_platform_schedule(
-                await self._get_mobile_schedules(child_id), platform
-            )
-            result = self._convert_mobile_schedule(schedule) if schedule else None
-        except Exception:
-            self.mobile_schedule_ok = False
-            raise
-        self.mobile_schedule_ok = result is not None
-        return result
+        """Return the child's schedule in the shape the entities read (allowance "HH:MM:SS")."""
+        schedule = self._mobile_platform_schedule(
+            await self._get_mobile_schedules(child_id), platform
+        )
+        return self._convert_mobile_schedule(schedule) if schedule else None
 
     @classmethod
     def _convert_mobile_schedule(cls, schedule: dict) -> dict | None:
@@ -2241,8 +522,7 @@ class FamilySafetyWebAPI:
 
         Accounts in "PerDeviceType" mode have a separate Xbox schedule, which
         is what the console enforces. It comes back in the Windows GET, so a
-        payload fetched moments ago in the same poll is reused. Never touches
-        ``mobile_schedule_ok``: that flag is about the Windows schedule.
+        payload fetched moments ago in the same poll is reused.
         """
         payload = await self._get_mobile_schedules(child_id, max_age=30.0)
         schedule = self._mobile_platform_schedule(payload, "Xbox")
@@ -2598,16 +878,20 @@ class FamilySafetyWebAPI:
             and not self._session.closed
         ):
             await self._session.close()
-        if self._web_session and not self._web_session.closed:
-            await self._web_session.close()
         self._session = None
-        self._web_session = None
 
 
 class FamilySafetyWebAPIError(Exception):
-    """Exception raised for API errors."""
+    """Exception raised for API errors.
 
-    def __init__(self, message: str = "", status: int | None = None) -> None:
+    ``transient`` marks a network failure or timeout (Microsoft did not
+    answer), as opposed to an answer that refused the request.
+    """
+
+    def __init__(
+        self, message: str = "", status: int | None = None, *, transient: bool = False
+    ) -> None:
         super().__init__(message)
         #: The HTTP status Microsoft answered, when it answered.
         self.status = status
+        self.transient = transient

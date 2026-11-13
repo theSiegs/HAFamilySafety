@@ -1,9 +1,11 @@
 """Native browser-assisted Microsoft Family Safety authentication.
 
-The user's regular browser renders Microsoft's login pages while Home Assistant
-acts as a short-lived reverse proxy.  Microsoft session cookies stay in the
-server-side httpx cookie jar and are exported only after the Family dashboard
-has been reached.  Passwords and MFA values are never persisted or logged.
+The user's regular browser renders Microsoft's mobile OAuth sign-in while Home
+Assistant acts as a short-lived reverse proxy. The flow ends on the
+``oauth20_desktop.srf`` redirect, whose code becomes the mobile refresh token.
+Microsoft session cookies stay in the server-side httpx cookie jar for the
+lifetime of the flow only. Passwords and MFA values are never persisted or
+logged.
 """
 from __future__ import annotations
 
@@ -30,7 +32,6 @@ from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import UnknownFlow
 from homeassistant.helpers.httpx_client import create_async_httpx_client
 
-from ..api_client import _BOT_MANAGER_COOKIE_NAMES
 from ..const import AUTH_PROXY_LIFETIME_SECONDS, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
@@ -60,6 +61,12 @@ _MICROSOFT_DOMAIN_ROOTS = ("live.com", "microsoft.com", "microsoftonline.com")
 #: Query parameter carrying a whole upstream query, see _hide_query_from_filter.
 _HIDDEN_QUERY = "__ms_q"
 _PROXY_LIFETIME_SECONDS = AUTH_PROXY_LIFETIME_SECONDS
+#: Cookies issued by Akamai Bot Manager in front of Microsoft's sites. They are
+#: bound to the fingerprint of the browser that obtained them and make Microsoft
+#: hang up on any other client that replays them, so they are never exported.
+_BOT_MANAGER_COOKIE_NAMES: frozenset[str] = frozenset(
+    {"bm_sv", "bm_sz", "bm_mi", "bm_s", "bm_so", "bm_ss", "bm_lso", "ak_bmsc", "_abck", "akavpau_ppsd"}
+)
 
 _AUTH_COOKIE_NAMES = {
     "MSPAuth",
@@ -174,24 +181,6 @@ def _reveal_url_query(url: str) -> str:
         return url
 
 
-def _extract_family_request_verification_token(page: str) -> str | None:
-    """Extract the Family SPA antiforgery token without logging its value."""
-    # The supplied browser HAR shows that successful /family/api requests use
-    # the hidden __RequestVerificationToken from the authenticated Family SPA.
-    # Do not accept generic apiCanary/canary values here: they can look valid
-    # but belong to a different antiforgery context and result in HTTP 401.
-    patterns = (
-        r"<input[^>]+name=[\"']__RequestVerificationToken[\"'][^>]+value=[\"']([^\"']+)",
-        r"<input[^>]+value=[\"']([^\"']+)[\"'][^>]+name=[\"']__RequestVerificationToken[\"']",
-        r'"__RequestVerificationToken"\s*:\s*"([^"]+)"',
-    )
-    for pattern in patterns:
-        match = re.search(pattern, page, re.IGNORECASE)
-        if match:
-            return html.unescape(match.group(1))
-    return None
-
-
 def _cookie_dict(cookie: Any) -> dict[str, Any]:
     """Serialize a CookieJar cookie into the Playwright-compatible shape."""
     result: dict[str, Any] = {
@@ -218,8 +207,7 @@ class MicrosoftFamilyAuthProxy:
         *,
         callback_url: str,
         token: str | None = None,
-        start_url: str = "https://account.microsoft.com/",
-        completion_mode: str = "web",
+        start_url: str,
         initial_cookies: list[dict[str, Any]] | None = None,
     ) -> None:
         self.hass = hass
@@ -232,17 +220,9 @@ class MicrosoftFamilyAuthProxy:
         self.proxy_path = f"{AUTH_PROXY_PATH}/{self.token}"
         self._start_url = URL(start_url)
         self._last_url = self._start_url
-        self._completion_mode = completion_mode
         self._oauth_redirect_url: str | None = None
         self._complete = False
-        self._completion_event = asyncio.Event()
-        self._family_wait_started = False
-        self._family_wait_flow_notified = False
         self._flow_id = URL(callback_url).query.get("flow_id")
-        self._web_recovery_attempts = 0
-        self._family_bootstrap_attempts = 0
-        self._family_request_verification_token: str | None = None
-        self._family_referer: str | None = None
         self._closed = False
         self._expiry_task: asyncio.Task | None = None
         self._discovered_hosts: set[str] = set()
@@ -313,9 +293,8 @@ class MicrosoftFamilyAuthProxy:
                 _LOGGER.debug("Could not preload Microsoft auth cookie %s: %s", name, err)
 
         _LOGGER.debug(
-            "Created native Microsoft Family auth proxy: mode=%s start=%s%s "
+            "Created native Microsoft Family auth proxy: start=%s%s "
             "initial_cookie_count=%d",
-            self._completion_mode,
             self._start_url.host,
             self._start_url.path,
             len(initial_cookies or []),
@@ -325,31 +304,18 @@ class MicrosoftFamilyAuthProxy:
     def complete(self) -> bool:
         return self._complete
 
-    @property
-    def family_wait_started(self) -> bool:
-        """Return whether visible sign-in is done and Family SSO is running."""
-        return self._family_wait_started
-
-    async def async_wait_until_complete(self) -> None:
-        """Wait until this proxy has completed its browser authentication work."""
-        if self._complete:
-            return
-        await self._completion_event.wait()
-
     def _mark_complete(self) -> None:
-        """Mark the browser authentication phase complete and wake waiters."""
+        """Mark the browser authentication phase complete."""
         self._complete = True
-        self._completion_event.set()
 
     def _capture_oauth_redirect(self, url: URL, source: str) -> None:
-        """In oauth mode, the registered desktop redirect ends the proxy.
+        """The registered desktop redirect ends the proxy.
 
         Capture the code (or error) and send the browser to the callback
         instead of letting it navigate to the desktop page.
         """
         if not (
-            self._completion_mode == "oauth"
-            and url.host == "login.live.com"
+            url.host == "login.live.com"
             and url.path == "/oauth20_desktop.srf"
             and ("code" in url.query or "error" in url.query)
         ):
@@ -369,56 +335,6 @@ class MicrosoftFamilyAuthProxy:
             )
         raise web.HTTPFound(location=self.callback_url)
 
-    def _start_family_wait_ui(self) -> None:
-        """Move the HA external step to its native progress UI once per flow."""
-        if self._completion_mode != "web":
-            return
-        self._family_wait_started = True
-        if self._family_wait_flow_notified or not self._flow_id:
-            return
-        self._family_wait_flow_notified = True
-        flow_id = self._flow_id
-
-        async def _advance_flow_to_progress() -> None:
-            from homeassistant.data_entry_flow import UnknownFlow
-
-            try:
-                current = self.hass.config_entries.flow.async_get(flow_id)
-            except UnknownFlow:
-                return
-            if current.get("step_id") != "check_mobile_proxy":
-                _LOGGER.debug(
-                    "Microsoft Family HA progress handoff skipped: flow_id=%s "
-                    "current_step=%s",
-                    flow_id, current.get("step_id"),
-                )
-                return
-            try:
-                result = await self.hass.config_entries.flow.async_configure(
-                    flow_id=flow_id,
-                    user_input={"family_wait_started": True},
-                )
-            except UnknownFlow:
-                return
-            except Exception:
-                _LOGGER.exception(
-                    "Could not move Microsoft Family auth flow %s to native "
-                    "Home Assistant progress step",
-                    flow_id,
-                )
-                return
-            result_type = getattr(result.get("type"), "value", result.get("type"))
-            _LOGGER.debug(
-                "Microsoft Family auth flow moved toward HA progress UI: "
-                "flow_id=%s result_type=%s step_id=%s",
-                flow_id, result_type, result.get("step_id"),
-            )
-
-        self.hass.async_create_task(
-            _advance_flow_to_progress(),
-            "Microsoft Family Safety HA progress handoff",
-        )
-
     @property
     def flow_id(self) -> str | None:
         return self._flow_id
@@ -432,23 +348,8 @@ class MicrosoftFamilyAuthProxy:
         """Return the intercepted Microsoft desktop OAuth redirect URL."""
         return self._oauth_redirect_url
 
-    @property
-    def family_request_verification_token(self) -> str | None:
-        """Return the Family SPA antiforgery token captured in the browser."""
-        return self._family_request_verification_token
-
-    @property
-    def family_referer(self) -> str | None:
-        """Return the Family SPA page that supplied the antiforgery token."""
-        return self._family_referer
-
     def export_cookies(self) -> list[dict[str, Any]]:
-        """Return only Microsoft/Live cookies required by the web session.
-
-        Akamai bot-manager cookies are excluded: they are bound to the user's
-        browser fingerprint and make Microsoft hang up on any other client that
-        replays them (see ``api_client.strip_bot_manager_cookies``).
-        """
+        """Return the Microsoft/Live cookies of this sign-in, without bot-manager ones."""
         cookies: list[dict[str, Any]] = []
         for cookie in self._client.cookies.jar:
             if cookie.name in _BOT_MANAGER_COOKIE_NAMES:
@@ -473,10 +374,6 @@ class MicrosoftFamilyAuthProxy:
         # (auto_cleanup=False), so call the httpx class implementation directly.
         await httpx.AsyncClient.aclose(self._client)
 
-    def _has_authenticated_cookie_set(self) -> bool:
-        found = {cookie.name for cookie in self._client.cookies.jar}
-        return len(found & _AUTH_COOKIE_NAMES) >= 2
-
     def diagnostic_summary(self) -> dict[str, Any]:
         """Return a secret-free diagnostic snapshot for auth-flow logging."""
         exported = self.export_cookies()
@@ -484,15 +381,9 @@ class MicrosoftFamilyAuthProxy:
             1 for cookie in self._client.cookies.jar if cookie.name in _AUTH_COOKIE_NAMES
         )
         return {
-            "mode": self._completion_mode,
             "complete": self._complete,
             "exported_cookie_count": len(exported),
             "auth_cookie_count": auth_cookie_count,
-            "web_recovery_attempts": self._web_recovery_attempts,
-            "family_bootstrap_attempts": self._family_bootstrap_attempts,
-            "family_token_present": bool(self._family_request_verification_token),
-            "family_token_length": len(self._family_request_verification_token or ""),
-            "family_referer_path": (URL(self._family_referer).path if self._family_referer else None),
             "last_host": self._last_url.host if self._last_url else None,
             "last_path": self._last_url.path if self._last_url else None,
         }
@@ -1282,27 +1173,6 @@ class MicrosoftFamilyAuthProxy:
             current.path,
         )
 
-        def _next_family_bootstrap_target() -> str | None:
-            # The supplied 2026-08-12 browser HAR reaches the authenticated Family
-            # SPA through complete-silent-signin -> /family/windows/home/direct.
-            # The hidden token from that page is then reused by successful Family
-            # API calls. Reproduce that route first so Microsoft can establish any
-            # Family-specific compact-ticket/session state before token capture.
-            targets = (
-                "https://account.microsoft.com/family/windows/home/direct?fref=coldstartv2&refd=account.microsoft.com",
-                "https://account.microsoft.com/family/windows/coldstart?refd=account.microsoft.com",
-                "https://account.microsoft.com/family/home",
-            )
-            if self._family_bootstrap_attempts >= len(targets):
-                return None
-            target = targets[self._family_bootstrap_attempts]
-            self._family_bootstrap_attempts += 1
-            proxied = self._proxyize_url(
-                target, str(current), proxy_origin, allow_relative=False,
-                source="family browser bootstrap",
-            )
-            return proxied if proxied != target else None
-
         # Preserve Microsoft's redirect state in the real browser. Silent SSO
         # callbacks rely on browser-visible navigation/location semantics;
         # following redirects inside Home Assistant collapses that state and can
@@ -1316,28 +1186,6 @@ class MicrosoftFamilyAuthProxy:
                 if not _is_microsoft_host(resolved.host):
                     _LOGGER.warning("Microsoft auth redirected to unexpected host %s", resolved.host)
                     raise web.HTTPBadGateway(text="Unexpected Microsoft authentication redirect")
-                # The marketing page ends a Family landing route: never serve it,
-                # go on with the next route in the same tab.
-                if (
-                    self._completion_mode == "web"
-                    and resolved.host == "www.microsoft.com"
-                    and "family-safety" in resolved.path
-                ):
-                    next_target = _next_family_bootstrap_target()
-                    if next_target:
-                        _LOGGER.debug(
-                            "Family browser bootstrap reached Microsoft marketing page; "
-                            "trying next Family landing route in same tab (%d/3)",
-                            self._family_bootstrap_attempts,
-                        )
-                        raise web.HTTPFound(location=next_target)
-                    self._mark_complete()
-                    _LOGGER.warning(
-                        "Family browser bootstrap exhausted all landing routes on the "
-                        "Microsoft marketing page; completing Home Assistant authentication "
-                        "without a Family antiforgery token"
-                    )
-                    raise web.HTTPFound(location=self.callback_url)
                 # Named so that a sign-in stuck on a new Microsoft host can be reported.
                 _LOGGER.info(
                     "Microsoft auth redirect leaves the proxy for %s", resolved.host
@@ -1385,150 +1233,6 @@ class MicrosoftFamilyAuthProxy:
         # document instead of an HTTP redirect.
         self._capture_oauth_redirect(final, "200 response")
 
-        def _is_authenticated_account_destination(url: URL, status_code: int) -> bool:
-            """Return whether an account.microsoft.com navigation proves SSO is live.
-
-            Microsoft does not consistently land on /family after silent SSO.
-            Current portal variants may finish on / or /account instead.  These
-            top-level document destinations are sufficient once the characteristic
-            Microsoft auth-cookie set is present.  Bundle/API paths are deliberately
-            excluded so a background resource cannot complete the flow.
-            """
-            if status_code != 200 or url.host != "account.microsoft.com":
-                return False
-            path = url.path.rstrip("/") or "/"
-            if "complete-signin-oauth" in str(url) or "complete-client-signin" in str(url):
-                return False
-            return path in ("/", "/account") or path.startswith("/family")
-
-        # Microsoft currently sometimes ends the silent account SSO bootstrap on
-        # /auth/client-signin-oauth-silent-error/INIT-FAIL-... even though the
-        # relevant Microsoft cookies have already been established.  A manual
-        # second/third press of HA's Open website button merely starts another
-        # top-level account.microsoft.com navigation and is why that workaround
-        # appeared to help.  Perform the same recovery in the *browser* so all
-        # navigation/origin semantics remain intact.  Limit retries to avoid a
-        # loop if Microsoft is genuinely unable to establish the session.
-        if (
-            self._completion_mode == "web"
-            and response.status_code == 200
-            and final.host == "account.microsoft.com"
-            and final.path.startswith("/auth/client-signin-oauth-silent-error/")
-            and self._family_bootstrap_attempts == 0
-            and self._web_recovery_attempts < 3
-        ):
-            self._web_recovery_attempts += 1
-            retry_location = f"{proxy_origin}{self.proxy_path}"
-            _LOGGER.debug(
-                "Microsoft Family silent SSO returned %s; retrying top-level "
-                "account navigation in the same browser tab (%d/3)",
-                final.path.rsplit("/", 1)[-1],
-                self._web_recovery_attempts,
-            )
-            raise web.HTTPFound(location=retry_location)
-
-        authenticated_account_page = (
-            self._completion_mode == "web"
-            and self._has_authenticated_cookie_set()
-            and _is_authenticated_account_destination(final, response.status_code)
-        )
-
-        # The private Family API needs browser-established SPA context beyond the
-        # generic /account login. Bootstrap that context in the already-open real
-        # browser tab and capture the hidden request-verification token there.
-        if (
-            self._completion_mode == "web"
-            and response.status_code == 200
-            and final.host == "account.microsoft.com"
-            and final.path.startswith("/family")
-        ):
-            self._start_family_wait_ui()
-            content_type = response.headers.get("content-type", "")
-            page = ""
-            if "text/html" in content_type.lower():
-                encoding = response.encoding or "utf-8"
-                page = response.content.decode(encoding, errors="replace")
-            token = _extract_family_request_verification_token(page) if page else None
-            if token and self._has_authenticated_cookie_set():
-                self._family_request_verification_token = token
-                self._family_referer = str(final)
-                self._mark_complete()
-                summary = self.diagnostic_summary()
-                _LOGGER.info(
-                    "Native Microsoft Family browser context captured at https://%s%s: "
-                    "exported_cookies=%d auth_cookies=%d family_token_present=True "
-                    "family_token_length=%d bootstrap_attempts=%d",
-                    final.host, final.path, summary["exported_cookie_count"],
-                    summary["auth_cookie_count"], summary["family_token_length"],
-                    summary["family_bootstrap_attempts"],
-                )
-                raise web.HTTPFound(location=self.callback_url)
-            _LOGGER.debug(
-                "Microsoft Family browser page reached without usable antiforgery token: "
-                "path=%s status=%s bootstrap_attempts=%d",
-                final.path, response.status_code, self._family_bootstrap_attempts,
-            )
-
-        if self._completion_mode == "web" and authenticated_account_page:
-            next_target = _next_family_bootstrap_target()
-            if next_target:
-                self._start_family_wait_ui()
-                _LOGGER.debug(
-                    "Microsoft account SSO verified; bootstrapping Family browser context "
-                    "in same tab (%d/3)", self._family_bootstrap_attempts,
-                )
-                raise web.HTTPFound(location=next_target)
-            self._mark_complete()
-            _LOGGER.warning(
-                "Native Microsoft account authentication completed but Family browser "
-                "context could not be captured after %d attempts; exporting account "
-                "cookies without Family antiforgery token",
-                self._family_bootstrap_attempts,
-            )
-            raise web.HTTPFound(location=self.callback_url)
-
-        family_watchdog_target: str | None = None
-        # A Family landing route can start a second Microsoft silent-SSO round.
-        # In a proxied top-level tab Microsoft occasionally leaves
-        # complete-client-signin-oauth-silent rendered without performing the
-        # final JavaScript navigation.  Do not let that blank/stalled document
-        # hold the Home Assistant flow forever.  Inject a delayed browser-side
-        # watchdog: normal Microsoft JavaScript gets several seconds to navigate;
-        # if the document is still alive afterwards we try the next Family route.
-        # On the last attempt the watchdog returns to our callback and completes
-        # authentication with the valid account cookies even if no Family token
-        # could be captured.
-        # The same applies to the INIT-FAIL page: the proxied client-signin
-        # page can report it and still recover later via
-        # complete-sso-with-redirect (~45 s seen). Do not bounce back to
-        # /account at once, that aborts Microsoft's own recovery.
-        if (
-            self._completion_mode == "web"
-            and response.status_code == 200
-            and final.host == "account.microsoft.com"
-            and (
-                final.path == "/auth/complete-client-signin-oauth-silent"
-                or final.path.startswith("/auth/client-signin-oauth-silent-error/")
-            )
-            and self._family_bootstrap_attempts > 0
-        ):
-            family_watchdog_target = _next_family_bootstrap_target()
-            if family_watchdog_target:
-                _LOGGER.debug(
-                    "Family browser page %s reached; arming %.1fs watchdog "
-                    "for next Family landing route (%d/3)",
-                    final.path, 55.0, self._family_bootstrap_attempts,
-                )
-            else:
-                self._mark_complete()
-                family_watchdog_target = self.callback_url
-                _LOGGER.warning(
-                    "Family browser page %s reached after all bootstrap routes; "
-                    "arming %.1fs watchdog to complete Home Assistant "
-                    "authentication without a Family antiforgery token",
-                    final.path, 55.0,
-                )
-
         content_type = response.headers.get("content-type", "")
         content = response.content
         if "text/html" in content_type.lower():
@@ -1549,74 +1253,7 @@ class MicrosoftFamilyAuthProxy:
                 # Keep the auth-proxy status UI in English regardless of browser or
                 # Home Assistant locale. This makes screenshots/log-assisted testing
                 # consistent across installations.
-                if family_watchdog_target:
-                    waiting_title = "Preparing Microsoft Family Safety"
-                    waiting_text = (
-                        "The visible sign-in is complete. Microsoft is now preparing "
-                        "the Family session in the background. Keep this window open; "
-                        "Home Assistant will continue automatically."
-                    )
-                    waiting_stage = "Waiting for Microsoft Family SSO"
-                    waiting_remaining = "Up to"
-                    waiting_seconds = "seconds remaining"
-
-                    # This overlay is deliberately non-interactive so it cannot block
-                    # Microsoft's own page or JavaScript. The browser leaves the page
-                    # immediately if Microsoft finishes before the watchdog expires.
-                    auth_ui = (
-                        '<style id="ha-family-auth-style">'
-                        '@keyframes haFamSpin{to{transform:rotate(360deg)}}'
-                        '@keyframes haFamPulse{0%,100%{opacity:.35}50%{opacity:1}}'
-                        '@keyframes haFamProgress{from{width:0}to{width:100%}}'
-                        '#ha-family-auth-wait{position:fixed;z-index:2147483647;'
-                        'left:50%;top:50%;width:min(680px,calc(100vw - 32px));max-width:680px;'
-                        'transform:translate(-50%,-50%);margin:0;'
-                        'box-sizing:border-box;padding:18px 20px;border-radius:14px;'
-                        'background:rgba(255,255,255,.98);color:#202124;'
-                        'box-shadow:0 8px 28px rgba(0,0,0,.30);font:14px/1.45 sans-serif;'
-                        'pointer-events:none}'
-                        '#ha-family-auth-head{display:flex;align-items:center;gap:12px}'
-                        '#ha-family-auth-spinner{width:24px;height:24px;border:3px solid #dadce0;'
-                        'border-top-color:#1a73e8;border-radius:50%;flex:0 0 auto;'
-                        'animation:haFamSpin .9s linear infinite}'
-                        '#ha-family-auth-title{font-size:16px;font-weight:600}'
-                        '#ha-family-auth-stage{margin-top:10px;font-weight:600}'
-                        '#ha-family-auth-dots span{animation:haFamPulse 1.2s ease-in-out infinite}'
-                        '#ha-family-auth-dots span:nth-child(2){animation-delay:.2s}'
-                        '#ha-family-auth-dots span:nth-child(3){animation-delay:.4s}'
-                        '#ha-family-auth-progress{height:5px;margin-top:12px;border-radius:4px;'
-                        'overflow:hidden;background:#e8eaed}'
-                        '#ha-family-auth-progress>span{display:block;height:100%;width:0;'
-                        'background:#1a73e8;animation:haFamProgress 55s linear forwards}'
-                        '#ha-family-auth-time{margin-top:7px;font-size:12px;color:#5f6368}'
-                        '</style>'
-                        '<div id="ha-family-auth-wait" role="status" aria-live="polite">'
-                        '<div id="ha-family-auth-head"><span id="ha-family-auth-spinner"></span>'
-                        '<div><div id="ha-family-auth-title">'
-                        + html.escape(waiting_title)
-                        + '</div><div>'
-                        + html.escape(waiting_text)
-                        + '</div></div></div>'
-                        '<div id="ha-family-auth-stage">'
-                        + html.escape(waiting_stage)
-                        + '<span id="ha-family-auth-dots"><span>.</span><span>.</span><span>.</span></span>'
-                        '</div><div id="ha-family-auth-progress"><span></span></div>'
-                        '<div id="ha-family-auth-time">'
-                        + html.escape(waiting_remaining)
-                        + ' <span id="ha-family-auth-seconds">55</span> '
-                        + html.escape(waiting_seconds)
-                        + '</div></div>'
-                        '<script>(function(){'
-                        'const u=' + json.dumps(family_watchdog_target) + ';'
-                        'const started=Date.now();const maxMs=55000;'
-                        'const el=document.getElementById("ha-family-auth-seconds");'
-                        'const tick=function(){if(!el)return;const left=Math.max(0,'
-                        'Math.ceil((maxMs-(Date.now()-started))/1000));el.textContent=String(left);};'
-                        'tick();const timer=setInterval(tick,250);'
-                        'setTimeout(function(){clearInterval(timer);try{window.location.replace(u);}'
-                        'catch(e){window.location.href=u;}},maxMs);})();</script>'
-                    )
-                elif self._completion_mode in {"oauth", "web"} and final.host in {
+                if final.host in {
                     "login.live.com",
                     "login.microsoft.com",
                     "login.microsoftonline.com",
@@ -1744,40 +1381,16 @@ _APP_RETURN_URL = (
 _RENOTIFY_MAX_SECONDS = 600.0
 _RENOTIFY_INTERVAL_SECONDS = 3.0
 #: Steps on which the flow waits for the frontend to fetch or configure it.
-#: Re-notification follows the flow through all of them: stopping as soon as
-#: the step changed (wait_family_proxy -> finish_proxy, observed on Android)
-#: left the dialog stuck on exactly the step that still needed a nudge.
-#: finish_web_first_done is where finish_proxy's tracked web-first completion
-#: parks the flow (progress done); without it the helper stopped right there.
 _FRONTEND_WAIT_STEPS = frozenset(
-    {
-        "check_mobile_proxy",
-        "wait_family_proxy",
-        "finish_proxy",
-        "finish_web_first_done",
-        "finish_mobile_proxy",
-        "auth_success",
-        "reauth_success",
-    }
+    {"check_mobile_proxy", "finish_mobile_proxy", "finish_sign_in"}
 )
 
 
 #: Steps the server may advance by itself once the frontend has left them alone
 #: for _AUTO_ADVANCE_AFTER_SECONDS. The Home Assistant Android app closes the
 #: setup dialog when it opens the sign-in in its in-app browser, so nobody is
-#: left to fetch the next step and the sign-in was lost (#50). The two success
-#: forms have no fields; submitting them is what the user's "Submit" would do.
-_AUTO_ADVANCE_STEPS = frozenset(
-    {
-        "wait_family_proxy",
-        "finish_proxy",
-        "finish_web_first_done",
-        "finish_mobile_proxy",
-        "auth_success",
-        "reauth_success",
-    }
-)
-_AUTO_SUBMIT_STEPS = frozenset({"auth_success", "reauth_success"})
+#: left to fetch the next step and the sign-in was lost (#50).
+_AUTO_ADVANCE_STEPS = frozenset({"finish_mobile_proxy", "finish_sign_in"})
 _AUTO_ADVANCE_AFTER_SECONDS = 20.0
 
 
@@ -1790,9 +1403,9 @@ async def _async_renotify_frontend(
     enough when the frontend merely missed an event (backgrounded app). If the
     flow then sits on one of _AUTO_ADVANCE_STEPS for
     _AUTO_ADVANCE_AFTER_SECONDS, nobody is following it any more and the
-    server advances it itself, up to the final (field-less) success form. The
-    grace period keeps the frontend the normal consumer: advancing right away
-    from the callback raced it and produced UnknownFlow before.
+    server advances it itself. The grace period keeps the frontend the normal
+    consumer: advancing right away from the callback raced it and produced
+    UnknownFlow before.
     """
     from homeassistant.data_entry_flow import (
         EVENT_DATA_ENTRY_FLOW_PROGRESSED,
@@ -1805,11 +1418,6 @@ async def _async_renotify_frontend(
     sent = 0
     last_step: str | None = None
     step_since = loop.time()
-    #: True once the server had to advance a step itself, i.e. no frontend is
-    #: following the flow. Only then are the success forms submitted: on a
-    #: desktop the user is looking at that form, and submitting it from here
-    #: made their own "Submit" fail with "Invalid flow specified".
-    driving = False
     while True:
         await asyncio.sleep(next(delays, _RENOTIFY_INTERVAL_SECONDS))
         if loop.time() > deadline:
@@ -1834,7 +1442,6 @@ async def _async_renotify_frontend(
             last_step, step_since = step, now
         elif (
             step in _AUTO_ADVANCE_STEPS
-            and (driving or step not in _AUTO_SUBMIT_STEPS)
             and now - step_since >= _AUTO_ADVANCE_AFTER_SECONDS
         ):
             _LOGGER.info(
@@ -1843,9 +1450,7 @@ async def _async_renotify_frontend(
                 "server-side", flow_id, step, now - step_since,
             )
             try:
-                result = await hass.config_entries.flow.async_configure(
-                    flow_id, {} if step in _AUTO_SUBMIT_STEPS else None
-                )
+                await hass.config_entries.flow.async_configure(flow_id, None)
             except UnknownFlow:
                 return
             except Exception as err:  # noqa: BLE001 - never crash the helper
@@ -1854,13 +1459,6 @@ async def _async_renotify_frontend(
                     flow_id, step, err,
                 )
                 return
-            # Only count as "driving" when this call actually moved the flow:
-            # a long-running progress step answers with the same step, and
-            # treating that as abandonment would later submit a success form
-            # a desktop user is looking at (review of PR #57).
-            new_step = result.get("step_id") if isinstance(result, dict) else None
-            if new_step != step:
-                driving = True
             step_since = loop.time()
             continue
         hass.bus.async_fire_internal(
@@ -1983,49 +1581,10 @@ class MicrosoftFamilyAuthorizationCallbackView(HomeAssistantView):
                 request.headers.get("User-Agent", "")[:160],
             )
 
-            # After the external-step -> native-progress handoff, the progress task
-            # owns Home Assistant advancement.  The browser's final callback is only
-            # a completion page at that point; configuring a progress/form step here
-            # would race the frontend and could accidentally submit the final form.
-            if before_step in {
-                "wait_family_proxy",
-                "finish_proxy",
-                "reauth_success",
-                "auth_success",
-            }:
-                from homeassistant.data_entry_flow import EVENT_DATA_ENTRY_FLOW_PROGRESSED
-
-                _LOGGER.debug(
-                    "Native Microsoft Family browser completion arrived after HA "
-                    "progress handoff; leaving flow advancement to Home Assistant: "
-                    "flow_id=%s current_step=%s",
-                    flow_id, before_step,
-                )
-                # Re-notify the frontend in case the original progress event was
-                # missed while focus was in the Microsoft window, and keep doing
-                # so while the flow stays on this step (see _async_renotify_frontend).
-                hass.bus.async_fire_internal(
-                    EVENT_DATA_ENTRY_FLOW_PROGRESSED,
-                    {
-                        "handler": DOMAIN,
-                        "flow_id": flow_id,
-                        "refresh": True,
-                    },
-                )
-                hass.async_create_task(
-                    _async_renotify_frontend(hass, flow_id, before_step),
-                    "Microsoft Family Safety auth flow frontend re-notify",
-                )
-                result = {
-                    "type": "browser_complete",
-                    "step_id": before_step,
-                }
-            else:
-                # Mobile OAuth and any web completion that occurs before the HA
-                # progress handoff still advance through the canonical external step.
-                result = await hass.config_entries.flow.async_configure(
-                    flow_id=flow_id, user_input={"native_callback": True}
-                )
+            # The browser's sign-in is complete: advance the external step.
+            result = await hass.config_entries.flow.async_configure(
+                flow_id=flow_id, user_input={"native_callback": True}
+            )
         except UnknownFlow as err:
             in_progress = [
                 {
@@ -2067,9 +1626,9 @@ class MicrosoftFamilyAuthorizationCallbackView(HomeAssistantView):
             bool(result.get("url")) if isinstance(result, dict) else False,
         )
 
-        # An EXTERNAL_STEP -> EXTERNAL_STEP transition is returned for native
-        # mobile OAuth -> web-session capture. Continue in the already-open
-        # browser tab; no second popup is required.
+        # An EXTERNAL_STEP -> EXTERNAL_STEP transition means the sign-in has to
+        # start over (Microsoft answered the OAuth redirect with an error).
+        # Continue in the already-open browser tab; no second popup is required.
         next_url = result.get("url") if isinstance(result, dict) else None
         if next_url:
             _LOGGER.debug(
@@ -2081,7 +1640,7 @@ class MicrosoftFamilyAuthorizationCallbackView(HomeAssistantView):
             # This is the canonical Home Assistant external-step handoff.
             # async_external_step_done stores the declared next step and the flow
             # manager notifies the frontend because the step id changed. The
-            # frontend is then the *only* consumer that advances to finish_proxy.
+            # frontend is then the consumer that advances to finish_mobile_proxy.
             # Never call async_configure() a second time here: the frontend may
             # already have consumed EXTERNAL_STEP_DONE, which races the callback
             # and produces UnknownFlow / "flow not found".
@@ -2193,23 +1752,22 @@ async def unregister_native_proxy(hass: HomeAssistant, proxy: MicrosoftFamilyAut
 _OAUTH_MAX_HOPS = 8
 
 
-async def async_fetch_mobile_oauth_redirect(
+async def async_fetch_oauth_redirect(
     hass: HomeAssistant, start_url: str, cookies: list[dict[str, Any]]
-) -> tuple[str, list[dict[str, Any]]] | None:
-    """Drive the mobile OAuth authorization server-side from web SSO cookies.
+) -> str | None:
+    """Drive an OAuth authorization server-side from fresh sign-in cookies.
 
-    After a fresh account.microsoft.com sign-in, ``oauth20_authorize.srf``
-    answers with one redirect straight to ``oauth20_desktop.srf?code=...``.
-    Returns that redirect URL and the refreshed cookie export, or ``None``
-    when Microsoft insists on an interactive step (the browser then does it).
-    The proxy class is reused unregistered, purely for its cookie jar and
-    export rules; no route is ever exposed for it.
+    Right after a Microsoft account sign-in, ``oauth20_authorize.srf`` (here
+    for the Xbox Family Settings client) answers with one redirect straight
+    to ``oauth20_desktop.srf?code=...``. Returns that redirect URL, or
+    ``None`` when Microsoft insists on an interactive step. The proxy class
+    is reused unregistered, purely for its cookie jar; no route is ever
+    exposed for it.
     """
     proxy = MicrosoftFamilyAuthProxy(
         hass,
         callback_url="",
         start_url=start_url,
-        completion_mode="oauth",
         initial_cookies=cookies,
     )
     try:
@@ -2217,7 +1775,7 @@ async def async_fetch_mobile_oauth_redirect(
         for hop in range(_OAUTH_MAX_HOPS):
             if not _is_allowed_host(current.host):
                 _LOGGER.debug(
-                    "Server-side mobile OAuth left the Microsoft hosts at hop %d (%s)",
+                    "Server-side OAuth authorization left the Microsoft hosts at hop %d (%s)",
                     hop, current.host,
                 )
                 return None
@@ -2228,13 +1786,12 @@ async def async_fetch_mobile_oauth_redirect(
                 current = target if target.is_absolute() else current.join(target)
                 if current.host == "login.live.com" and current.path == "/oauth20_desktop.srf":
                     if "code" in current.query:
-                        _LOGGER.info(
-                            "Mobile OAuth completed server-side from the web sign-in "
-                            "in %d hop(s)", hop + 1,
+                        _LOGGER.debug(
+                            "OAuth authorization completed server-side in %d hop(s)", hop + 1
                         )
-                        return str(current), proxy.export_cookies()
+                        return str(current)
                     _LOGGER.debug(
-                        "Server-side mobile OAuth ended in an error redirect: error=%s",
+                        "Server-side OAuth authorization ended in an error redirect: error=%s",
                         current.query.get("error", "unknown"),
                     )
                     return None
@@ -2245,14 +1802,14 @@ async def async_fetch_mobile_oauth_redirect(
                 and final.path == "/oauth20_desktop.srf"
                 and "code" in final.query
             ):
-                return str(final), proxy.export_cookies()
+                return str(final)
             _LOGGER.debug(
-                "Server-side mobile OAuth stopped at %s%s status=%s after %d hop(s); "
+                "Server-side OAuth authorization stopped at %s%s status=%s after %d hop(s); "
                 "an interactive step is needed",
                 final.host, final.path, response.status_code, hop + 1,
             )
             return None
-        _LOGGER.debug("Server-side mobile OAuth gave up after %d hops", _OAUTH_MAX_HOPS)
+        _LOGGER.debug("Server-side OAuth authorization gave up after %d hops", _OAUTH_MAX_HOPS)
         return None
     finally:
         await proxy.async_close()

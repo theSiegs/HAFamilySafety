@@ -3,14 +3,14 @@
     "step": {
       "user": {
         "title": "Microsoft Family Safety",
-        "description": "Integration konfigurieren. Nach dem Absenden öffnet Home Assistant die Microsoft-Anmeldung über einen temporären Authentifizierungs-Proxy. Melde dich mit dem Elternkonto an und antworte mit **Ja** auf „Angemeldet bleiben?“: Dadurch bleibt die Family-Sitzung etwa ein Jahr statt nur wenige Stunden gültig. Ist Home Assistant nicht per HTTPS erreichbar, kann lokales HTTP ausdrücklich zu Testzwecken aktiviert werden; Microsoft-Anmeldedaten sind dann im lokalen Netz nicht transportverschlüsselt.",
+        "description": "Integration konfigurieren. Nach dem Absenden öffnet Home Assistant die Microsoft-Anmeldung über einen temporären Authentifizierungs-Proxy: Melde dich mit dem Elternkonto an. Ist Home Assistant nicht per HTTPS erreichbar, kann lokales HTTP ausdrücklich zu Testzwecken aktiviert werden; Microsoft-Anmeldedaten sind dann im lokalen Netz nicht transportverschlüsselt. Ohne beides kannst du im nächsten Schritt die Weiterleitungsadresse von Microsoft von Hand einfügen.",
         "data": {
           "update_interval": "Aktualisierungsintervall (Sekunden)",
           "platforms": "Überwachte Plattformen",
           "allow_insecure_http_auth": "Unsichere lokale HTTP-Anmeldung erlauben (nur zum Testen)"
         },
         "data_description": {
-          "platforms": "Windows, Xbox, Mobile: ein Sperrschalter pro ausgewählter Plattform. Xbox aktiviert außerdem die Xbox-Spielzeit und die Xbox-Sperre, die die Microsoft-Websitzung benötigen (manche Konten müssen sie alle 24 Stunden mit einer Anmeldung erneuern). Xbox nicht auswählen, wenn die Kinder keine Xbox haben: Die Integration nutzt dann nur das mobile Token, mit einer kürzeren Anmeldung."
+          "platforms": "Windows, Xbox, Mobile: ein Sperrschalter pro ausgewählter Plattform. Xbox fügt außerdem die Xbox-Sperre und die Xbox-Limits hinzu, die über die Anmeldung von Xbox Family Settings laufen (wenn möglich bei der Microsoft-Anmeldung verknüpft, sonst über die Optionen). Xbox nicht auswählen, wenn die Kinder keine Xbox haben."
         }
       },
       "auth": {
@@ -22,41 +22,24 @@
       },
       "reauth_confirm": {
         "title": "Microsoft Family Safety erneut anmelden",
-        "description": "Die gespeicherte Microsoft-Anmeldung ist unvollständig, abgelaufen oder widerrufen. Fahre fort, um die vollständige Anmeldung erneut auszuführen und sowohl das mobile Refresh-Token als auch die Family-Websitzung zu erneuern."
+        "description": "Die gespeicherte Microsoft-Anmeldung ist unvollständig, abgelaufen oder widerrufen. Fahre fort, um dich erneut anzumelden und das Refresh-Token der Integration zu erneuern."
       },
       "reauth_full_confirm": {
         "title": "Microsoft Family Safety erneut anmelden",
-        "description": "Die gespeicherte Microsoft-Authentifizierung ist unvollständig, abgelaufen oder widerrufen. Fahre fort, um dich erneut anzumelden; antworte mit **Ja** auf „Angemeldet bleiben?“, damit die erneuerte Sitzung lange gültig bleibt. Ist diese Home-Assistant-Instanz nur über eine private lokale HTTP-URL erreichbar, aktiviere unten die lokale HTTP-Testoption.",
+        "description": "Die gespeicherte Microsoft-Anmeldung ist unvollständig, abgelaufen oder widerrufen. Fahre fort, um dich mit demselben Elternkonto erneut anzumelden. Ist diese Home-Assistant-Instanz nur über eine private lokale HTTP-URL erreichbar, aktiviere unten die lokale HTTP-Testoption.",
         "data": {
           "allow_insecure_http_auth": "Unsichere lokale HTTP-Anmeldung erlauben (nur zum Testen)"
         }
       },
-      "reauth_success": {
-        "title": "Microsoft Family Safety-Anmeldung abgeschlossen",
-        "description": "Die Microsoft-Anmeldung wurde erfolgreich abgeschlossen und die neuen Zugangsdaten können gespeichert werden. Wähle Absenden, um die erneute Anmeldung abzuschließen."
-      },
       "check_mobile_proxy": {
         "title": "Microsoft-Anmeldung",
-        "description": "Melde dich mit dem Microsoft-Konto an, das die Familie verwaltet, und antworte mit **Ja**, wenn Microsoft „Angemeldet bleiben?“ fragt. Lass das geöffnete Anmeldefenster offen: Nach der sichtbaren Anmeldung wechselt Home Assistant zu einer Warteanzeige, während die Family-Sitzung und das mobile Token eingerichtet werden.\n\nEin Passkey funktioniert hier nicht, weil die Anmeldung über die Adresse von Home Assistant läuft und nicht über die von Microsoft: Bietet Microsoft einen an, wähle **Andere Möglichkeiten zum Anmelden** und melde dich mit Passwort oder Code an."
-      },
-      "check_proxy": {
-        "title": "Microsoft Family-Websitzung",
-        "description": "**Melde dich im gerade geöffneten Fenster an**, mit dem Microsoft-Konto, das die Familie verwaltet, und antworte bei „Angemeldet bleiben?“ mit **Ja**.\n\nKomm dann hierher zurück und **warte**: Dieser Dialog läuft von selbst weiter, was nach der Anmeldung bis zu etwa einer Minute dauern kann. Klicke nicht erneut auf *Website öffnen*, außer das Microsoft-Fenster hat sich nie geöffnet oder wurde vor der Anmeldung geschlossen.\n\nEin Passkey funktioniert hier nicht, weil die Anmeldung über die Adresse von Home Assistant läuft und nicht über die von Microsoft: Bietet Microsoft einen an, wähle **Andere Möglichkeiten zum Anmelden** und melde dich mit Passwort oder Code an."
-      },
-      "auth_success": {
-        "title": "Microsoft Family Safety-Anmeldung abgeschlossen",
-        "description": "Microsoft-Anmeldung abgeschlossen: Family-Websitzung und mobiles Refresh-Token sind bereit. Wähle Weiter, um die Integration anzulegen.",
-        "submit": "Weiter"
-      },
-      "wait_family_proxy": {
-        "title": "Microsoft Family Safety-Anmeldung wird abgeschlossen"
+        "description": "Melde dich im geöffneten Fenster mit dem Microsoft-Konto an, das die Familie verwaltet. Lass es offen, bis die Microsoft-Anmeldung abgeschlossen ist: Home Assistant fährt dann von selbst fort.\n\nEin Passkey funktioniert hier nicht, weil die Anmeldung über die Adresse von Home Assistant läuft und nicht über die von Microsoft: Bietet Microsoft einen an, wähle **Andere Möglichkeiten zum Anmelden** und melde dich mit Passwort oder Code an."
       }
     },
     "error": {
       "auth_failed": "Anmeldung fehlgeschlagen.",
       "token_expired": "Anmeldung abgelaufen.",
       "no_redirect_url": "Bitte gib eine gültige Weiterleitungs-URL ein.",
-      "native_https_required": "Die automatische Browser-Anmeldung erfordert normalerweise HTTPS. Für lokale Tests kannst du die unsichere HTTP-Anmeldung ausdrücklich aktivieren; Microsoft-Zugangsdaten werden dann im lokalen Netz unverschlüsselt übertragen.",
       "unknown": "Unerwarteter Anmeldefehler.",
       "native_http_not_local": "Die unsichere HTTP-Anmeldung ist nur über localhost, .local oder eine private/lokale IP-Adresse erlaubt."
     },
@@ -64,21 +47,21 @@
       "already_configured": "Dieses Konto ist bereits konfiguriert.",
       "reauth_successful": "Erneute Anmeldung erfolgreich!",
       "reconfigure_successful": "Neukonfiguration erfolgreich!",
-      "native_auth_failed": "Die Microsoft-Web-Anmeldung wurde nicht erfolgreich abgeschlossen.",
       "native_auth_state_lost": "Der Browser-Anmeldevorgang ist abgelaufen. Bitte beginne von vorn.",
-      "native_auth_unavailable": "Die native Web-Anmeldung konnte nicht geladen werden: {error}",
+      "native_auth_unavailable": "Die Browser-Anmeldung konnte nicht geladen werden: {error}",
       "native_oauth_failed": "Die Microsoft Family Safety-OAuth-Anmeldung wurde nicht erfolgreich abgeschlossen.",
-      "wrong_account": "Es wurde ein anderes Microsoft-Konto verwendet. Bitte melde dasselbe Family Safety-Konto erneut an."
+      "wrong_account": "Es wurde ein anderes Microsoft-Konto verwendet. Bitte melde dasselbe Family Safety-Konto erneut an.",
+      "native_http_not_local": "Die unsichere HTTP-Anmeldung ist nur über localhost, .local oder eine private/lokale IP-Adresse erlaubt."
     },
     "progress": {
-      "family_sso": "Die Microsoft-Anmeldung ist abgeschlossen. Home Assistant schließt die Family-Sitzung im offenen Fenster ab und holt das mobile Token. Das kann bis zu etwa 60 Sekunden dauern. Lass das Microsoft-Fenster offen; es ist nichts weiter zu tun."
+      "sign_in": "Die Microsoft-Anmeldung ist abgeschlossen. Home Assistant holt jetzt die Tokens der Integration; das dauert ein paar Sekunden."
     }
   },
   "options": {
     "step": {
       "init": {
         "title": "Microsoft Family Safety-Optionen",
-        "description": "Abfrageintervall, Plattformen und optionalen Legacy-Add-on-Fallback konfigurieren.",
+        "description": "Abfrageintervall, Plattformen, berechtigte Benutzer und die Verknüpfung mit Xbox Family Settings konfigurieren.",
         "data": {
           "update_interval": "Aktualisierungsintervall (Sekunden)",
           "platforms": "Überwachte Plattformen",
@@ -87,9 +70,9 @@
           "xbox_link": "Xbox-Family-Settings-Anmeldung verknüpfen"
         },
         "data_description": {
-          "platforms": "Windows, Xbox, Mobile: ein Sperrschalter pro ausgewählter Plattform. Xbox aktiviert außerdem die Xbox-Spielzeit und die Xbox-Sperre, die die Microsoft-Websitzung benötigen (manche Konten müssen sie alle 24 Stunden mit einer Anmeldung erneuern). Xbox nicht auswählen, wenn die Kinder keine Xbox haben: Die Integration nutzt dann nur das mobile Token, mit einer kürzeren Anmeldung.",
+          "platforms": "Windows, Xbox, Mobile: ein Sperrschalter pro ausgewählter Plattform. Xbox fügt außerdem die Xbox-Sperre und die Xbox-Limits hinzu, die über die Anmeldung von Xbox Family Settings laufen (wenn möglich bei der Microsoft-Anmeldung verknüpft, sonst über die Optionen). Xbox nicht auswählen, wenn die Kinder keine Xbox haben.",
           "allowed_users": "Leer lassen, damit alle Benutzer die Schalter und Einstellungen verwenden können (Standard). Sobald Benutzer ausgewählt sind, dürfen nur sie und die Administratoren das: Das Nicht-Administrator-Konto eines Kindes wird bei jeder Taste, jedem Schalter, jedem Limit und jedem Zeitfenster sowie bei den microsoft_family_safety-Aktionen abgewiesen. Automatisierungen und Skripte, die Home Assistant ausführt, sind nicht betroffen. Gib dem Kind ein Nicht-Administrator-Konto: Ein Administrator kann diese Option ändern.",
-          "xbox_link": "Xbox-Limits, die Xbox-Sperre und die Xbox-Spielzeit laufen dann über den Dienst der Xbox-Family-Settings-App, mit eigener Anmeldung und ohne die Websitzung. Nur wenn Xbox ausgewählt ist. Die Verknüpfung erfolgt meist automatisch nach einer Anmeldung; aktiviere dies, wenn der Verbindungssensor xbox_family: not_linked anzeigt."
+          "xbox_link": "Xbox-Limits, die Xbox-Sperre und die Xbox-Spielzeit laufen dann über den Dienst der Xbox-Family-Settings-App, mit eigener Anmeldung. Nur wenn Xbox ausgewählt ist. Die Verknüpfung erfolgt meist automatisch bei der Microsoft-Anmeldung; aktiviere dies, wenn der Verbindungssensor xbox_family: not_linked anzeigt."
         }
       },
       "xbox_link_manual": {
@@ -105,6 +88,16 @@
     },
     "progress": {
       "xbox_link": "Öffne [diese Microsoft-Anmeldung]({url}) und melde dich mit dem Elternkonto an, das du in der Xbox-Family-Settings-App verwendest. Sobald Microsoft die Anmeldung angenommen hat, zeigt das Fenster „Sign-in received“ und kann geschlossen werden; dieser Schritt geht dann von selbst weiter, ohne dass du etwas kopieren musst. Ist die Anmeldung nach 10 Minuten nicht abgeschlossen, kannst du stattdessen die Adresse einfügen. Ein Passkey funktioniert hier nicht, weil die Anmeldung über die Adresse von Home Assistant läuft und nicht über die von Microsoft: Bietet Microsoft einen an, wähle **Andere Möglichkeiten zum Anmelden** und melde dich mit Passwort oder Code an."
+    }
+  },
+  "issues": {
+    "xbox_not_linked": {
+      "title": "Xbox-Family-Settings-Anmeldung verknüpfen",
+      "description": "Bei {entry_title} ist Xbox als überwachte Plattform ausgewählt, die Xbox-Family-Settings-Anmeldung ist aber nicht verknüpft: Die Xbox-Sperre funktioniert nicht und die Xbox-Spielzeit wird nicht gelesen.\n\nÖffne **Einstellungen > Geräte & Dienste > Microsoft Family Safety > Konfigurieren**, aktiviere **Xbox-Family-Settings-Anmeldung verknüpfen** und folge den Schritten. Diese Meldung verschwindet, sobald die Verknüpfung funktioniert."
+    },
+    "xbox_link_refused": {
+      "title": "Xbox-Family-Settings-Anmeldung erneut verknüpfen",
+      "description": "Microsoft akzeptiert die Xbox-Family-Settings-Anmeldung für {entry_title} nicht mehr: Die Xbox-Sperre funktioniert nicht und die Xbox-Spielzeit wird nicht gelesen. Alles andere funktioniert weiter.\n\nÖffne **Einstellungen > Geräte & Dienste > Microsoft Family Safety > Konfigurieren**, aktiviere **Xbox-Family-Settings-Anmeldung verknüpfen** und folge den Schritten. Diese Meldung verschwindet, sobald die Verknüpfung funktioniert."
     }
   },
   "services": {
