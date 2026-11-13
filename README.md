@@ -333,7 +333,7 @@ An app used on two platforms has a different id on each, so it is listed once pe
 |--------|-----------|----------|
 | **Account Lock** | `switch.{prefix}_lock` | **ON = account locked** (all screen time set to 0). Saves quotas before locking, restores on unlock. Persists across restarts. Attribute `has_saved_policy` shows whether a restore point exists. |
 | **Screen Time Limits** | `switch.{prefix}_screen_time_limits` | OFF = the Windows schedule is turned off, every day kept as it is. ON = turned back on. Same switch as in the Family Safety app (before 2.0.20 it rewrote every day to 24 h). |
-| Xbox Screen Time Limits | `switch.{prefix}_xbox_screen_time_limits` | Turns the child's separate Xbox schedule on or off (the days are kept). Once it is on, seven `number.{prefix}_xbox_{day}_limit` entities set the daily Xbox allowance the console enforces; with the Xbox Family Settings sign-in linked, each also shows that day's Xbox allowed hours in its `allowed_intervals` attribute. Not created without Xbox among the monitored platforms. |
+| Xbox Screen Time Limits | `switch.{prefix}_xbox_screen_time_limits` | Turns the child's separate Xbox schedule on or off (the days are kept). Once it is on, seven `number.{prefix}_xbox_{day}_limit` entities set the daily Xbox allowance the console enforces; with the Xbox Family Settings sign-in linked, each also shows that day's Xbox allowed hours in its `allowed_intervals` attribute. The switch and the limits write through the Xbox Family Settings sign-in only: without it linked (or when the child cannot be matched) the change fails and nothing is written. Not created without Xbox among the monitored platforms. |
 | App Limits | `switch.{prefix}_app_limits` | The "App, feature, and game limits" toggle above the app list. While it is OFF, the per-app time limits are kept but not enforced. |
 | Web Filtering | `switch.{prefix}_web_filtering` | ON = Microsoft filters inappropriate websites and searches in Microsoft Edge, and the blocked and allowed lists apply. Same write as the `toggle_web_filter` action. |
 | App Block | `switch.{prefix}_app_{appname}` | ON = app blocked. One switch per application. |
@@ -707,6 +707,11 @@ How it behaves:
   `set_screentime_intervals`), with the same requirements as above: the Xbox
   Family Settings sign-in linked. The kept value is the day's whole list of
   Xbox time windows.
+- Xbox changes (limit and allowed hours) are read and written through the Xbox
+  Family Settings sign-in only, never the mobile Xbox schedule, which the
+  console ignores. Without it the today-only call fails and nothing is
+  written; a pending Xbox restore waits for it and is retried at each poll
+  (within the 7 days above).
 
 To put the usual values back before midnight:
 
