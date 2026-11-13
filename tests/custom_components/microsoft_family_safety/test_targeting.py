@@ -32,6 +32,8 @@ def coordinator(hass):
         async_lock_account=AsyncMock(),
         async_block_website=AsyncMock(),
         async_approve_request=AsyncMock(),
+        async_pause_app=AsyncMock(return_value={"paused": []}),
+        async_resume_app=AsyncMock(return_value={"resumed": []}),
     )
     hass.data.setdefault(DOMAIN, {})["entry"] = coord
     with patch(
@@ -276,3 +278,16 @@ async def test_a_str_id_finds_an_int_keyed_account(hass) -> None:
     assert coord.account_data(CHILD) is coord.data["accounts"][int(CHILD)]
     assert coord.get_account(OTHER) is None
     assert coord.account_data(OTHER) is None
+
+
+async def test_pause_and_resume_take_an_entity_of_the_child(hass, coordinator) -> None:
+    """Fork: pause_app / resume_app name the child like the other services."""
+    entity_id = _entity(hass, "switch.alex_lock", CHILD)
+    await hass.services.async_call(
+        DOMAIN, "pause_app", {"entity_id": entity_id, "apps": ["x:1"]}, blocking=True
+    )
+    coordinator.async_pause_app.assert_awaited_once_with(CHILD, ["x:1"])
+    await hass.services.async_call(
+        DOMAIN, "resume_app", {"account_id": CHILD}, blocking=True
+    )
+    coordinator.async_resume_app.assert_awaited_once_with(CHILD, None)

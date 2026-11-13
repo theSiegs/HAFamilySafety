@@ -93,7 +93,7 @@ class FamilySafetyAllowedNowSensor(
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Why, today's allowance and minutes used, and who decides the lock (as the lock switch)."""
+        """Why, today's allowance and use, and who decides the lock (as the lock switch)."""
         status = self.coordinator.platform_status(self._account_id, self._platform)
         current = status.get("override") or {}
         until = current.get("valid_until")

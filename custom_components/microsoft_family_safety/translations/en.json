@@ -613,6 +613,10 @@
           "name": "Account ID",
           "description": "The user ID of the child account."
         },
+        "entity_id": {
+          "name": "Child entity",
+          "description": "Any Microsoft Family Safety entity of the child (or of one of its devices), instead of the account ID."
+        },
         "platform": {
           "name": "Platform",
           "description": "Only this schedule. Omitted = every platform."
