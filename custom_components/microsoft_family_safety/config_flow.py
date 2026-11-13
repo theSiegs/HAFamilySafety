@@ -30,9 +30,11 @@ from .const import (
     CONF_ALLOWED_USERS,
     CONF_STRICT_MODE,
     DEFAULT_STRICT_MODE,
+    CONF_APP_USAGE_SENSORS,
     CONF_XBOX_FEATURES,
     CONF_XBOX_LINK,
     CONF_XBOX_REFRESH_TOKEN,
+    DEFAULT_APP_USAGE_SENSORS,
     DEFAULT_XBOX_FEATURES,
     LEGACY_WEB_AUTH_KEYS,
     AVAILABLE_PLATFORMS,
@@ -823,6 +825,12 @@ class FamilySafetyOptionsFlow(config_entries.OptionsFlow):
                             CONF_STRICT_MODE, DEFAULT_STRICT_MODE
                         ),
                     ): cv.boolean,
+                    vol.Optional(
+                        CONF_APP_USAGE_SENSORS,
+                        default=self._config_entry.options.get(
+                            CONF_APP_USAGE_SENSORS, DEFAULT_APP_USAGE_SENSORS
+                        ),
+                    ): vol.All(vol.Coerce(int), vol.Range(min=0, max=30)),
                     vol.Optional(
                         CONF_ALLOW_INSECURE_HTTP_AUTH,
                         default=current_allow_insecure_http_auth,
