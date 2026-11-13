@@ -503,6 +503,7 @@ Both actions can answer with what they did (`response_variable`), `{prior, appli
 | `"parent_lock_kept"` | (`lock_platform`) A longer lock that is not the integration's is in force; nothing was sent, see `current` |
 | `"hold_expired"` | The integration's lock had already run out; nothing was sent |
 | `"not_locked"` | The integration's lock never went through; nothing was sent |
+| `"bonus_kept"` | (`unlock_platform`) Extra time the integration gave is in force (it replaced the lock); nothing was sent and the extra time keeps running, see `current` |
 
 `unlock_platform` adds `prior_unknown: true` when the state before the lock could not be read, and `state_unknown: true` when the state at unlock could not be read. `until` may be at most 168 hours away, like `duration_hours`.
 
@@ -523,7 +524,7 @@ The platform lock switches show the same as attributes, for automations that mus
 
 | Attribute | Values |
 |-----------|--------|
-| `hold` | `ours` (the integration's lock, still as it was placed), `parent` (a lock or extra time the integration did not place, or its own lock changed elsewhere), `none` (nothing in force, nothing held) |
+| `hold` | `ours` (the integration's lock, still as it was placed), `bonus_ours` (extra time given by `add_time_bonus` is in force), `parent` (a lock or extra time the integration did not place, or its own lock changed elsewhere), `none` (nothing in force, nothing held) |
 | `override` | `blockUntil`, `allowUntil`, `none`, or null when it could not be read |
 | `override_until` | When the lock or extra time in force ends (local ISO time), or null |
 | `allow_until` | When extra time in force ends (local ISO time), or null |

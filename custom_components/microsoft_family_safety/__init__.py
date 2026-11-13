@@ -491,13 +491,17 @@ def _register_services(hass: HomeAssistant) -> None:
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Delete what this entry kept on disk: the Xbox Family Settings refresh
-    token, the platform holds, the paused apps and the today-only changes
-    waiting to be put back."""
+    token, the platform holds and extra time records, the paused apps and the
+    today-only changes waiting to be put back."""
     from homeassistant.helpers import issue_registry as ir
     from homeassistant.helpers.storage import Store
 
     from .app_pause import AppPauser
-    from .coordinator import PLATFORM_HOLD_STORAGE_KEY, STORAGE_VERSION
+    from .coordinator import (
+        PLATFORM_HOLD_STORAGE_KEY,
+        STORAGE_VERSION,
+        TIME_BONUS_STORAGE_KEY,
+    )
     from .today_only import today_only_store
     from .xbox_family_api import XboxFamilyAPI
 
@@ -506,6 +510,9 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     ir.async_delete_issue(hass, DOMAIN, f"xbox_link_{entry.entry_id}")
     await Store(
         hass, STORAGE_VERSION, f"{PLATFORM_HOLD_STORAGE_KEY}.{entry.entry_id}"
+    ).async_remove()
+    await Store(
+        hass, STORAGE_VERSION, f"{TIME_BONUS_STORAGE_KEY}.{entry.entry_id}"
     ).async_remove()
     await today_only_store(hass, entry.entry_id).async_remove()
 
