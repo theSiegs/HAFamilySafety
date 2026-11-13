@@ -63,6 +63,7 @@ from .screen_time import (
     platform_allowance,
     xbox_policy_override,
 )
+from .today_only import FIELD_ALLOWED_HOURS, FIELD_LIMIT, TodayOnlyChanges
 from .xbox_family_api import (
     OVERRIDE_ALLOW,
     OVERRIDE_BLOCK,
@@ -93,6 +94,7 @@ from .const import (
     ERROR_TOKEN_EXPIRED,
     LEGACY_WEB_AUTH_KEYS,
     EVENT_REQUEST,
+    SCREENTIME_PLATFORMS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -136,6 +138,12 @@ _STRICT_READ_TIMEOUT = 15
 #: Strict mode places one lock again at most this often, so a lock Microsoft
 #: keeps reporting as cancelled cannot turn into a write on every poll.
 _STRICT_REASSERT_COOLDOWN = timedelta(minutes=10)
+
+
+def _clock_to_minutes(value: Any) -> int:
+    """"HH:MM" (24:00 = midnight at the end of the day) as minutes after midnight."""
+    hours, minutes = (int(p) for p in str(value).split(":")[:2])
+    return hours * 60 + minutes
 
 
 def _describe_error(err: Exception | None) -> str:
@@ -361,6 +369,8 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             entry.options.get(CONF_APP_USAGE_SENSORS, DEFAULT_APP_USAGE_SENSORS) or 0
         )
         self._app_usage_tracker = AppUsageGrowthTracker()
+        #: Limits and allowed hours changed for today only (today_only.py).
+        self.today_only = TodayOnlyChanges(hass, self, entry.entry_id)
 
     @property
     def xbox_features(self) -> bool:
@@ -428,6 +438,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._policy_key(key): value for key, value in data.items()
             }
         await self._async_load_platform_holds()
+        await self.today_only.async_load()
         auth_state = await self._auth_store.async_load()
         self._runtime_auth_state = {}
         if isinstance(auth_state, dict):
@@ -1693,63 +1704,104 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             child_id, day_of_week, allowed_intervals
         )
 
+    @staticmethod
+    def _check_day(day_of_week: int | None, today_only: bool) -> None:
+        if day_of_week is None:
+            if not today_only:
+                raise ValueError("day_of_week is required unless today_only is set")
+        elif not 0 <= day_of_week <= 6:
+            raise ValueError("day_of_week must be between 0 and 6")
+
+    @staticmethod
+    def _check_platform(platform: str) -> None:
+        if platform not in SCREENTIME_PLATFORMS:
+            raise ValueError("platform must be Windows or Xbox")
+
     async def async_set_screentime_limit(
         self,
         child_id: str,
-        day_of_week: int,
+        day_of_week: int | None,
         hours: int,
         minutes: int,
         platform: str = "Windows",
+        today_only: bool = False,
     ) -> None:
+        self._check_platform(platform)
+        self._check_day(day_of_week, today_only)
+        if hours < 0 or minutes < 0 or minutes > 59 or hours * 60 + minutes > 1440:
+            raise ValueError("screen-time allowance must be between 0 and 24 hours")
+        if today_only:
+            await self.today_only.async_apply(
+                child_id, platform, day_of_week, FIELD_LIMIT, hours * 60 + minutes
+            )
+            await self.async_request_refresh()
+            return
+        assert day_of_week is not None
         if platform == "Xbox":
             await self.async_set_xbox_screentime_limit(
                 child_id, day_of_week, hours, minutes, require_xapprove=True
             )
             return
-        if platform != "Windows":
-            raise ValueError("platform must be Windows or Xbox")
-        if not 0 <= day_of_week <= 6:
-            raise ValueError("day_of_week must be between 0 and 6")
-        if hours < 0 or minutes < 0 or minutes > 59 or hours * 60 + minutes > 1440:
-            raise ValueError("screen-time allowance must be between 0 and 24 hours")
-        async with self._account_lock(child_id):
+        async with self._account_lock(child_id), self.today_only.lock(child_id, platform):
             await self._set_screentime_allowance(child_id, day_of_week, hours, minutes)
             await self._update_saved_day(
                 child_id, day_of_week, allowance=f"{hours:02d}:{minutes:02d}:00"
             )
-        self._update_cached_day(
-            child_id, day_of_week, allowance=f"{hours:02d}:{minutes:02d}:00"
-        )
+            self._update_cached_day(
+                child_id, day_of_week, allowance=f"{hours:02d}:{minutes:02d}:00"
+            )
+            await self.today_only.async_forget(child_id, platform, day_of_week, FIELD_LIMIT)
         await self.async_request_refresh()
 
     async def async_set_screentime_intervals(
         self,
         child_id: str,
-        day_of_week: int,
+        day_of_week: int | None,
         start_hour: int,
         start_minute: int,
         end_hour: int,
         end_minute: int,
         platform: str = "Windows",
+        today_only: bool = False,
     ) -> None:
+        self._check_platform(platform)
+        self._check_day(day_of_week, today_only)
         if platform == "Xbox":
-            await self.async_set_xbox_allowed_hours(
-                child_id, day_of_week, start_hour, start_minute, end_hour, end_minute
-            )
-            return
-        if platform != "Windows":
-            raise ValueError("platform must be Windows or Xbox")
-        if not 0 <= day_of_week <= 6:
-            raise ValueError("day_of_week must be between 0 and 6")
+            # The console only enforces allowed hours written through the Xbox
+            # Family Settings service: refused with a clear reason without it.
+            await self._xapprove_xuid_required(child_id)
         start_total = start_hour * 60 + start_minute
         end_total = end_hour * 60 + end_minute
         if not 0 <= start_total < end_total <= 1440:
             raise ValueError("screen-time interval end must be later than start")
+        if platform == "Xbox":
+            if today_only:
+                await self.today_only.async_apply(
+                    child_id, platform, day_of_week, FIELD_ALLOWED_HOURS,
+                    [[start_total, end_total]],
+                )
+                await self.async_request_refresh()
+                return
+            assert day_of_week is not None
+            await self.async_set_xbox_allowed_hours(
+                child_id, day_of_week, start_hour, start_minute, end_hour, end_minute
+            )
+            return
         slots = _range_to_slots(start_hour, start_minute, end_hour, end_minute)
-        async with self._account_lock(child_id):
+        if today_only:
+            await self.today_only.async_apply(
+                child_id, platform, day_of_week, FIELD_ALLOWED_HOURS, slots
+            )
+            await self.async_request_refresh()
+            return
+        assert day_of_week is not None
+        async with self._account_lock(child_id), self.today_only.lock(child_id, platform):
             await self._set_screentime_intervals(child_id, day_of_week, slots)
             await self._update_saved_day(child_id, day_of_week, slots=slots)
-        self._update_cached_day(child_id, day_of_week, slots=slots)
+            self._update_cached_day(child_id, day_of_week, slots=slots)
+            await self.today_only.async_forget(
+                child_id, platform, day_of_week, FIELD_ALLOWED_HOURS
+            )
         await self.async_request_refresh()
 
     async def _update_saved_day(
@@ -1781,6 +1833,87 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             day["timeline"] = list(slots)
         daily[key] = day
         await self._async_save_screentime()
+
+    async def async_restore_today_only(
+        self, child_id: str, platform: str | None = None
+    ) -> None:
+        """Put back today-only changes now instead of at midnight."""
+        if platform is not None:
+            self._check_platform(platform)
+        await self.today_only.async_restore(child_id, platform)
+
+    # --- one day of a platform schedule, for today-only changes --------------
+    # Mobile API and Xbox Family Settings only. Reads always ask Microsoft
+    # (never the poll cache): the value read decides what midnight writes.
+    def today_only_fields(self, platform: str) -> tuple[str, ...]:
+        """Fields of a day that ``async_read_day`` / ``async_write_day`` handle."""
+        if platform == "Windows":
+            return (FIELD_LIMIT, FIELD_ALLOWED_HOURS)
+        if platform == "Xbox":
+            # Allowed hours only through the Xbox Family Settings service: the
+            # console does not enforce those of the mobile Xbox schedule.
+            if self._xapprove_active:
+                return (FIELD_LIMIT, FIELD_ALLOWED_HOURS)
+            return (FIELD_LIMIT,)
+        return ()
+
+    async def async_read_day(
+        self, child_id: str, platform: str, day_of_week: int
+    ) -> dict[str, Any]:
+        """Today's values of ``today_only_fields(platform)`` as Microsoft holds them."""
+        if self.web_api is None:
+            raise HomeAssistantError("Microsoft Family Safety is not connected")
+        if platform == "Xbox":
+            xuid = await self._xapprove_xuid_for(child_id)
+            if xuid is not None:
+                try:
+                    policy = schedule_to_policy(await self.xbox_family.async_get_schedule(xuid))
+                except XboxFamilyError as err:
+                    raise HomeAssistantError(f"Could not read the Xbox schedule: {err}") from err
+                day = (policy.get("dailyRestrictions") or {}).get(DAY_KEYS[day_of_week])
+                if not isinstance(day, dict):
+                    raise HomeAssistantError(
+                        f"The Xbox schedule has no {DAY_KEYS[day_of_week]}"
+                    )
+                hours, minutes = (int(p) for p in str(day["allowance"]).split(":")[:2])
+                # Allowed hours as [begin, end] minutes after midnight.
+                windows = [
+                    [_clock_to_minutes(i.get("begin")), _clock_to_minutes(i.get("end"))]
+                    for i in day.get("allowedIntervals") or []
+                    if isinstance(i, dict)
+                ]
+                return {FIELD_LIMIT: hours * 60 + minutes, FIELD_ALLOWED_HOURS: windows}
+        return await self.web_api.get_mobile_day(child_id, day_of_week, platform)
+
+    async def async_write_day(
+        self, child_id: str, platform: str, day_of_week: int, field: str, value: Any
+    ) -> None:
+        """Write one field of one day; the caller holds the platform lock."""
+        if self.web_api is None:
+            raise HomeAssistantError("Microsoft Family Safety is not connected")
+        if field not in self.today_only_fields(platform):
+            raise HomeAssistantError(f"{platform} {field} cannot be written")
+        if platform == "Xbox":
+            if field == FIELD_ALLOWED_HOURS:
+                await self._write_xbox_allowed_hours(
+                    child_id, day_of_week, [(int(b), int(e)) for b, e in value]
+                )
+            else:
+                await self._write_xbox_limit(child_id, day_of_week, int(value))
+            return
+        if field == FIELD_LIMIT:
+            hours, minutes = divmod(int(value), 60)
+            await self.web_api.set_mobile_screentime_allowance(
+                child_id, day_of_week, hours, minutes
+            )
+            self._update_cached_day(
+                child_id, day_of_week, allowance=f"{hours:02d}:{minutes:02d}:00"
+            )
+        else:
+            await self.web_api.set_mobile_screentime_intervals(
+                child_id, day_of_week, list(value)
+            )
+            self._update_cached_day(child_id, day_of_week, slots=list(value))
 
     def _update_cached_day(
         self,
@@ -2270,17 +2403,31 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise ValueError("day_of_week must be between 0 and 6")
         if hours < 0 or minutes < 0 or minutes > 59 or hours * 60 + minutes > 1440:
             raise ValueError("screen-time allowance must be between 0 and 24 hours")
+        async with self.today_only.lock(child_id, "Xbox"):
+            await self._write_xbox_limit(
+                child_id, day_of_week, hours * 60 + minutes, require_xapprove=require_xapprove
+            )
+            await self.today_only.async_forget(child_id, "Xbox", day_of_week, FIELD_LIMIT)
+        await self.async_request_refresh()
+
+    async def _write_xbox_limit(
+        self, child_id: str, day_of_week: int, total: int, *, require_xapprove: bool = False
+    ) -> None:
+        """Write one Xbox day's allowance.
+
+        Through xapprove when linked, else the mobile API; with
+        ``require_xapprove`` refused instead of that fallback.
+        """
+        hours, minutes = divmod(total, 60)
         if require_xapprove:
             xuid: str | None = await self._xapprove_xuid_required(child_id)
         else:
             if not self.web_api:
-                raise RuntimeError("Web API not initialized")
+                raise RuntimeError("API not initialized")
             xuid = await self._xapprove_xuid_for(child_id)
         if xuid is not None:
             try:
-                await self.xbox_family.async_set_day(
-                    xuid, day_of_week, minutes=hours * 60 + minutes
-                )
+                await self.xbox_family.async_set_day(xuid, day_of_week, minutes=total)
             except XboxFamilyError as err:
                 raise HomeAssistantError(f"Could not set the Xbox limit: {err}") from err
         else:
@@ -2295,7 +2442,6 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 entry["allowance"] = f"{hours:02d}:{minutes:02d}:00"
 
         self._set_xbox_policy_field(child_id, _update)
-        await self.async_request_refresh()
 
     async def async_set_xbox_allowed_hours(
         self,
@@ -2322,11 +2468,22 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "Xbox allowed hours must end later the same day than they start "
                 "(24:00 at the latest)"
             )
+        async with self.today_only.lock(child_id, "Xbox"):
+            await self._write_xbox_allowed_hours(
+                child_id, day_of_week, [(start_total, end_total)]
+            )
+            await self.today_only.async_forget(
+                child_id, "Xbox", day_of_week, FIELD_ALLOWED_HOURS
+            )
+        await self.async_request_refresh()
+
+    async def _write_xbox_allowed_hours(
+        self, child_id: str, day_of_week: int, windows: list[tuple[int, int]]
+    ) -> None:
+        """Write one Xbox day's allowed hours through xapprove, keeping its allowance."""
         xuid = await self._xapprove_xuid_required(child_id)
         try:
-            await self.xbox_family.async_set_day(
-                xuid, day_of_week, intervals=[(start_total, end_total)]
-            )
+            await self.xbox_family.async_set_day(xuid, day_of_week, intervals=list(windows))
         except XboxFamilyError as err:
             raise HomeAssistantError(f"Could not set the Xbox allowed hours: {err}") from err
         day = DAY_KEYS[day_of_week]
@@ -2336,13 +2493,13 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if isinstance(entry, dict):
                 entry["allowedIntervals"] = [
                     {
-                        "begin": f"{start_total // 60:02d}:{start_total % 60:02d}",
-                        "end": f"{end_total // 60:02d}:{end_total % 60:02d}",
+                        "begin": f"{begin // 60:02d}:{begin % 60:02d}",
+                        "end": f"{end // 60:02d}:{end % 60:02d}",
                     }
+                    for begin, end in windows
                 ]
 
         self._set_xbox_policy_field(child_id, _update)
-        await self.async_request_refresh()
 
     async def async_set_xbox_schedule_enabled(self, child_id: str, enabled: bool) -> None:
         """Turn the Xbox schedule on or off, keeping its days as they are."""
@@ -3082,6 +3239,9 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             pending = getattr(self.api, "pending_requests", None) or []
             self._fire_request_events(pending, accounts_data)
             self._is_retrying_auth = False
+            # Today-only changes from an earlier day (Home Assistant was down
+            # at midnight, or the clock skipped it) are put back now.
+            self.today_only.async_schedule_restore_due({str(k) for k in accounts_data})
             return {"accounts": accounts_data, "devices": devices_data, "pending_requests": pending}
         except HttpException as err:
             if "401" in str(err) or "authentication" in str(err).lower():
