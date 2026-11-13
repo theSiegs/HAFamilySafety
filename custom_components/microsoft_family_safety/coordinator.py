@@ -1171,21 +1171,16 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         raise ValueError(f"Account {account_id} not found")
 
     def _sync_blocked_platforms(self) -> None:
-        """Put the Xbox lock state our writes left into the polled data.
+        """Put the lock state our writes left into the polled data.
 
-        Only the Xbox entry: it comes from the overrides this integration
-        tracks, the other platforms from the last poll.
+        A mobile write sets the account's blocked platforms from its answer
+        (with the write grace), the Xbox comes from the overrides this
+        integration tracks: the merge the poll does gives both.
         """
-        now = dt_util.utcnow()
-        for key in self._accounts:
+        for key, account in self._accounts.items():
             data = self._account_data(key)
-            if data is None:
-                continue
-            blocked = [p for p in (data.get("blocked_platforms") or []) if p != "Xbox"]
-            until = self._platform_override_until.get((str(key), "xbox"))
-            if until is not None and until > now:
-                blocked.append("Xbox")
-            data["blocked_platforms"] = blocked
+            if data is not None:
+                data["blocked_platforms"] = self._merge_blocked_platforms(account)
 
     def _account_data(self, account_id: Any) -> dict[str, Any] | None:
         """A child's polled data, whether the id comes as int or str."""
