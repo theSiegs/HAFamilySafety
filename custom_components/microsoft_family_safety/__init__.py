@@ -52,6 +52,7 @@ from .const import (
     SERVICE_CANCEL_TIME_BONUS,
     SERVICE_RESTORE_TODAY_ONLY,
     SERVICE_SYNC_SITE_LIST,
+    SERVICE_PROBE_APP_POLICY,
     CONF_ALLOWED_USERS,
     SCREENTIME_PLATFORMS,
 )
@@ -107,6 +108,11 @@ SERVICE_ADD_TIME_BONUS_SCHEMA = child_schema({
 
 SERVICE_CANCEL_TIME_BONUS_SCHEMA = child_schema({
     vol.Optional("platform", default="Xbox"): _platform("Xbox", "Windows"),
+})
+
+SERVICE_PROBE_APP_POLICY_SCHEMA = vol.Schema({
+    vol.Required("account_id"): cv.string,
+    vol.Required("app_id"): cv.string,
 })
 
 SERVICE_APPROVE_REQUEST_SCHEMA = vol.Schema({
@@ -463,6 +469,22 @@ def _register_services(hass: HomeAssistant) -> None:
                 return result
             return None
         return handler
+
+    async def probe_app_policy(call: ServiceCall) -> dict:
+        """Diagnostic: every candidate read of one app's policy (no writes)."""
+        await async_require_admin(hass, call)
+        coordinator = _get_coordinator(hass, call.data["account_id"])
+        if coordinator is None:
+            raise HomeAssistantError("No Microsoft Family Safety coordinator available")
+        return await coordinator.async_probe_app_policy(
+            call.data["account_id"], call.data["app_id"]
+        )
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_PROBE_APP_POLICY, guard_service(hass, probe_app_policy),
+        schema=SERVICE_PROBE_APP_POLICY_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
+    )
 
     for name, schema, method, extract in services:
         per_child = schema not in (
