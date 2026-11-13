@@ -8,7 +8,7 @@
 
 A full-featured Home Assistant custom integration for **Microsoft Family Safety**. Monitor screen time, manage app restrictions, lock accounts, control web filtering, and adjust daily limits — all from your Home Assistant dashboard.
 
-Authentication is **native**: you sign in to Microsoft from Home Assistant itself. The Playwright auth add-on is no longer required and is kept only as a [legacy fallback](#legacy-add-on-mode).
+Authentication is **native**: you sign in to Microsoft once, from Home Assistant itself. After that the integration runs on the long-lived token of the Family Safety app (and, for the Xbox, on the Xbox Family Settings sign-in) and never visits Microsoft's web pages on its own.
 
 **Supported platforms:** Windows, Xbox, Mobile
 
@@ -56,66 +56,61 @@ This **breaks dashboards, automations, scripts and templates** that reference th
 
 > Note the device-name prefix is not identical across platforms: sensors, numbers and time entities are prefixed with *first name + surname*, while switches and buttons are prefixed with the *first name only*.
 
-### The add-on is no longer required
+### The Family web session is no longer used
 
-The Playwright auth add-on is now a **legacy fallback**. New installations should not install it. Existing installations keep working unchanged — see [Legacy add-on mode](#legacy-add-on-mode).
+The integration no longer keeps a Microsoft Family **web session** (the `account.microsoft.com` cookies captured at sign-in). Microsoft makes some accounts renew that session with an interactive sign-in every 24 hours ([#52](https://github.com/noiwid/HAFamilySafety/issues/52)), and the integration's own attempts to keep it alive (the `/account` probe, the Family dashboard bootstrap, the silent "Continue" renewal) are what landed on Microsoft's sign-in pages and sent security codes to the parent's phone.
+
+Existing entries keep working on their mobile token, without a new sign-in: the stored cookies are deleted from the entry at the first start. What changes:
+
+- **Xbox lock and Xbox play time** come only from the [Xbox Family Settings sign-in](#xbox). It is linked during the Microsoft sign-in when Microsoft allows it, otherwise from the integration options. Without it, the Xbox lock switch reports an error instead of locking, the Xbox play time is not added to the screen time, and a repair issue asks you to link it.
+- **Windows platform lock** always uses the mobile API's device override (the web time override is gone).
+- **Reauthentication** is only asked when Microsoft refuses the integration's refresh token. A lapsed web session, the Family dashboard asking for a sign-in, or missing cookies no longer start one. A refused Xbox Family Settings sign-in raises a repair issue asking for a new Xbox link instead.
+- **Connection sensor**: the web-session attributes are gone (see [Sensor — Per Integration](#sensor--per-integration)); `degraded` now means the Xbox Family Settings link is missing or refused while Xbox is ticked.
+- **Sign-in**: every entry signs in through the Family Safety app's own page. "Stay signed in?" no longer matters, and an HTTP-only instance can always use the manual redirect step, for a reauthentication too.
+
+### The add-on is no longer used
+
+The Playwright auth add-on is not contacted any more. Entries created with it keep working on their mobile token, without a new sign-in; the add-on (and its standalone container) can be uninstalled.
 
 ---
 
 ## Architecture
 
-The integration authenticates natively inside Home Assistant and talks to both Microsoft backends itself. **No add-on, no browser automation, and no separate container are needed in the normal case.**
+The integration authenticates natively inside Home Assistant and talks to Microsoft's backends itself. **No add-on, no browser automation, and no separate container are needed.**
 
-### The two Microsoft APIs
-
-Microsoft Family Safety has **two distinct APIs**, each with its own authentication. The integration uses both:
+### The Microsoft APIs
 
 | API | Base URL | Auth Method | Capabilities |
 |-----|----------|-------------|-------------|
-| **Mobile API** | `mobileaggregator.family.microsoft.com` | OAuth Bearer token (from a long-lived refresh token) | Almost everything: family roster, devices, usage, screen time schedules (Windows and Xbox), account lock, app blocking and app time limits, websites, age rating, ask-to-buy, requests. |
-| **Web API** (private) | `account.microsoft.com/family/api/` | Microsoft session cookies + a `__RequestVerificationToken` antiforgery token | Xbox play time and the Xbox lock. Also a fallback for the schedules. |
+| **Mobile API** | `mobileaggregator.family.microsoft.com` | OAuth Bearer token (from the long-lived refresh token of the Family Safety app, client `000000000004893A`) | Family roster, devices, usage, screen time schedules (Windows and Xbox), account lock, Windows/Mobile platform lock, app blocking and app time limits, websites, age rating, ask-to-buy, requests. |
+| **Xbox Family Settings** | `xapprove.xboxlive.com` | Refresh token of the Xbox Family Settings app (client `00000000482c8f49`), exchanged for Xbox Live tokens | The Xbox schedule the console enforces, the Xbox lock and Xbox play time. |
 
-Since 2.0.17-2.0.21 everything except those two Xbox features runs on the mobile API, the same way the Family Safety app works. That matters because Microsoft makes some accounts renew the web session with an interactive sign-in every 24 hours ([#52](https://github.com/noiwid/HAFamilySafety/issues/52)), while the mobile refresh token lasts. If your children have no Xbox, leave **Xbox** unticked among the monitored platforms and the integration does not use the web session at all (see [Xbox and the web session](#xbox-and-the-web-session)).
+Both run on refresh tokens, the same way Microsoft's own apps work; neither needs a browser session. Microsoft's private web API (`account.microsoft.com/family/api`) is not used.
 
 ### How native authentication works
 
-You sign in **once**, in your normal browser, through a short-lived reverse proxy that Home Assistant mounts inside its own HTTP server.
+You sign in **once**, in your normal browser, through a short-lived reverse proxy that Home Assistant mounts inside its own HTTP server. The proxy serves Microsoft's mobile OAuth page, the one the Family Safety app uses, and captures the redirect carrying the authorization code; that code becomes the refresh token for the mobile API.
 
-**Without Xbox among the monitored platforms**, that sign-in is the one the Family Safety app uses: Microsoft's mobile OAuth page, which hands back the refresh token for the mobile API, and that is all. No web session is created or stored.
-
-**With Xbox ticked**, two things happen behind that single sign-in:
-
-**Step 1 — Family web session.** The proxy serves the regular `account.microsoft.com` sign-in. Answer **Yes** to "Stay signed in?": that answer is what makes Microsoft issue persistent session cookies (valid for about a year), so the Family session no longer has to be renewed every few hours. (Before 2.0.4 the flow signed in through the mobile app's OAuth page instead, which never asks the question, and sessions expired after about 7 hours.) Once you are signed in, the same tab is redirected a few times so the Family dashboard can be loaded and its `__RequestVerificationToken` read. This part may take up to about 60 seconds; Home Assistant shows a waiting screen.
-
-**Step 2 — mobile refresh token.** With the cookies from step 1, Home Assistant completes the mobile OAuth authorization **server-side**: Microsoft answers with a single redirect carrying the authorization code, with no second sign-in page. That code becomes the refresh token used for the mobile API. Should Microsoft ever require an interactive step here, the flow falls back to finishing it in your browser.
-
-The browser part of step 1 is required and cannot be removed: a cold-start, purely server-side bootstrap is impossible because Microsoft gates the Family dashboard behind an interactive `prompt=none` OAuth hop.
+With **Xbox** among the monitored platforms, Home Assistant then asks Microsoft, with the cookies of that same sign-in and only during the sign-in, for an authorization code of the Xbox Family Settings app. When Microsoft answers without another sign-in page, the Xbox link is made with no extra step; otherwise link it from the integration options (see [Xbox](#xbox)). The sign-in cookies are discarded at the end of the flow: only the two refresh tokens are kept.
 
 ### After sign-in: no browser at all
 
-After the sign-in, Home Assistant talks to both APIs **directly over HTTPS** from the integration. The schedules go through the mobile API (`/v4/devicelimits/schedules`, the endpoint the Family Safety app uses), with the web API's `/family/api/st` as a fallback when a web session exists.
+After the sign-in, Home Assistant talks to both APIs **directly over HTTPS** from the integration, on the refresh tokens only. It never loads `account.microsoft.com` or a Microsoft sign-in page on its own.
 
 ### Data flow
 
 ```
 Poll loop (default every 5 min)
-  ├─ Mobile API   → roster, devices, apps, usage, schedules (Windows + Xbox),
-  │                 websites, content restrictions, app limits switch
-  └─ Web API      → Xbox play time report, Xbox lock state (Xbox ticked only)
+  ├─ Mobile API            → roster, devices, apps, usage, schedules (Windows + Xbox),
+  │                          websites, content restrictions, app limits switch
+  └─ Xbox Family Settings  → Xbox schedule, Xbox lock state, Xbox play time (linked only)
 
 Service call / entity write
-  ├─ Mobile API   → schedules, account lock, app blocking and app limits,
-  │                 websites, age rating, ask-to-buy, requests, Xbox limits
-  └─ Web API      → Xbox lock (Xbox ticked only)
+  ├─ Mobile API            → schedules, account lock, Windows/Mobile platform lock,
+  │                          app blocking and app limits, websites, age rating,
+  │                          ask-to-buy, requests, Xbox limits (when not linked)
+  └─ Xbox Family Settings  → Xbox lock, Xbox limits (linked only)
 ```
-
-### Legacy add-on mode
-
-The `familysafety-playwright/` add-on is being phased out. Since 2.0.22 a new install can no longer choose it (the add-on URL and key fields are gone from the setup and options forms). Existing add-on entries keep working as before, and reauthenticating one (from the notification, Repairs or **Reconfigure**) moves it to the native sign-in for good: its add-on URL and key are cleared and the add-on can then be uninstalled.
-
-The cases the add-on used to cover are handled natively now: an HTTP-only instance can sign in through the manual redirect step as long as **Xbox** is not ticked (the mobile token is all it needs), and the schedules no longer depend on a browser session at all.
-
-Legacy and native mode are mutually exclusive per config entry; there is no automatic downgrade from native to add-on at runtime.
 
 ---
 
@@ -132,7 +127,7 @@ Legacy and native mode are mutually exclusive per config entry; there is no auto
 | **Web filtering** | Block/unblock domains (one or several per call), read the blocked and allowed lists, toggle content filtering (action or switch), set PEGI age ratings |
 | **Purchase controls** | Enable/disable ask-to-buy via service call |
 | **Request handling** | Approve or deny pending screen time requests from HA |
-| **Connection diagnostics** | A dedicated sensor reports whether the mobile API and the web session are healthy |
+| **Connection diagnostics** | A dedicated sensor reports whether the mobile API and the Xbox Family Settings sign-in are healthy |
 | **Dashboard cards** | A per-child card with sheets for every setting, and screen time cards shared with Google Family Link, served by the integration ([details](#dashboard-cards)) |
 | **Optimistic updates** | UI values update instantly when changing limits or intervals (reverts on failure) |
 
@@ -166,14 +161,13 @@ Legacy and native mode are mutually exclusive per config entry; there is no auto
 
 1. Go to **Settings > Devices & Services > Add Integration**
 2. Search for **Microsoft Family Safety**
-3. Set the **update interval** and the **monitored platforms** (Windows, Xbox, Mobile). Tick **Xbox** only if your children use one: without it the sign-in is shorter and Home Assistant never needs the Microsoft web session. Click **Submit**
+3. Set the **update interval** and the **monitored platforms** (Windows, Xbox, Mobile). Tick **Xbox** only if your children use one. Click **Submit**
 4. Home Assistant shows an **Open website** button. Click it: a browser window opens on the Microsoft sign-in page, served through Home Assistant's temporary authentication proxy
-5. Sign in with your **Microsoft parent account** (the family organizer, not a child account) and complete MFA if prompted. With Xbox ticked, answer **Yes** when Microsoft asks **"Stay signed in?"**: this is what keeps the web session valid for longer than a few hours
-6. **Keep the window open and be patient.** With Xbox ticked, Home Assistant completes the Family session in the background after the visible sign-in and fetches the mobile token from the same sign-in. The waiting screen can sit for **up to about a minute** without visibly updating, and the tab may briefly redirect again — this is normal. Do not click *Open website* again and do not close the dialog; wait for it to switch to the completion screen on its own. Without Xbox, the window finishes as soon as Microsoft hands back the token
-7. When both steps complete, the window closes itself and Home Assistant shows **Microsoft Family Safety sign-in completed**. Click **Continue**
-8. The integration discovers all child accounts and devices automatically. Screen-time entities can read `unknown` for up to one update interval (5 minutes by default) while the first data pull completes; that is expected
+5. Sign in with your **Microsoft parent account** (the family organizer, not a child account) and complete MFA if prompted
+6. As soon as Microsoft hands back the token, the window closes itself; Home Assistant shows a short progress screen while it fetches the tokens, then creates the integration. With Xbox ticked, Home Assistant also tries to link the Xbox Family Settings sign-in in the same step (see [Xbox](#xbox))
+7. The integration discovers all child accounts and devices automatically. Screen-time entities can read `unknown` for up to one update interval (5 minutes by default) while the first data pull completes; that is expected
 
-> The old flow — copy an auth URL, sign in, paste the redirect URL back — is gone in the normal case. It survives as a fallback on HTTP-only instances, for legacy add-on users and for entries without Xbox (which only need the mobile token).
+> The old flow — copy an auth URL, sign in, paste the redirect URL back — is gone in the normal case. It survives as a fallback on HTTP-only instances.
 
 ### Integration Options
 
@@ -182,7 +176,7 @@ Legacy and native mode are mutually exclusive per config entry; there is no auto
 | Option | Range / Format | Default | Notes |
 |--------|----------------|---------|-------|
 | Update interval (seconds) | 30 – 3600 | 300 (5 min) | |
-| Monitored platforms | Windows / Xbox / Mobile | Windows | One lock switch per platform. Xbox also decides whether the web session is used, see [below](#xbox-and-the-web-session) |
+| Monitored platforms | Windows / Xbox / Mobile | Windows | One lock switch per platform. Xbox also adds the Xbox entities, see [below](#xbox) |
 | Users allowed to control Microsoft Family Safety | list of Home Assistant users | *(empty: everybody)* | See [Who can control the integration](#who-can-control-the-integration) |
 | Allow insecure local HTTP authentication (testing only) | on / off | off | See below |
 | Link the Xbox Family Settings sign-in | on / off | off | Only with Xbox ticked; for when the Connection sensor shows `xbox_family: not_linked`. Opens a Microsoft sign-in through the same temporary proxy as the setup, which picks up the result itself: sign in, close the window, done. A passkey does not work through the proxy (it is tied to Microsoft's address), here or in the main sign-in: choose *Sign in another way*. Without an HTTPS URL (or the local HTTP option below), or if the sign-in does not finish within 10 minutes, you paste the address of the blank page Microsoft ends on instead |
@@ -199,14 +193,16 @@ The option **Users allowed to control Microsoft Family Safety** closes that gap:
 
 Give the child a **non-administrator** account and tick the parents: an administrator can change this option, so a child with an administrator account bypasses it. The child still sees the entities (Home Assistant cannot hide them per user) but can no longer use them. Changing the option takes effect immediately, without reloading the integration.
 
-#### Xbox and the web session
+#### Xbox
 
-Xbox play time and the Xbox lock are the only features that still need the Microsoft **web session**, which some accounts must renew with an interactive sign-in every 24 hours ([#52](https://github.com/noiwid/HAFamilySafety/issues/52)). Everything else, Xbox daily limits included, runs on the mobile token.
+The Xbox lock, the Xbox limits and Xbox play time go through the **Xbox Family Settings** app's service, on its own refresh token. Microsoft moved the Xbox settings there: its per-day limits are the ones the console enforces, and an Xbox override stored by the Family Safety mobile API is accepted but ignored by the console.
 
-- **Xbox ticked** among the monitored platforms: the sign-in captures both the web session and the mobile token, and the Xbox entities are created. Installs made before 2.0.22 keep this behaviour (the options show Xbox ticked) until you untick it.
-- **Xbox unticked** (the default for new installs): the integration runs on the mobile token only. The sign-in is the short one of the Family Safety app, no browser cookies are stored, the connection sensor no longer reports `degraded` for a missing web session, and no Xbox entities are created (Xbox lock, Xbox schedule switch, Xbox daily limits).
+- **Xbox ticked** among the monitored platforms: the Xbox entities are created (Xbox lock, Xbox schedule switch, Xbox daily limits). The Xbox Family Settings sign-in is linked during the Microsoft sign-in when Microsoft allows it. Otherwise a repair issue appears (and the Connection sensor shows `xbox_family: not_linked`): open the options, tick **Link the Xbox Family Settings sign-in**, open the link shown, sign in with the parent account and paste the address of the blank page you end up on. If Microsoft later refuses that sign-in, it is retried every 6 hours and a repair issue asks you to link it again the same way.
+- **Xbox unticked** (the default for new installs): no Xbox entities are created and no Xbox Family Settings link is made.
 
-Unticking Xbox later takes effect at once; the web credentials already stored stay unused and are removed at the next reauthentication. Ticking it again starts a reauthentication so the web session can be captured. Xbox entities created earlier stay in the entity list as unavailable; remove them there if you like.
+Without the link, the Xbox daily limits and the Xbox schedule switch still work through the mobile API, but the Xbox lock fails with an error (the mobile API's Xbox override does nothing on the console) and the Xbox play time is not read. Children are matched to their Xbox account by first name and surname; a child whose names differ between Microsoft and Xbox is reported in `xbox_family_unmatched_children` and has no Xbox lock.
+
+Unticking Xbox later takes effect at once. Xbox entities created earlier stay in the entity list as unavailable; remove them there if you like.
 
 #### Insecure local HTTP authentication
 
@@ -221,35 +217,9 @@ Use it for testing, or on a network you fully trust. Setting up HTTPS is the bet
 
 ### Re-authenticating
 
-Microsoft sessions expire. The account page session lapses about once a day; since 2.0.6 the integration completes Microsoft's silent sign-in on its own (the same "Continue" step a browser performs), so you should not be asked to sign in again as long as the "Stay signed in?" cookies are valid. When the login itself is gone, Home Assistant raises a **repair / reauthentication** prompt and a persistent notification. That also covers the case where Microsoft has dropped the Family session while the account page still answers: after two consecutive updates in that state the connection sensor reports `degraded` with `reauth_recommended: true` and the reauthentication flow is started for you. You can also start it yourself at any time with the `microsoft_family_safety.request_reauth` service (handy from a dashboard button). Re-authenticating runs the same sign-in and renews **both** the Family web session and the mobile refresh token (only the token without Xbox).
-
-Since 2.0.20 a dead web session no longer triggers a reauthentication on its own as long as the schedules answer through the mobile API: only the Xbox features stop working. Without Xbox, the web session is not used at all and only an expired mobile token can ask you to sign in again.
+The mobile refresh token is long-lived and renewed by the integration on its own; you are not asked to sign in again as long as Microsoft accepts it. When Microsoft refuses it (password change, security review, revoked sign-in), Home Assistant raises a **repair / reauthentication** prompt. A refused Xbox Family Settings sign-in does not: it only affects the Xbox features, and a repair issue asks you to link it again from the options (see [Xbox](#xbox)). You can also start a reauthentication yourself at any time with the `microsoft_family_safety.request_reauth` service (handy from a dashboard button). Re-authenticating runs the same sign-in, renews the refresh token and, with Xbox ticked and the Xbox link missing or refused, links the Xbox Family Settings sign-in again.
 
 Reauthentication must use the **same Microsoft account** — signing in with a different one aborts with *"A different Microsoft account was used"*.
-
-#### Daily sign-in on some accounts, and a community workaround
-
-Since early October 2026, Microsoft asks some accounts for an interactive Family sign-in every 24 hours, whatever the cookies say (see [#52](https://github.com/noiwid/HAFamilySafety/issues/52)). The connection sensor then reports `signin_required`, and nothing server-side can avoid the sign-in itself.
-
-Since 2.0.20 this only affects the Xbox play time and the Xbox lock: everything else keeps working on the mobile token and the integration no longer asks you to sign in for it. If your children have no Xbox, untick **Xbox** among the monitored platforms and the question goes away entirely.
-
-If you rely on the Xbox play time or the Xbox lock and want the daily sign-in unattended, [BartVPL/HAFamilySafety-Auto-Reauth](https://github.com/BartVPL/HAFamilySafety-Auto-Reauth) is a community project that watches the connection sensor, drives the sign-in through Playwright on a separate Linux host, reads the one-time code Microsoft emails through the Gmail API, and completes the flow. It only uses what the integration already exposes (the connection sensor, the `request_reauth` service and the reauth flow). Read its README before installing: it is **not part of this integration, not reviewed here and experimental**. It needs a long-lived Home Assistant token, read-only OAuth access to the mailbox that receives the Microsoft codes, and runs a browser on a machine you must keep secure. Weigh that against signing in by hand once a day.
-
-### Legacy add-on installation
-
-New installs no longer use the add-on (see [Legacy add-on mode](#legacy-add-on-mode)). This section remains for entries that still run on it. Reauthenticating such an entry moves it to the native sign-in, after which the add-on and its standalone container (see [`familysafety-playwright/README.standalone.md`](familysafety-playwright/README.standalone.md)) can be removed.
-
-#### Add-on Configuration
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `log_level` | `info` | Logging verbosity (`trace`, `debug`, `info`, `warning`, `error`) |
-| `auth_timeout` | `300` | Seconds to wait for user to complete authentication (60-600) |
-| `session_duration` | `86400` | Session validity in seconds (1h-7d) |
-| `language` | *(auto)* | Browser locale (e.g., `fr-FR`, `en-US`) |
-| `timezone` | *(auto)* | Browser timezone (e.g., `Europe/Paris`) |
-| `vnc_password` | `familysafety` | Password for the noVNC interface |
-| `api_key` | *(auto)* | Only needed when Home Assistant runs on another host |
 
 ---
 
@@ -331,9 +301,9 @@ Windows uses the Windows schedule and the minutes of the child's Windows devices
 
 | Entity | Entity ID | State | Key Attributes |
 |--------|-----------|-------|----------------|
-| Connection | `sensor.microsoft_family_safety_connection` | connected / degraded / disconnected | `mobile_api`, `web_session`, `web_api`, `family_context`, `screentime_policy_source`, `native_web_auth`, `reauth_required`, `reauth_recommended`, `last_update_success` |
+| Connection | `sensor.microsoft_family_safety_connection` | connected / degraded / disconnected | `mobile_api`, `roster_errors`, `screentime_policy_status`, `xbox_features`, `xbox_family`, `xbox_family_linked_via`, `xbox_family_last_error`, `xbox_family_matched_children`, `xbox_family_unmatched_children`, `reauth_required`, `reauth_reason`, `last_update_success` |
 
-`degraded` means the mobile API works but the Family web session does not. Since 2.0.20 that only affects the Xbox play time and the Xbox lock; the schedules keep working on the mobile API. Without Xbox the web session is not used and the state is `connected` whenever the mobile API answers (attribute `xbox_features: false`). When that state persists for two consecutive updates, `reauth_recommended` turns `true`, a notification is raised and the reauthentication flow is started automatically. Only a real login redirect, an expired account session or that two-update condition triggers reauthentication; a single rejected request does not, to avoid loops on a merely stale token. This is a **diagnostic** entity; enable it in the entity list if it is hidden.
+`connected` means the mobile API answers. `degraded` means it does, but with Xbox ticked the Xbox Family Settings link is missing (`xbox_family: not_linked`) or refused (`xbox_family: auth_failed`): only the Xbox lock and Xbox play time are affected, and a repair issue says how to link it. `disconnected` means the mobile API does not answer. `screentime_policy_status` is `ok`, `no_policy_data`, `network_error` or `error` for the last Windows schedule read. This is a **diagnostic** entity; enable it in the entity list if it is hidden.
 
 ### Switches — Per Child Account
 
@@ -345,7 +315,7 @@ Windows uses the Windows schedule and the minutes of the child's Windows devices
 | App Limits | `switch.{prefix}_app_limits` | The "App, feature, and game limits" toggle above the app list. While it is OFF, the per-app time limits are kept but not enforced. |
 | Web Filtering | `switch.{prefix}_web_filtering` | ON = Microsoft filters inappropriate websites and searches in Microsoft Edge, and the blocked and allowed lists apply. Same write as the `toggle_web_filter` action. |
 | App Block | `switch.{prefix}_app_{appname}` | ON = app blocked. One switch per application. |
-| Platform Lock | `switch.{prefix}_{platform}_lock` | ON = platform locked. Locks one platform (e.g. Windows) through a Microsoft device override. For Windows the integration tries a web-API time override first, then falls back to the mobile API. Use **Account Lock** to lock every platform at once. |
+| Platform Lock | `switch.{prefix}_{platform}_lock` | ON = platform locked. Windows and Mobile are locked through the mobile API's device override, the Xbox through the [Xbox Family Settings](#xbox) sign-in (an error without it). Use **Account Lock** to lock every platform at once. |
 
 ### Buttons — Per Child Account
 
@@ -377,7 +347,7 @@ One start/end pair per day of the week, editable from the UI with optimistic upd
 
 ## Services
 
-The integration exposes **23 services**, split between the pyfamilysafety library, the web API and the Xbox Family Settings service, plus one to start the sign-in flow on demand.
+The integration exposes **23 services**, split between the pyfamilysafety library, the integration's own mobile API calls and the Xbox Family Settings service, plus one to start the sign-in flow on demand.
 
 Every service that acts on one child takes the child either as `account_id` (the Microsoft user ID, shown in the `user_id` attribute of the child's entities) or as `entity_id`: any Microsoft Family Safety entity of that child or of one of its devices. `device_id` works the same way: the child's Microsoft Family Safety device or one of its physical devices. The account is looked up from the entity or device, so automations need no hard-coded ID. Lists are accepted as long as everything in them belongs to the same child. When `account_id` is given, it wins.
 
@@ -699,7 +669,7 @@ data:
 
 ### Reauthentication
 
-Starts the Microsoft sign-in flow immediately, without waiting for the integration to detect an expired session. Useful behind a dashboard button (the example card's connection pill opens the integration page for the same purpose). No fields.
+Starts the Microsoft sign-in flow immediately, without waiting for Microsoft to refuse the stored sign-in. Useful behind a dashboard button (the example card's connection pill opens the integration page for the same purpose). No fields.
 
 ```yaml
 service: microsoft_family_safety.request_reauth
@@ -931,12 +901,11 @@ This page appears when the same address exists as both kinds of Microsoft accoun
 
 Microsoft's sign-in page links some of its own pages with an explicit port (`login.microsoftonline.com:443`), and versions before 2.0.4 rejected that host. Update to 2.0.4 or later; the port is ignored now. If you still see it, the host in the address bar after `__ms_host__/` is not one of the sign-in hosts (`account.microsoft.com`, `account.live.com`, `login.live.com`, `login.microsoft.com`, `login.microsoftonline.com`), which the proxy deliberately refuses. Please open an issue with that host name.
 
-### Sign-in never finishes / stuck on the waiting screen
+### Sign-in never finishes
 
-- The waiting screen after the visible sign-in can legitimately sit for up to about **a minute** without updating. Keep the Microsoft window open, do not click **Open website** again and do not close the dialog while it is running.
 - The authentication proxy expires **10 minutes** after it is created. If you took longer, start the flow again.
 - **On a phone** (Home Assistant app or mobile browser) the Microsoft page opens in a separate browser. Once it shows *Authentication completed*, close it and switch back to Home Assistant: since 2.0.9 the dialog picks up the result within a few seconds of coming back. Before 2.0.9 it could stay stuck because Android pauses the app while the sign-in runs; signing in from a desktop browser avoids that on older versions.
-- If Home Assistant aborts with *"Native web authentication could not be loaded"* or *"The browser authentication flow expired"*, simply restart the flow.
+- If Home Assistant aborts with *"The browser sign-in could not be loaded"* or *"The browser authentication flow expired"*, simply restart the flow.
 
 
 ### "502 Bad Gateway" from nginx during sign-in
@@ -959,20 +928,18 @@ Your Home Assistant URL is not HTTPS. Either configure HTTPS (recommended), or e
 
 ### Screen time reads return `unknown`
 
-- Check the **Connection** sensor: `screentime_policy_source` should be `mobile_v4`. If it is not, the mobile schedule read failed and the integration fell back to the web session.
-- If both fail, the most common cause is an expired Microsoft session. Home Assistant raises a reauthentication prompt and a persistent notification — complete it.
-- After a network or timeout error on the schedule endpoint, the integration backs off for **30 minutes** before retrying. If a fix seems to have no effect, you may be inside that window; reload the integration to clear it.
-- Versions before 2.0.3 could stay in this state indefinitely without ever asking you to re-authenticate: a rejected Family request left the captured session marked valid, so the check that detects an expired login never ran again. If you are on an older version and the schedule has been `unknown` for days while the mobile sensors keep updating, update and reload; the reauthentication prompt will appear.
+- Check the **Connection** sensor's `screentime_policy_status`: `network_error` means Microsoft did not answer (it is retried at the next update), `error` that it refused the request or answered something unreadable (see the debug log), `no_policy_data` that the child has no Windows schedule.
+- If Microsoft refuses the refresh token itself, every sensor stops updating and Home Assistant raises a reauthentication prompt — complete it.
 
 ### Screen time writes fail
 
-- Writes go to the mobile API first and to the web API only as a fallback. If reads are also `unknown`, fix authentication first.
+- Writes go to the mobile API (`/v4/devicelimits/schedules`, as the Family Safety app). If reads are also `unknown`, fix that first.
 - Microsoft answers the schedule writes slowly: a lock or unlock (7 days, allowance and time window each) can take about a minute.
 - A partial failure raises an error naming how many of the 7 weekdays were updated, and **keeps the saved restore point** so you can safely retry.
 
 ### Account Lock issues
 
-- **Lock refuses to run** with *"current schedule unreadable and no saved policy exists"* — this is the safety guard from issue #23. It prevents wiping a child's real schedule when the current one cannot be read and there is nothing to restore from. The message tells you which case you are in: an expired session (re-authenticate), or a timeout / network error / active backoff (retry in a few minutes).
+- **Lock refuses to run** with *"current schedule unreadable and no saved policy exists"* — this is the safety guard from issue #23. It prevents wiping a child's real schedule when the current one cannot be read and there is nothing to restore from. When Microsoft did not answer, the message says so: retry in a few minutes.
 - **Unlock refuses to run** with *"no saved schedule to restore"* — the restore point is gone, typically because `.storage/microsoft_family_safety.saved_screentime.<entry_id>` was deleted. The integration will not invent a schedule; set the daily limits again from Home Assistant or at [account.microsoft.com/family](https://account.microsoft.com/family). Before 2.0.3 it wrote a 2 h/day, 07:00-22:00 default here, which silently replaced the real schedule.
 - **Lock is account-wide** — it affects all platforms simultaneously.
 - Lock and unlock **stop at the first network failure** rather than waiting out a timeout for each of the seven days, and keep the saved schedule so the operation can be retried.
@@ -980,13 +947,6 @@ Your Home Assistant URL is not HTTPS. Either configure HTTPS (recommended), or e
 ### "Microsoft cannot resolve part of the family roster"
 
 Microsoft's mobile API sometimes answers `Family.UnableToFindTargetResource` / `RosterError` (HTTP 404) for one child, typically when a reset or decommissioned device is still listed in the family, or when a school/work (Entra ID) account is enrolled on the child's device. Since 2.0.7 the integration keeps running: the affected child keeps empty values for the data Microsoft refuses (devices, screen-time usage, apps, lockable platforms or spending), everything else loads normally, and a persistent notification plus the `roster_errors` attribute of the Connection sensor tell you which member and which data are affected. Removing the stale device at https://account.microsoft.com/family clears it when that is possible; a school-managed device usually cannot be removed, in which case the degraded data for that child is expected.
-
-### Legacy add-on mode
-
-- Make sure the add-on is **started** (green icon in the Add-ons page).
-- The integration resolves the add-on hostname dynamically via the Supervisor API, or uses the add-on URL stored in the entry when it was created.
-- If the session is dead (redirect to a marketing page), the simplest fix since 2.0.8 is to reauthenticate the entry from Home Assistant: it switches the entry to the native sign-in (answer Yes to "Stay signed in?"). Re-authenticating via the noVNC interface still works if you want to stay on the add-on.
-- Add-on writes take ~20-30 s each because the browser must reach the family dashboard first.
 
 ### Diagnostics
 
@@ -1002,7 +962,7 @@ logger:
     pyfamilysafety: debug
 ```
 
-Useful markers: `family_token_present`, `exported_cookies`, `bootstrap_attempts` during sign-in; `Microsoft Family context requires browser authentication` when the Family session needs re-establishing.
+Useful markers: `Native Microsoft Family mobile OAuth redirect captured` at the end of the browser sign-in; `Xbox Family Settings linked from the sign-in` or `could not be linked from the sign-in` right after it.
 
 ---
 
@@ -1010,9 +970,9 @@ Useful markers: `family_token_present`, `exported_cookies`, `bootstrap_attempts`
 
 ### Security
 
-Native authentication trades some of the add-on's isolation for simplicity. Be aware of the following before enabling it:
+Be aware of the following before enabling native authentication:
 
-- **Credentials are stored in clear text.** Microsoft session cookies, the Family antiforgery token and the OAuth refresh token are persisted in the config entry and in `.storage/` **unencrypted**. The legacy add-on encrypted its cookie file with Fernet; the native path does not. Anyone with read access to your Home Assistant configuration directory (including backups) can extract a usable Microsoft session. Protect and encrypt your backups accordingly.
+- **Credentials are stored in clear text.** The Family Safety and Xbox Family Settings refresh tokens are persisted in the config entry and in `.storage/` **unencrypted**. No browser cookies are stored. Anyone with read access to your Home Assistant configuration directory (including backups) can extract a usable Microsoft token. Protect and encrypt your backups accordingly.
 - **The authentication proxy endpoint is unauthenticated.** `/auth/microsoft_family_safety/proxy/{token}` and its callback are registered without Home Assistant authentication — the only protection is a 24-byte random token in the URL. The flow is scoped: the proxy only serves the Microsoft sign-in hosts (`account.microsoft.com`, `account.live.com`, `login.live.com`, `login.microsoft.com`, `login.microsoftonline.com`), the callback only accepts that token for its own flow, it exists for at most **10 minutes**, and it is destroyed when the flow finishes. Still, while a flow is live, anyone who can reach your Home Assistant HTTP interface **and** guess the token would be proxied to Microsoft.
 - **The Microsoft login page is served from your Home Assistant origin.** Because the sign-in is proxied, the address bar shows your Home Assistant URL rather than `login.live.com`, so you cannot verify the Microsoft certificate visually. Only start the flow from Home Assistant itself.
 - **HTTP mode is genuinely insecure.** With `allow_insecure_http_auth` enabled, your Microsoft password crosses the local network unencrypted. It is restricted to local/private addresses and logs a warning, but it remains a testing option, not a deployment mode.
@@ -1020,110 +980,45 @@ Native authentication trades some of the add-on's isolation for simplicity. Be a
 ### Limitations
 
 - **Unofficial API** — Microsoft provides no public API for Family Safety. This integration relies on reverse-engineered endpoints that may change or break at any time.
-- **Renewal depends on the Microsoft-account cookies.** The integration captures Microsoft's cookie rotations, re-fetches the antiforgery token when it goes stale and, since 2.0.6, completes the daily silent sign-in of the account page by itself. It cannot recover from a revoked or expired Microsoft login (password change, security review, cookies past their date); Home Assistant will prompt you then. With "Stay signed in?" answered Yes, the captured cookies are valid for about a year.
-- **Akamai bot-manager cookies are deliberately discarded.** Microsoft fronts `account.microsoft.com` with Akamai, whose `bm_sv` / `ak_bmsc` cookies are tied to the browser that obtained them. Replaying them from Home Assistant made Microsoft stop answering entirely (the request hung until the timeout, then the connection was reset), which hid an expired session behind timeouts and backoffs. They are dropped wherever cookies are captured, loaded or saved.
-- **A browser is still required to sign in.** The Family web session can only be established interactively, because Microsoft gates the Family dashboard behind an interactive OAuth hop. The mobile token is then fetched server-side, and only falls back to the browser if Microsoft demands another interactive step. There is no fully headless sign-in.
+- **Renewal depends on the refresh tokens.** The integration renews and stores Microsoft's token rotations by itself. It cannot recover from a revoked login (password change, security review); Home Assistant will prompt you then.
+- **A browser is required to sign in.** Microsoft's OAuth sign-in is interactive (password, MFA). There is no headless sign-in.
 - **Entity IDs changed** — see [Breaking changes](#breaking-changes).
 - **Per-platform lock is unreliable** — Microsoft removed the `override_device` endpoint. Account Lock is the recommended replacement, but it locks all platforms at once.
-- **Legacy add-on mode is serialized** — the add-on uses a single browser instance with a lock, so concurrent requests are queued.
 
 ---
 
 ## API Reference
 
-Microsoft Family Safety exposes **two distinct APIs**. This integration uses both, each for specific capabilities.
-
 ### Mobile API — `mobileaggregator.family.microsoft.com`
 
-**Authentication:** OAuth Bearer token (acquired via `pyfamilysafety`)
-
-Used for read operations and app management. Token-based, no browser session required.
+**Authentication:** OAuth token of the Family Safety app (client `000000000004893A`), refreshed from the stored refresh token. The roster, devices, usage, applications, device overrides and requests go through `pyfamilysafety`; the integration adds:
 
 | Method | Endpoint | Description | Used by |
 |--------|----------|-------------|---------|
-| GET | `/v1/WebRestrictions/{childId}` | Web filter settings & blocked sites | `sensor.web_filter` |
-| GET | `/v1/WebRestrictions/{childId}?exceptions=true` | Web filter settings with the blocked and allowed sites (without `exceptions=true` the list is empty) | `get_sites` |
-| PATCH | `/v1/WebRestrictions/{childId}` | Block/allow/remove a website (one operation per site), web filter on/off | website actions, `switch.web_filtering` |
-| GET | `/v1/ContentRestrictions/{childId}` | Age rating & ask-to-buy state | `sensor.web_filter` attributes |
+| GET / PATCH | `/v4/devicelimits/schedules/{childId}` | Windows and Xbox schedules (allowance and time windows per day, on/off) | `sensor.screen_time_policy`, `number.*_limit`, `time.*_start/end`, `switch.lock`, `switch.screen_time_limits`, `switch.xbox_screen_time_limits` |
+| GET / PATCH | `/v1/WebRestrictions/{childId}` | Web filter and the blocked / allowed sites (`exceptions=true`) | `sensor.web_filter`, website services |
+| GET / PATCH | `/v1/ContentRestrictions/{childId}` | Age rating & ask-to-buy | `sensor.web_filter` attributes, services |
+| GET / PATCH | `/v2/AppLimits/settings/{childId}` | "App, feature, and game limits" switch | `switch.app_limits` |
+| PATCH | `/v3/AppLimits/policies/{childId}/{appId}` | Per-app time limits | app time limit services |
 | GET | `/v1/activityreport/webactivity/{childId}` | Websites visited in Edge (`allowStatus=true`, 403 when there is no data) | `sensor.websites_visited` |
 | GET | `/v1/activityreport/searchactivity/{childId}` | Bing searches | `sensor.websites_visited` attributes |
 | GET | `/v4/devicelimits/{childId}/overrides` (`Plat-Info: ALL`) | Active device overrides; the platform name to send is its `appliesTo` (Windows can be listed as `Desktop`) | `switch.lock`, `lock_platform` / `unlock_platform` read-back |
 | POST | `/v4/devicelimits/{childId}/overrides` (`Plat-Info: ALL`) | Lock (`BlockUntil`) or unlock (`Cancel`) Windows/Mobile; body `{target, overrideType, validUntil, culture}` | `lock_platform`, `unlock_platform` |
-| PATCH | `/v4/devicelimits/schedules/{childId}` | ~~Set screen time schedule~~ | **Broken** (400 error) |
 
 > The POST answers with the whole overrides document as it stands after the write, and `lock_platform` / `unlock_platform` are judged by that answer: a GET made right after a write can still list the previous state for a while. Microsoft sometimes answers HTTP 500 to a lock or unlock it applied anyway, and has failed a cancel without applying it; after an error, a timeout or an answer without the document, the overrides are read up to three times over a few seconds, and the action succeeds only when a read shows the platform locked (lock) or not locked (unlock); when no read succeeds it fails. A poll answer without the platform list keeps the last known locks. For two minutes after a write, its answer is shown for that platform instead of what the poll reads.
 
-> The mobile API's schedule endpoint no longer works reliably; screen time schedule writes go through the web API.
+### Xbox Family Settings — `xapprove.xboxlive.com`
 
-### Web API — `account.microsoft.com/family/api/`
+**Authentication:** refresh token of the Xbox Family Settings app (client `00000000482c8f49`), exchanged for an Xbox Live XSTS token plus an `x-ms-rps-ticket`. Children are found on the Xbox family roster (`accounts.xboxlive.com`).
 
-**Authentication:** Microsoft session cookies + the `__RequestVerificationToken` antiforgery token, read from the authenticated Family dashboard and sent as a header of the same name. All requests require the headers `X-AMC-JsonMode: CamelCase`, `X-Requested-With: XMLHttpRequest`, a plausible `Referer`, and — for writes — `Content-Type: application/json` and `Origin: https://account.microsoft.com`. Some endpoints additionally require a per-child `X-JwtFamilyRelationshipToken`, harvested from the roster or landing-page feed.
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET / PATCH | `/api/v1/user/{xuid}/settings/screentime` | Xbox schedule the console enforces |
+| GET | `/api/v1/user/{xuid}/settings/screentime/overrides` | Active Xbox lock / extra time |
+| POST | `/api/v1/user/{xuid}/settings/screentime/overrides/create` | Lock the Xbox (type 2) or release it (type 100) |
+| GET | `/api/v1/user/{xuid}/activityreport/screenTimeUsage` | Xbox play time |
 
-> Only the token named `__RequestVerificationToken` works. The generic `canary` / `apiCanary` values look similar but belong to a different antiforgery context and produce HTTP 401.
-
-**In native mode these calls are issued directly by Home Assistant over HTTP** (httpx), with no browser and no add-on, once the Family session has been established. In [legacy add-on mode](#legacy-add-on-mode) they are executed from inside the add-on's authenticated Chromium session instead.
-
-#### Read Endpoints (GET)
-
-| Endpoint | Query Params | Description | Used by |
-|----------|-------------|-------------|---------|
-| `/family/api/roster` | — | Family members list | Coordinator, relationship tokens |
-| `/family/api/st` | `childId` | Screen time policy (per-device, Windows) — **tried first** | `sensor.screen_time_policy`, `number.*_limit`, `time.*_start/end` |
-| `/family/api/landing-page-feeds` | `memberIdList` | Dashboard feed; fallback source for the weekday schedule, and source of relationship tokens | `sensor.screen_time_policy`, `number.*_limit`, `time.*_start/end` |
-| `/family/windows/home/direct`, `/family/home` | — | Family dashboard pages, scraped for `__RequestVerificationToken` | Session bootstrap |
-| `/account` | — | Session health probe | `sensor.*_connection` |
-| `/family/api/screen-time-global` | `childId` | Global screen time toggle | — |
-| `/family/api/screen-time-xbox` | `childId` | Xbox screen time policy | — |
-| `/family/api/device-limits/get-devices` | `childId` | Connected devices list | — |
-| `/family/api/app-limits/get-all-app-policies-v3` | `childId` | All app policies | `switch.app_*` |
-| `/family/api/app-limits/get-app-time-extension-requests` | `memberIdList` | Pending extension requests | `sensor.pending_requests`, `button.approve/deny` |
-| `/family/api/recent-activity/report-v3` | `childId`, `isPreviousWeek`, `timeZone` | Activity report | `sensor.screen_time` |
-| `/family/api/settings/web-browsing` | `childId` | Web filter settings | `sensor.web_filter` |
-
-#### Write Endpoints (POST/PUT/DELETE)
-
-| Method | Endpoint | Body | Description |
-|--------|----------|------|-------------|
-| POST | `/family/api//st/day-allow` | `{childId, dayOfWeek, timeSpanDays, timeSpanHours, timeSpanMinutes}` | Set daily screen time allowance |
-| POST | `/family/api//st/day-allow-int` | `{childId, dayOfWeek, allowedIntervals: [48 booleans]}` | Set allowed time intervals (30-min slots) |
-| POST | `/family/api/app-limits/set-custom-app-policy-v3` | `{childId, appPolicy: {...}, platform}` | Block/unblock/limit an app |
-| POST | `/family/api/settings/block-website` | `{childId, website}` | Block a website |
-| DELETE | `/family/api/settings/remove-website` | `?childId=&website=` | Remove a blocked/allowed website |
-| POST | `/family/api/settings/web-browsing-toggle` | `{childId, isEnabled}` | Toggle web content filtering |
-| PUT | `/family/api/settings/update-content-settings` | `{childId, contentRatingAge}` | Set age rating (3-20, 21=unrestricted) |
-| POST | `/family/api/ps/set-acquisition-policy` | `{childId, policy}` | Set ask-to-buy (`freeOnly` / `unrestricted`) |
-
-#### Screen Time Response Structure
-
-`GET /family/api/st?childId={childId}` returns:
-
-```json
-{
-  "userId": "1234567890123456",
-  "isEnabled": true,
-  "dailyRestrictions": {
-    "monday": {
-      "dayOfWeek": "monday",
-      "allowance": "01:00:00",
-      "allowedIntervals": [
-        {
-          "begin": "PT7H",
-          "beginTimeSpan": "07:00:00",
-          "end": "PT23H",
-          "endTimeSpan": "23:00:00"
-        }
-      ],
-      "timeline": [false, false, ..., true, true, ..., false, false]
-    }
-  }
-}
-```
-
-- `allowance`: daily limit as `HH:MM:SS`
-- `allowedIntervals[].beginTimeSpan/endTimeSpan`: window boundaries as `HH:MM:SS`
-- `timeline`: 48 booleans representing 30-min slots (index 0 = 00:00, index 14 = 07:00)
-
-### Home Assistant authentication proxy (native mode)
+### Home Assistant authentication proxy
 
 Registered by the integration only while a sign-in flow is running, and destroyed when it finishes or after 10 minutes. Both routes are served **without Home Assistant authentication**; the random per-flow token in the URL is the only guard. See [Security & limitations](#security--limitations).
 
@@ -1131,40 +1026,6 @@ Registered by the integration only while a sign-in flow is running, and destroye
 |--------|----------|-------------|
 | any | `/auth/microsoft_family_safety/proxy/{token}[/{path}]` | Reverse proxy to Microsoft sign-in (restricted to `account.microsoft.com`, `account.live.com`, `login.live.com`, `login.microsoft.com`, `login.microsoftonline.com`) |
 | GET | `/auth/microsoft_family_safety/callback?flow_id=` | Hands the captured result back to the config flow |
-
-### Addon API — `http://{addon-hostname}:8098` *(legacy mode only)*
-
-The addon exposes a local HTTP API that proxies requests through the authenticated browser session. It is not used in native mode.
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/health` | Health check |
-| POST | `/api/auth/start` | Start authentication session |
-| GET | `/api/auth/status/{session_id}` | Check auth session status |
-| GET | `/api/cookies/check` | Check cookie freshness |
-| GET | `/api/cookies` | Get stored cookies |
-| DELETE | `/api/cookies` | Delete stored cookies |
-| GET | `/api/screentime?childId=` | Fetch screen time via browser |
-| POST | `/api/screentime/set-allowance` | Set daily allowance via browser |
-| POST | `/api/screentime/set-intervals` | Set time intervals via browser |
-
-### Capabilities Matrix
-
-| Action | Web API | Mobile API | Status |
-|--------|:---:|:---:|--------|
-| View family roster | GET | — | Working |
-| View screen time usage | — | GET | Working |
-| Read screen time schedule | GET | — | Working (direct from HA) |
-| Set daily screen time allowance | POST | ~~PATCH~~ | Working (web only) |
-| Set allowed time intervals | POST | ~~PATCH~~ | Working (web only) |
-| Block/unblock an app | POST | POST | Working |
-| Set per-app time limits | POST | — | Working |
-| Block/allow a website | POST/DELETE | — | Working |
-| Toggle web filtering | POST | — | Working |
-| Set content age rating | PUT | — | Working |
-| Set ask-to-buy policy | POST | — | Working |
-| **Lock device (instant)** | **N/A** | ~~POST~~ | **Broken** (Microsoft removed) |
-| Lock account (workaround) | POST x14 | — | Working (sets all quotas to 0) |
 
 ---
 
@@ -1178,7 +1039,7 @@ Contributions are welcome!
 
 Areas where help is especially appreciated:
 - Microsoft API endpoint documentation and analysis
-- Encrypting the stored Microsoft cookies and tokens at rest
+- Encrypting the stored Microsoft tokens at rest
 - Additional language translations
 - Testing native authentication across different Family Safety account configurations and Home Assistant setups
 
@@ -1202,7 +1063,7 @@ This project is licensed under the [MIT License](LICENSE).
 - [GitHub Issues](https://github.com/noiwid/HAFamilySafety/issues)
 - [GitHub Discussions](https://github.com/noiwid/HAFamilySafety/discussions)
 
-When reporting an issue, please include: HA version, integration version, whether you use native or legacy add-on authentication (the **Connection** sensor's `native_web_auth` attribute tells you), the add-on version if applicable, debug logs, and steps to reproduce.
+When reporting an issue, please include: HA version, integration version, the attributes of the **Connection** sensor, debug logs, and steps to reproduce.
 
 [releases-shield]: https://img.shields.io/github/release/noiwid/HAFamilySafety.svg?style=for-the-badge
 [releases]: https://github.com/noiwid/HAFamilySafety/releases

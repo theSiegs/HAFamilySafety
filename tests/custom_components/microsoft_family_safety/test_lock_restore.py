@@ -2,7 +2,7 @@
 
 Microsoft has no lock endpoint: a lock zeroes the 7 days and the restore point
 kept by the coordinator is the only way back. These tests drive the coordinator
-with a fake web API that records every write, and check the guards of
+with a fake API client that records every write, and check the guards of
 issue #23 plus the ones added after the 2026-11 audit.
 """
 
@@ -42,7 +42,7 @@ class FakeWebAPI:
         self.intervals: list[tuple[int, list[bool]]] = []
         self.enabled_calls: list[bool] = []
         self.fail = False
-        self.last_web_error_code = None
+        self.screentime_policy_status = "ok"
 
     async def set_mobile_schedule_enabled(self, child_id, enabled, platform="Windows"):
         self.enabled_calls.append(enabled)
