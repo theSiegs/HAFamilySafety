@@ -54,6 +54,7 @@ from .const import (
     SERVICE_SYNC_SITE_LIST,
     SERVICE_PROBE_APP_POLICY,
     SERVICE_PROBE_XBOX_SCHEDULE,
+    SERVICE_PROBE_XBOX_UNLINK,
     CONF_ALLOWED_USERS,
     SCREENTIME_PLATFORMS,
 )
@@ -498,6 +499,20 @@ def _register_services(hass: HomeAssistant) -> None:
         if coordinator is None:
             raise HomeAssistantError("No Microsoft Family Safety coordinator available")
         return await coordinator.async_probe_xbox_schedule(call.data["account_id"])
+
+    async def probe_xbox_unlink(call: ServiceCall) -> None:
+        """Diagnostic (fork only): forget the Xbox Family Settings link."""
+        await async_require_admin(hass, call)
+        for coordinator in hass.data.get(DOMAIN, {}).values():
+            xbox_family = getattr(coordinator, "xbox_family", None)
+            if xbox_family is not None:
+                await xbox_family.async_unlink()
+                await coordinator.async_request_refresh()
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_PROBE_XBOX_UNLINK, guard_service(hass, probe_xbox_unlink),
+        schema=vol.Schema({}),
+    )
 
     hass.services.async_register(
         DOMAIN, SERVICE_PROBE_XBOX_SCHEDULE, guard_service(hass, probe_xbox_schedule),
