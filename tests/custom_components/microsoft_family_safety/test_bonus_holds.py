@@ -371,7 +371,7 @@ async def test_windows_lock_is_put_back_when_our_extra_time_has_ended(
     coord._mobile_writes.clear()  # and our write is minutes old
     mobile_extra.writes.clear()
 
-    _windows_polled(coord, mobile_extra)
+    _windows_poll(coord, mobile_extra)  # the poll reads the extra time gone
     assert coord.platform_hold_state(CHILD, "Windows")["hold"] == "ours"
 
     await coord._async_resume_after_bonus({}, {})
@@ -415,3 +415,96 @@ async def test_unlock_leaves_our_windows_extra_time_running(hass, xbox, mobile_e
     assert result["applied"] == "bonus_kept"
     assert mobile_extra.writes == []
     assert coord.platform_hold(CHILD, "Windows") is None
+
+
+# --- Windows extra time as the poll reads it (extra_time from the overrides) --------
+
+
+def _windows_poll(coord, mobile) -> None:
+    """What a real poll holds for Windows: the lock flag and the extra time in force."""
+    from custom_components.microsoft_family_safety.mobile_overrides import mobile_extra_time
+
+    _windows_polled(coord, mobile)
+    coord.data["accounts"][CHILD]["extra_time"] = mobile_extra_time(mobile.state())
+
+
+class RoundingMobile(FakeMobileExtra):
+    """Microsoft stores the extra time ending a little off the asked end."""
+
+    async def set_mobile_device_override(self, child_id, target, override_type, valid_until):
+        if override_type == "AllowUntil":
+            valid_until = valid_until.replace(second=0, microsecond=0) + timedelta(seconds=50)
+        return await super().set_mobile_device_override(
+            child_id, target, override_type, valid_until
+        )
+
+
+async def test_a_poll_during_the_write_reads_our_windows_extra_time(hass, xbox, mobile_extra):
+    coord = _coordinator(hass, xbox, mobile_extra)
+    seen = []
+
+    async def poll():
+        _windows_poll(coord, mobile_extra)
+        seen.append(coord.platform_hold_state(CHILD, "Windows")["hold"])
+
+    coord.async_request_refresh.side_effect = poll
+    await coord.async_add_time_bonus(CHILD, "Windows", _minutes(30))
+    assert seen and set(seen) == {"bonus_ours"}
+
+
+async def test_the_push_after_the_write_reads_our_windows_extra_time(hass, xbox, mobile_extra):
+    coord = _coordinator(hass, xbox, mobile_extra)
+    # The last poll (before the write) saw no extra time; the refresh is put off.
+    coord.data["accounts"][CHILD]["extra_time"] = {}
+    await coord.async_add_time_bonus(CHILD, "Windows", _minutes(30))
+    state = coord.platform_hold_state(CHILD, "Windows")
+    assert state["hold"] == "bonus_ours" and state["override"] == "allowUntil"
+
+
+async def test_polled_windows_extra_time_rounded_by_microsoft_is_ours(hass, xbox):
+    mobile = RoundingMobile()
+    coord = _coordinator(hass, xbox, mobile)
+    await coord.async_add_time_bonus(CHILD, "Windows", _minutes(30))
+    _windows_poll(coord, mobile)
+    assert coord.platform_hold_state(CHILD, "Windows")["hold"] == "bonus_ours"
+
+    # Across a restart: the record is read back and the next poll still reads ours.
+    again = _make(hass, coord.entry, xbox, mobile)
+    await again._async_load_platform_holds()
+    _windows_poll(again, mobile)
+    assert again.platform_hold_state(CHILD, "Windows")["hold"] == "bonus_ours"
+
+
+async def test_polled_windows_extra_time_from_a_parent_reads_parent(hass, xbox, mobile_extra):
+    coord = _coordinator(hass, xbox, mobile_extra)
+    await coord.async_add_time_bonus(CHILD, "Windows", _minutes(30))
+    # A parent gave another amount of time in the app since.
+    mobile_extra.platforms["Windows"] = [
+        {"overrideType": "AllowUntil", "validUntil": iso_utc(_minutes(90))}
+    ]
+    _windows_poll(coord, mobile_extra)
+    assert coord.platform_hold_state(CHILD, "Windows")["hold"] == "parent"
+
+
+async def test_a_failed_windows_write_leaves_a_parents_extra_time_as_parent(
+    hass, xbox, mobile_extra
+):
+    coord = _coordinator(hass, xbox, mobile_extra)
+    mobile_extra.platforms["Windows"] = [
+        {"overrideType": "AllowUntil", "validUntil": iso_utc(_minutes(90))}
+    ]
+
+    async def refused(*args):
+        from custom_components.microsoft_family_safety.api_client import (
+            FamilySafetyWebAPIError,
+        )
+
+        raise FamilySafetyWebAPIError("API request failed with status 500")
+
+    mobile_extra.set_mobile_device_override = refused
+    coord._MOBILE_READBACK_DELAYS = (0,)
+    with pytest.raises(HomeAssistantError, match="left as it was"):
+        await coord.async_add_time_bonus(CHILD, "Windows", _minutes(30))
+    assert f"{CHILD}|windows" not in coord._time_bonuses
+    _windows_poll(coord, mobile_extra)
+    assert coord.platform_hold_state(CHILD, "Windows")["hold"] == "parent"
