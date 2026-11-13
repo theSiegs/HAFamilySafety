@@ -1601,7 +1601,8 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         add_time_bonus over a lock this integration holds replaces that lock
         (Microsoft keeps one Xbox override) but keeps the hold, marked with
         ``bonus_until``. Once the extra time has ended and this poll's read,
-        taken after that end, shows nothing in force, the lock goes back on
+        taken after that end (the Xbox read of this poll, a fresh mobile API
+        read for Windows), shows nothing in force, the lock goes back on
         until the hold's end, whatever the strict mode option. Any other
         override in force then (a parent's lock or extra time) ends the mark
         and the usual hold rules apply.
@@ -1622,10 +1623,14 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 continue
             account_id = str(hold.get("account_id"))
             platform = str(hold.get("platform") or key.split("|", 1)[-1])
-            read_at = (xbox_read_at or {}).get(account_id)
-            state = xbox_overrides.get(account_id)
-            if platform.lower() != "xbox" or read_at is None or read_at < bonus_end:
-                continue
+            if platform.lower() == "xbox":
+                read_at = (xbox_read_at or {}).get(account_id)
+                state = xbox_overrides.get(account_id)
+                if read_at is None or read_at < bonus_end:
+                    continue
+            else:
+                # Windows and Mobile: read the mobile API now, after the end.
+                state = await self._async_read_platform_override(account_id, platform)
             if not isinstance(state, dict):
                 continue
             if state.get("type") == NO_OVERRIDE:
@@ -1738,10 +1743,10 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         * ``none``: nothing in force and no hold of ours.
 
         The Xbox override is the one the poll read from xapprove (unknown
-        without the Xbox Family Settings link). For Windows and Mobile only
-        the mobile "locked" flag is polled, without an end, so a lock with a
-        hold of ours reads as ``ours``, one without as ``parent``, and extra
-        time is not seen. Also returns ``override``, ``override_until`` and
+        without the Xbox Family Settings link). For Windows and Mobile the
+        mobile "locked" flag is polled without an end, so a lock with a hold
+        of ours reads as ``ours``, one without as ``parent``; extra time comes
+        from the polled ``extra_time``. Also returns ``override``, ``override_until`` and
         ``allow_until`` (local ISO).
         """
         account = self._account_data(account_id) or {}
@@ -1753,6 +1758,17 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             current = make_override(BLOCK_UNTIL, until)
         elif account.get("blocked_platforms") is not None:
             current = make_override(NO_OVERRIDE)
+            extra = account.get("extra_time")
+            if isinstance(extra, dict):
+                # The poll reads the extra time (AllowUntil) in force, ours or a parent's.
+                bonus_until = parse_utc(extra.get(platform))
+            else:
+                # No extra time read: extra time this integration gave stands
+                # for what is in force while it runs.
+                bonus = self._time_bonuses.get(self._hold_key(account_id, platform))
+                bonus_until = parse_utc((bonus or {}).get("until"))
+            if bonus_until is not None and bonus_until > dt_util.utcnow():
+                current = make_override(ALLOW_UNTIL, bonus_until)
         else:
             current = None
         hold = self._platform_holds.get(self._hold_key(account_id, platform))

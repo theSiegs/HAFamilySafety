@@ -613,6 +613,10 @@
           "name": "ID du compte",
           "description": "L'identifiant utilisateur du compte enfant."
         },
+        "entity_id": {
+          "name": "Entité de l'enfant",
+          "description": "N'importe quelle entité Microsoft Family Safety de l'enfant (ou de l'un de ses appareils), à la place de l'identifiant du compte."
+        },
         "platform": {
           "name": "Plateforme",
           "description": "Uniquement ce planning. Vide = toutes les plateformes."

@@ -613,6 +613,10 @@
           "name": "Konto-ID",
           "description": "Die Benutzer-ID des Kinderkontos."
         },
+        "entity_id": {
+          "name": "Entität des Kindes",
+          "description": "Eine beliebige Microsoft-Family-Safety-Entität des Kindes (oder eines seiner Geräte), statt der Konto-ID."
+        },
         "platform": {
           "name": "Plattform",
           "description": "Nur dieser Zeitplan. Leer = alle Plattformen."

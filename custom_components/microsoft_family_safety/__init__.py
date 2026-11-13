@@ -323,7 +323,6 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
     await hass.config_entries.async_reload(entry.entry_id)
 
 
-
 def _bonus_until(data: dict) -> datetime:
     """When add_time_bonus's extra time ends: ``until``, or ``minutes`` from now."""
     if (data.get("until") is None) == (data.get("minutes") is None):
