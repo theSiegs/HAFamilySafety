@@ -215,6 +215,20 @@
         }
       }
     },
+    "probe_app_policy": {
+      "name": "Tester la règle d'une application",
+      "description": "Diagnostic (administrateurs uniquement) : lit la règle de limite d'une application de toutes les manières auxquelles l'API mobile pourrait répondre (règle, liste, paramètres et rapport d'activité ; aucune écriture) et renvoie chaque requête avec le statut et la réponse brute de Microsoft.",
+      "fields": {
+        "account_id": {
+          "name": "ID du compte",
+          "description": "L'identifiant utilisateur du compte enfant."
+        },
+        "app_id": {
+          "name": "ID de l'application",
+          "description": "L'identifiant de l'application tel que le capteur Applications l'affiche, par ex. appx:windowsplt:example_1234abcd ou x:1234567890."
+        }
+      }
+    },
     "cancel_time_bonus": {
       "name": "Annuler le temps supplémentaire",
       "description": "Annule le temps supplémentaire en cours sur la Xbox ou sur Windows d'un enfant. Seul le temps supplémentaire est annulé : échoue tant que la plateforme est verrouillée (un verrouillage n'est jamais levé), et ne fait rien quand aucun temps supplémentaire n'est en cours. Peut répondre avec cancelled et reason ou lock_in_force.",

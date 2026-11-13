@@ -40,6 +40,7 @@ from ._pyfamilysafety_compat import (
 from . import site_sync
 from .api_client import FamilySafetyWebAPI, FamilySafetyWebAPIError
 from .app_pause import AppPauser, app_limit_today
+from .app_policy_probe import async_probe_app_policy
 from .app_usage import EVENT_APP_USAGE, AppUsageGrowthTracker
 from .mobile_overrides import (
     MOBILE_OVERRIDE_ALLOW,
@@ -2520,6 +2521,12 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "cancelled": True,
             "lock_in_force": mobile_lock_of(mobile_platform_entry(state, "Windows")) is not None,
         }
+
+    async def async_probe_app_policy(self, account_id: str, app_id: str) -> dict[str, Any]:
+        """Diagnostic: every candidate read of one app's policy, raw (GETs only)."""
+        if not self.web_api:
+            raise HomeAssistantError("Mobile API not initialized")
+        return await async_probe_app_policy(self.web_api, str(account_id), app_id)
 
     # --- Xbox Family Settings API (xapprove) ---------------------------------
     @property
