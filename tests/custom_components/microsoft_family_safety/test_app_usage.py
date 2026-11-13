@@ -55,6 +55,13 @@ def test_app_platform_from_the_id():
     assert app_platform("other") is None
 
 
+def test_a_windowsplt_app_is_windows_not_xbox():
+    """x:windowsplt: ids are Windows apps, though they start with the Xbox x: prefix."""
+    assert app_platform("x:windowsplt:61f08e27aff06317") == "Windows"
+    assert app_platform("X:WindowsPLT:Example.App_abc") == "Windows"
+    assert app_platform("x:1234") == "Xbox"
+
+
 def test_growth_tracker_baselines_then_reports():
     tracker = AppUsageGrowthTracker()
     assert tracker.update(CHILD, "2026-11-07", _apps(game=10, browser=5)) == []

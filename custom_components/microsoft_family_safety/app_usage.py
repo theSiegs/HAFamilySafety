@@ -23,9 +23,17 @@ MIN_RANKED_MINUTES = 1.0
 MIN_GROWTH_MINUTES = 0.5
 EVENT_APP_USAGE = f"{DOMAIN}_app_usage"
 
-#: App id prefix -> platform. Microsoft gives each platform its own id for
-#: an app: a game is x:<id> on the Xbox and appx:/win32: on Windows.
-_PLATFORM_PREFIXES = (("x:", "Xbox"), ("appx:", "Windows"), ("win32:", "Windows"), ("a:", "Mobile"))
+#: App id prefix -> platform, first match wins. Microsoft gives each platform
+#: its own id for an app: a game is x:<id> on the Xbox and appx:/win32: on
+#: Windows. A Windows app can also be listed as x:windowsplt:<id>, so that
+#: prefix comes before the plain x: of the Xbox.
+_PLATFORM_PREFIXES = (
+    ("x:windowsplt:", "Windows"),
+    ("x:", "Xbox"),
+    ("appx:", "Windows"),
+    ("win32:", "Windows"),
+    ("a:", "Mobile"),
+)
 
 
 def safe_app_id(app_id: str) -> str:
@@ -40,8 +48,9 @@ def app_usage_unique_id(entry_id: str, account_id: Any, app_id: str) -> str:
 
 def app_platform(app_id: str) -> str | None:
     """The platform an app id belongs to, from its prefix."""
+    app_id = str(app_id).lower()
     for prefix, platform in _PLATFORM_PREFIXES:
-        if str(app_id).startswith(prefix):
+        if app_id.startswith(prefix):
             return platform
     return None
 
