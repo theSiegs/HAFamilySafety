@@ -162,6 +162,17 @@ add_time_bonus:
       selector:
         boolean:
 
+probe_xbox_schedule:
+  name: Probe Xbox Schedule
+  description: "Diagnostic (administrators only): returns the raw Xbox Family Settings schedule of one child (GET only)."
+  fields:
+    account_id:
+      name: Account ID
+      description: The user ID of the child account.
+      required: true
+      selector:
+        text:
+
 probe_app_policy:
   name: Probe App Policy
   description: "Diagnostic (administrators only): reads one app's limit policy every way the mobile API might answer it (policy, list, settings and activity report reads; no writes) and returns each request with Microsoft's raw status and body."
