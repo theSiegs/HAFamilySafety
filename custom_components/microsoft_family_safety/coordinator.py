@@ -1762,6 +1762,9 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         * ``bonus_ours``: the extra time in force is the one add_time_bonus
           gave (over a lock of ours, or not).
         * ``none``: nothing in force and no hold of ours.
+        * None: Windows / Mobile whose locks have not been read yet (no
+          overrides document since the start, see platform_lock_known) and no
+          hold of ours; ``override`` is None too.
 
         The Xbox override is the one the poll read from xapprove (unknown
         without the Xbox Family Settings link). For Windows and Mobile the
@@ -1774,6 +1777,10 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         current: dict[str, Any] | None
         if platform.lower() == "xbox":
             current = account.get("xbox_override")
+        elif not self.platform_lock_known(account_id, platform):
+            # No overrides document read yet for this child: what is in force
+            # is unknown, never "nothing" (that would read as a parent's unlock).
+            current = None
         elif platform in (account.get("blocked_platforms") or []):
             until = self._platform_override_until.get((str(account_id), platform.lower()))
             current = make_override(BLOCK_UNTIL, until)
@@ -1818,6 +1825,8 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             who = "parent"
         elif hold is not None:
             who = "ours"  # unreadable: nothing says otherwise
+        elif current is None and platform.lower() != "xbox":
+            who = None  # Windows / Mobile lock state unknown (see above)
         else:
             who = "none"
         details = self._override_details(current)
@@ -3354,7 +3363,7 @@ class FamilySafetyDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         if platform.lower() == "xbox":
             return True
-        account = ((self.data or {}).get("accounts") or {}).get(account_id) or {}
+        account = self._account_data(account_id) or {}
         return account.get("lock_state_known", True) is not False
 
     def is_account_locked(self, account_id: str) -> bool | None:
